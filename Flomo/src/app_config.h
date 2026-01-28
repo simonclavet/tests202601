@@ -56,6 +56,12 @@ struct AppConfig {
 
     bool drawFeatures = false;
     bool drawBlendCursors = true;  // Debug: show individual blend cursor skeletons
+    bool drawVelocities = false;   // Draw joint velocity vectors
+    bool drawAccelerations = false; // Draw joint acceleration vectors
+
+    // Animation settings
+    float defaultBlendTime = 2.0f;  // time for blend cursor spring to reach 95% of target
+    float switchInterval = 3.0f;    // time between random animation switches
 
     // Validity
     bool valid = false;
@@ -142,6 +148,11 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
 
     config.drawFeatures = ResolveBoolConfig(buffer, "drawFeatures", config.drawFeatures, argc, argv);
     config.drawBlendCursors = ResolveBoolConfig(buffer, "drawBlendCursors", config.drawBlendCursors, argc, argv);
+    config.drawVelocities = ResolveBoolConfig(buffer, "drawVelocities", config.drawVelocities, argc, argv);
+    config.drawAccelerations = ResolveBoolConfig(buffer, "drawAccelerations", config.drawAccelerations, argc, argv);
+
+    config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
+    config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
 
     if (buffer) free(buffer);
 
@@ -202,10 +213,15 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"drawShadows\": %s,\n", cfg.drawShadows ? "true" : "false");
     fprintf(file, "    \"drawEndSites\": %s,\n", cfg.drawEndSites ? "true" : "false");
     fprintf(file, "    \"drawFPS\": %s,\n", cfg.drawFPS ? "true" : "false");
-    fprintf(file, "    \"drawUI\": %s\n", cfg.drawUI ? "true" : "false");
+    fprintf(file, "    \"drawUI\": %s,\n", cfg.drawUI ? "true" : "false");
 
     fprintf(file, "    \"drawFeatures\": %s,\n", cfg.drawFeatures ? "true" : "false");
-    fprintf(file, "    \"drawBlendCursors\": %s\n", cfg.drawBlendCursors ? "true" : "false");
+    fprintf(file, "    \"drawBlendCursors\": %s,\n", cfg.drawBlendCursors ? "true" : "false");
+    fprintf(file, "    \"drawVelocities\": %s,\n", cfg.drawVelocities ? "true" : "false");
+    fprintf(file, "    \"drawAccelerations\": %s,\n", cfg.drawAccelerations ? "true" : "false");
+
+    fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
+    fprintf(file, "    \"switchInterval\": %.4f\n", cfg.switchInterval);
 
     fprintf(file, "}\n");
 

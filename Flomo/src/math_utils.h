@@ -255,3 +255,296 @@ static inline bool FrustumContainsSphere(Frustum frustum, Vector3 position, floa
     return true;
 }
 
+static inline float FastNegExp(float x)
+{
+    return 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+}
+
+static inline float HalflifeToDamping(float halflife, float eps = 1e-5f)
+{
+    return (4.0f * 0.69314718056f) / (halflife + eps);
+}
+
+static inline void SimpleSpringDamperUsingDampingEydt(
+    float& x,
+    float& v,
+    float x_goal,
+    float damping,
+    float eydt,
+    float dt)
+{
+    const float y = damping;
+    const float j0 = x - x_goal;
+    const float j1 = v + j0 * y;
+
+    x = eydt * (j0 + j1 * dt) + x_goal;
+    v = eydt * (v - j1 * y * dt);
+}
+
+
+static inline void SimpleSpringDamper(
+    float& x,
+    float& v,
+    float x_goal,
+    float halflife,
+    float dt)
+{
+    const float y = HalflifeToDamping(halflife) / 2.0f;
+    const float eydt = FastNegExp(y * dt);
+
+    SimpleSpringDamperUsingDampingEydt(x, v, x_goal, y, eydt, dt);
+}
+
+struct DoubleSpringDamperState
+{
+    float x;
+    float v;
+    float xi;
+    float vi;
+};
+
+static inline void DoubleSpringDamper(
+    DoubleSpringDamperState& state,
+    float x_goal,
+    float halflife,
+    float dt)
+{
+    const float y = HalflifeToDamping(halflife) / 2.0f;
+    const float eydt = FastNegExp(y * dt);
+
+    SimpleSpringDamperUsingDampingEydt(state.xi, state.vi, x_goal, y, eydt, dt);
+    SimpleSpringDamperUsingDampingEydt(state.x, state.v, state.xi, y, eydt, dt);
+}
+
+
+
+
+
+struct Rot6d
+{
+    float ax, ay, az;
+    float bx, by, bz;
+};
+
+inline float FastInvSqrt(const float x)
+{
+    const float xhalf = 0.5f * x;
+    int32_t i = *(int32_t*)&x;
+    i = 0x5f3759df - (i >> 1);
+    float y = *(float*)&i;
+    y = y * (1.5f - xhalf * y * y);
+    return y;
+}
+
+void Rot6dRotate(Rot6d& rot, const Vector3& omega, float dt)
+{
+    const float wx = omega.x * dt;
+    const float wy = omega.y * dt;
+    const float wz = omega.z * dt;
+
+    const float thetaSq = wx * wx + wy * wy + wz * wz;
+    if (thetaSq < 1e-12f)
+    {
+        return;
+    }
+
+    const float nax = rot.ax + (wy * rot.az - wz * rot.ay);
+    const float nay = rot.ay + (wz * rot.ax - wx * rot.az);
+    const float naz = rot.az + (wx * rot.ay - wy * rot.ax);
+
+    const float nbx = rot.bx + (wy * rot.bz - wz * rot.by);
+    const float nby = rot.by + (wz * rot.bx - wx * rot.bz);
+    const float nbz = rot.bz + (wx * rot.by - wy * rot.bx);
+
+    const float invLenA = FastInvSqrt(nax * nax + nay * nay + naz * naz);
+    rot.ax = nax * invLenA;
+    rot.ay = nay * invLenA;
+    rot.az = naz * invLenA;
+
+    const float dot = rot.ax * nbx + rot.ay * nby + rot.az * nbz;
+    const float rbx = nbx - dot * rot.ax;
+    const float rby = nby - dot * rot.ay;
+    const float rbz = nbz - dot * rot.az;
+
+    const float invLenB = FastInvSqrt(rbx * rbx + rby * rby + rbz * rbz);
+    rot.bx = rbx * invLenB;
+    rot.by = rby * invLenB;
+    rot.bz = rbz * invLenB;
+}
+
+void Rot6dMultiply(const Rot6d& lhs, const Rot6d& rhs, Rot6d& out)
+{
+    const float lcx = lhs.ay * lhs.bz - lhs.az * lhs.by;
+    const float lcy = lhs.az * lhs.bx - lhs.ax * lhs.bz;
+    const float lcz = lhs.ax * lhs.by - lhs.ay * lhs.bx;
+
+    out.ax = lhs.ax * rhs.ax + lhs.bx * rhs.ay + lcx * rhs.az;
+    out.ay = lhs.ay * rhs.ax + lhs.by * rhs.ay + lcy * rhs.az;
+    out.az = lhs.az * rhs.ax + lhs.bz * rhs.ay + lcz * rhs.az;
+
+    out.bx = lhs.ax * rhs.bx + lhs.bx * rhs.by + lcx * rhs.bz;
+    out.by = lhs.ay * rhs.bx + lhs.by * rhs.by + lcy * rhs.bz;
+    out.bz = lhs.az * rhs.bx + lhs.bz * rhs.by + lcz * rhs.bz;
+}
+
+void Rot6dInverse(const Rot6d& rot, Rot6d& out)
+{
+    const float cx = rot.ay * rot.bz - rot.az * rot.by;
+    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
+    
+    out.ax = rot.ax; out.ay = rot.bx; out.az = cx;
+    out.bx = rot.ay; out.by = rot.by; out.bz = cy;
+}
+
+void Rot6dTransformVector(const Rot6d& rot, const Vector3& v, Vector3& out)
+{
+    const float cx = rot.ay * rot.bz - rot.az * rot.by;
+    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
+    const float cz = rot.ax * rot.by - rot.ay * rot.bx;
+
+    out.x = v.x * rot.ax + v.y * rot.bx + v.z * cx;
+    out.y = v.x * rot.ay + v.y * rot.by + v.z * cy;
+    out.z = v.x * rot.az + v.y * rot.bz + v.z * cz;
+}
+
+
+void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
+{
+    const float cx = rot.ay * rot.bz - rot.az * rot.by;
+    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
+    const float cz = rot.ax * rot.by - rot.ay * rot.bx;
+
+    const float tr = rot.ax + rot.by + cz;
+    if (tr > 0.0f)
+    {
+        const float s = std::sqrt(tr + 1.0f) * 2.0f;
+        outQ.w = 0.25f * s;
+        outQ.x = (cy - rot.bz) / s;
+        outQ.y = (rot.az - cx) / s;
+        outQ.z = (rot.bx - rot.ay) / s;
+    }
+    else if ((rot.ax > rot.by) && (rot.ax > cz))
+    {
+        const float s = std::sqrt(1.0f + rot.ax - rot.by - cz) * 2.0f;
+        outQ.w = (cy - rot.bz) / s;
+        outQ.x = 0.25f * s;
+        outQ.y = (rot.ay + rot.bx) / s;
+        outQ.z = (rot.az + cx) / s;
+    }
+    else if (rot.by > cz)
+    {
+        const float s = std::sqrt(1.0f + rot.by - rot.ax - cz) * 2.0f;
+        outQ.w = (rot.az - cx) / s;
+        outQ.x = (rot.ay + rot.bx) / s;
+        outQ.y = 0.25f * s;
+        outQ.z = (rot.bz + cy) / s;
+    }
+    else
+    {
+        const float s = std::sqrt(1.0f + cz - rot.ax - rot.by) * 2.0f;
+        outQ.w = (rot.bx - rot.ay) / s;
+        outQ.x = (rot.az + cx) / s;
+        outQ.y = (rot.bz + cy) / s;
+        outQ.z = 0.25f * s;
+    }
+}
+
+void Rot6dFromQuaternion(const Quaternion& q, Rot6d& outRot)
+{
+    const float x2 = q.x + q.x, y2 = q.y + q.y, z2 = q.z + q.z;
+    const float xx = q.x * x2, xy = q.x * y2, xz = q.x * z2;
+    const float yy = q.y * y2, yz = q.y * z2, zz = q.z * z2;
+    const float wx = q.w * x2, wy = q.w * y2, wz = q.w * z2;
+
+    outRot.ax = 1.0f - (yy + zz);
+    outRot.ay = xy + wz;
+    outRot.az = xz - wy;
+
+    outRot.bx = xy - wz;
+    outRot.by = 1.0f - (xx + zz);
+    outRot.bz = yz + wx;
+}
+
+void Rot6dToMatrix(const Rot6d& rot, Matrix& outMat)
+{
+    const float cx = rot.ay * rot.bz - rot.az * rot.by;
+    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
+    const float cz = rot.ax * rot.by - rot.ay * rot.bx;
+
+    outMat.m0 = rot.ax; outMat.m4 = rot.bx; outMat.m8 = cx;   outMat.m12 = 0.0f;
+    outMat.m1 = rot.ay; outMat.m5 = rot.by; outMat.m9 = cy;   outMat.m13 = 0.0f;
+    outMat.m2 = rot.az; outMat.m6 = rot.bz; outMat.m10 = cz;   outMat.m14 = 0.0f;
+    outMat.m3 = 0.0f;   outMat.m7 = 0.0f;   outMat.m11 = 0.0f; outMat.m15 = 1.0f;
+}
+
+void Rot6dFromMatrix(const Matrix& mat, Rot6d& outRot)
+{
+    outRot.ax = mat.m0; outRot.ay = mat.m1; outRot.az = mat.m2;
+    outRot.bx = mat.m4; outRot.by = mat.m5; outRot.bz = mat.m6;
+}
+
+void Rot6dLerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
+{
+    const float invT = 1.0f - t;
+
+    const float nax = start.ax * invT + end.ax * t;
+    const float nay = start.ay * invT + end.ay * t;
+    const float naz = start.az * invT + end.az * t;
+
+    const float nbx = start.bx * invT + end.bx * t;
+    const float nby = start.by * invT + end.by * t;
+    const float nbz = start.bz * invT + end.bz * t;
+
+    const float invLenA = FastInvSqrt(nax * nax + nay * nay + naz * naz);
+    out.ax = nax * invLenA;
+    out.ay = nay * invLenA;
+    out.az = naz * invLenA;
+
+    const float dot = out.ax * nbx + out.ay * nby + out.az * nbz;
+    const float rbx = nbx - dot * out.ax;
+    const float rby = nby - dot * out.ay;
+    const float rbz = nbz - dot * out.az;
+
+    const float invLenB = FastInvSqrt(rbx * rbx + rby * rby + rbz * rbz);
+    out.bx = rbx * invLenB;
+    out.by = rby * invLenB;
+    out.bz = rbz * invLenB;
+}
+void Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
+{
+    Quaternion qStart, qEnd;
+    Rot6dToQuaternion(start, qStart);
+    Rot6dToQuaternion(end, qEnd);
+    Rot6dFromQuaternion(QuaternionSlerp(qStart, qEnd, t), out);
+}
+
+void Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt, Vector3& outOmega)
+{
+    Quaternion qCurrent, qTarget;
+    Rot6dToQuaternion(current, qCurrent);
+    Rot6dToQuaternion(target, qTarget);
+
+    const float qx = qTarget.w * -qCurrent.x + qTarget.x * qCurrent.w + qTarget.y * -qCurrent.z - qTarget.z * -qCurrent.y;
+    const float qy = qTarget.w * -qCurrent.y - qTarget.x * -qCurrent.z + qTarget.y * qCurrent.w + qTarget.z * -qCurrent.x;
+    const float qz = qTarget.w * -qCurrent.z + qTarget.x * -qCurrent.y - qTarget.y * -qCurrent.x + qTarget.z * qCurrent.w;
+    const float qw = qTarget.w * qCurrent.w - qTarget.x * -qCurrent.x - qTarget.y * -qCurrent.y - qTarget.z * -qCurrent.z;
+
+    float absQw = (qw < 0.0f) ? -qw : qw;
+    if (absQw > 1.0f) absQw = 1.0f;
+
+    const float angle = 2.0f * std::acos(absQw);
+
+    if (angle < 1e-6f)
+    {
+        outOmega.x = 0.0f; outOmega.y = 0.0f; outOmega.z = 0.0f;
+        return;
+    }
+
+    const float sinHalf = std::sqrt(1.0f - absQw * absQw);
+    float factor = (angle / dt) / (sinHalf < 1e-6f ? 1.0f : sinHalf);
+    if (qw < 0.0f) factor = -factor;
+
+    outOmega.x = qx * factor;
+    outOmega.y = qy * factor;
+    outOmega.z = qz * factor;
+}

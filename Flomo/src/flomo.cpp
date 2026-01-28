@@ -372,6 +372,8 @@ struct AnimDatabase {
     // index = frameIndex * jointCount + jointIndex
     std::vector<Vector3> globalJointPositions;     // global positions
     std::vector<Quaternion> globalJointRotations;  // global rotations
+    std::vector<Vector3> globalJointVelocities;    // velocities (defined at midpoint between frames)
+    std::vector<Vector3> globalJointAccelerations; // accelerations (derivative of velocity)
 
     // local joint transforms (localPositions/localRotations for the canonical skeleton)
     // These are useful to avoid repeating global->local conversion when blending.
@@ -449,6 +451,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->motionFrameCount = -1;
     db->globalJointPositions.clear();
     db->globalJointRotations.clear();
+    db->globalJointVelocities.clear();
+    db->globalJointAccelerations.clear();
     db->localJointPositions.clear();
     db->localJointRotations.clear();
     db->clipStartFrame.clear();
@@ -469,6 +473,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->motionFrameCount = 0;
     db->globalJointPositions.clear();
     db->globalJointRotations.clear();
+    db->globalJointVelocities.clear();
+    db->globalJointAccelerations.clear();
     db->localJointPositions.clear();
     db->localJointRotations.clear();
     db->clipStartFrame.clear();
@@ -537,6 +543,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     try {
         db->globalJointPositions.resize((size_t)db->motionFrameCount * db->jointCount);
         db->globalJointRotations.resize((size_t)db->motionFrameCount * db->jointCount);
+        db->globalJointVelocities.resize((size_t)db->motionFrameCount * db->jointCount);
+        db->globalJointAccelerations.resize((size_t)db->motionFrameCount * db->jointCount);
         db->localJointPositions.resize((size_t)db->motionFrameCount * db->jointCount);
         db->localJointRotations.resize((size_t)db->motionFrameCount * db->jointCount);
     }
@@ -545,6 +553,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->motionFrameCount = 0;
         db->globalJointPositions.clear();
         db->globalJointRotations.clear();
+        db->globalJointVelocities.clear();
+        db->globalJointAccelerations.clear();
         db->localJointPositions.clear();
         db->localJointRotations.clear();
         db->valid = false;
@@ -584,6 +594,88 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     TransformDataFree(&tmpXform);
 
+    // Compute velocities for each joint at each frame
+    // Velocity at frame i is defined at midpoint between frame i and i+1: v = (pos[i+1] - pos[i]) / frameTime
+    // For last frame of each clip, copy from previous frame
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float invFrameTime = 1.0f / frameTime;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+            const int nextF = isLastFrame ? f : (f + 1);
+            const int prevF = isLastFrame ? (f - 1) : f;
+
+            // handle edge case: single-frame clip
+            if (clipEnd - clipStart <= 1)
+            {
+                for (int j = 0; j < db->jointCount; ++j)
+                {
+                    const size_t idx = (size_t)f * db->jointCount + j;
+                    db->globalJointVelocities[idx] = Vector3Zero();
+                }
+                continue;
+            }
+
+            for (int j = 0; j < db->jointCount; ++j)
+            {
+                const size_t currIdx = (size_t)prevF * db->jointCount + j;
+                const size_t nextIdx = (size_t)nextF * db->jointCount + j;
+                const size_t dstIdx = (size_t)f * db->jointCount + j;
+
+                const Vector3 pos0 = db->globalJointPositions[currIdx];
+                const Vector3 pos1 = db->globalJointPositions[nextIdx];
+                const Vector3 vel = Vector3Scale(Vector3Subtract(pos1, pos0), invFrameTime);
+                db->globalJointVelocities[dstIdx] = vel;
+            }
+        }
+    }
+
+    // Compute accelerations for each joint at each frame
+    // Acceleration at frame i: a = (vel[i+1] - vel[i]) / frameTime
+    // For last frame of each clip, copy from previous frame
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float invFrameTime = 1.0f / frameTime;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+            const int nextF = isLastFrame ? f : (f + 1);
+            const int prevF = isLastFrame ? (f - 1) : f;
+
+            // handle edge case: single-frame or two-frame clip
+            if (clipEnd - clipStart <= 2)
+            {
+                for (int j = 0; j < db->jointCount; ++j)
+                {
+                    const size_t idx = (size_t)f * db->jointCount + j;
+                    db->globalJointAccelerations[idx] = Vector3Zero();
+                }
+                continue;
+            }
+
+            for (int j = 0; j < db->jointCount; ++j)
+            {
+                const size_t currIdx = (size_t)prevF * db->jointCount + j;
+                const size_t nextIdx = (size_t)nextF * db->jointCount + j;
+                const size_t dstIdx = (size_t)f * db->jointCount + j;
+
+                const Vector3 vel0 = db->globalJointVelocities[currIdx];
+                const Vector3 vel1 = db->globalJointVelocities[nextIdx];
+                const Vector3 acc = Vector3Scale(Vector3Subtract(vel1, vel0), invFrameTime);
+                db->globalJointAccelerations[dstIdx] = acc;
+            }
+        }
+    }
+
     TraceLog(LOG_INFO, "AnimDatabase: built motion DB with %d frames and %d joints",
         db->motionFrameCount, db->jointCount);
 
@@ -604,11 +696,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->toeIndices[SIDE_RIGHT] = -1;
 
     // HIP candidates (lowercase)
-    std::vector<std::string> hipCandidates;
-    hipCandidates.push_back("hips");
-    hipCandidates.push_back("hip");
-    hipCandidates.push_back("pelvis");
-    hipCandidates.push_back("root");
+    std::vector<std::string> hipCandidates = { "hips", "hip", "pelvis", "root" };
 
     // Toe candidates (lowercase)
     const std::vector<std::string> leftToeCandidates = { "lefttoebase", "lefttoe", "left_toe", "l_toe" };
@@ -863,7 +951,7 @@ struct BlendCursor {
     float normalizedWeight = 0.0f;              // weight / totalWeight (sums to 1 across active cursors)
     float targetWeight = 0.0f;                  // desired weight
     float weightVel = 0.0f;                     // velocity for spring integrator
-    float weightStiffness = 30.0f;              // stiffness k
+    float blendTime = 0.3f;                     // time for spring to reach 95% of target
     bool active = false;                        // is cursor in use
 
     // Local-space pose stored per cursor for blending (size = jointCount)
@@ -906,7 +994,6 @@ struct ControlledCharacter {
 
     // Random switch timer
     float switchTimer;
-    static constexpr float SWITCH_INTERVAL = 1.0f;
 
     // Pose output (local space with root zeroed, then transformed to world)
     TransformData xformData;
@@ -941,7 +1028,8 @@ struct ControlledCharacter {
 static void ControlledCharacterInit(
     ControlledCharacter* cc,
     const BVHData* skeleton,
-    float scale)
+    float scale,
+    float switchInterval)
 {
     cc->skeleton = skeleton;
     cc->scale = scale;
@@ -954,7 +1042,7 @@ static void ControlledCharacterInit(
     // Animation state
     cc->animIndex = 0;
     cc->animTime = 0.0f;
-    cc->switchTimer = ControlledCharacter::SWITCH_INTERVAL;
+    cc->switchTimer = switchInterval;
 
     // Initialize transform buffers
     TransformDataInit(&cc->xformData);
@@ -981,7 +1069,6 @@ static void ControlledCharacterInit(
         cc->cursors[i].weight = 0.0f;
         cc->cursors[i].targetWeight = 0.0f;
         cc->cursors[i].weightVel = 0.0f;
-        cc->cursors[i].weightStiffness = 30.0f;
     }
 
     // Sample initial pose to get starting root state
@@ -1035,9 +1122,10 @@ static BlendCursor* FindAvailableCursor(ControlledCharacter* cc)
 // Helper: update a critically-damped spring for cursor weight
 static inline void UpdateWeightSpring(BlendCursor* cursor, float dt)
 {
-    // stiffness k, damping d = 2*sqrt(k) for critical damping
-    const float k = cursor->weightStiffness;
-    const float d = 2.0f * sqrtf(k);
+    // compute stiffness from blendTime: k = (4.75 / blendTime)^2 gives 95% settling
+    const float omega = 4.75f / cursor->blendTime;
+    const float k = omega * omega;
+    const float d = 2.0f * omega;  // critical damping: d = 2*sqrt(k) = 2*omega
     const float x = cursor->weight - cursor->targetWeight;
     const float acc = -k * x - d * cursor->weightVel;
     cursor->weightVel += acc * dt;
@@ -1056,7 +1144,9 @@ static void ControlledCharacterUpdate(
     const CharacterData* characterData,
     const AnimDatabase* db,
     float dt,
-    int sampleMode)
+    int sampleMode,
+    float defaultBlendTime,
+    float switchInterval)
 {
     if (!cc->active || characterData->count == 0) return;
 
@@ -1118,7 +1208,7 @@ static void ControlledCharacterUpdate(
 
             cursor->weightVel = 0.0f;
             cursor->targetWeight = 1.0f;
-            cursor->weightStiffness = 30.0f;
+            cursor->blendTime = defaultBlendTime;
 
             Vector3 rootPos;
             Quaternion rootRot;
@@ -1137,7 +1227,7 @@ static void ControlledCharacterUpdate(
 
         cc->animIndex = newAnim;
         cc->animTime = startTime;
-        cc->switchTimer = ControlledCharacter::SWITCH_INTERVAL;
+        cc->switchTimer = switchInterval;
 
         TraceLog(LOG_INFO, "ControlledCharacter: Spawned cursor for anim %d, time %.2f", newAnim, startTime);
     }
@@ -1869,6 +1959,8 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Separator();
         ImGui::Checkbox("Draw Features", &config->drawFeatures);
         ImGui::Checkbox("Draw Blend Cursors", &config->drawBlendCursors);
+        ImGui::Checkbox("Draw Velocities", &config->drawVelocities);
+        ImGui::Checkbox("Draw Accelerations", &config->drawAccelerations);
 
     }
     ImGui::End();
@@ -2037,6 +2129,17 @@ static inline void ImGuiScrubberSettings(
     ImGui::End();
 }
 
+static inline void ImGuiAnimSettings(AppConfig* config)
+{
+    ImGui::SetNextWindowPos(ImVec2(250, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(200, 100), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Anim Settings")) {
+        ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.05f, 2.0f, "%.2f s");
+        ImGui::SliderFloat("Switch Interval", &config->switchInterval, 0.1f, 5.0f, "%.2f s");
+    }
+    ImGui::End();
+}
+
 //----------------------------------------------------------------------------------
 // Application
 //----------------------------------------------------------------------------------
@@ -2131,12 +2234,13 @@ static void ApplicationUpdate(void* voidApplicationState)
                 app->controlledCharacter.active = false;
             }
             else {
-                // initialize controlled character 
+                // initialize controlled character
                 if (!app->controlledCharacter.active) {
                     ControlledCharacterInit(
                         &app->controlledCharacter,
                         &app->characterData.bvhData[0],
-                        app->characterData.scales[0]);
+                        app->characterData.scales[0],
+                        app->config.switchInterval);
                 }
             }
 
@@ -2341,7 +2445,9 @@ static void ApplicationUpdate(void* voidApplicationState)
             &app->characterData,
             &app->animDatabase,
             effectiveDt,
-            app->scrubberSettings.sampleMode);
+            app->scrubberSettings.sampleMode,
+            app->config.defaultBlendTime,
+            app->config.switchInterval);
     }
 
     // Update Camera
@@ -2817,6 +2923,79 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
     }
 
+    // Draw joint velocities
+    if (app->config.drawVelocities && app->animDatabase.valid)
+    {
+        const float velScale = 0.1f;  // scale factor for velocity visualization
+
+        for (int c = 0; c < app->characterData.count; ++c)
+        {
+            if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
+
+            // compute current motion frame index for this character
+            const float frameTime = app->animDatabase.animFrameTime[c];
+            const int clipStart = app->animDatabase.clipStartFrame[c];
+            const int clipEnd = app->animDatabase.clipEndFrame[c];
+            const int clipFrameCount = clipEnd - clipStart;
+            if (clipFrameCount <= 0 || frameTime <= 0.0f) continue;
+
+            int localFrame = (int)(app->scrubberSettings.playTime / frameTime);
+            localFrame = ClampInt(localFrame, 0, clipFrameCount - 1);
+            const int motionFrame = clipStart + localFrame;
+
+            const int jointCount = app->animDatabase.jointCount;
+            const TransformData& xform = app->characterData.xformData[c];
+
+            for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
+            {
+                if (xform.endSite[j]) continue;  // skip end sites
+
+                const size_t idx = (size_t)motionFrame * jointCount + j;
+                const Vector3 pos = xform.globalPositions[j];
+                const Vector3 vel = app->animDatabase.globalJointVelocities[idx];
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(vel, velScale));
+
+                DrawLine3D(pos, endPos, BLUE);
+            }
+        }
+    }
+
+    // Draw joint accelerations
+    if (app->config.drawAccelerations && app->animDatabase.valid)
+    {
+        const float accScale = 0.01f;  // scale factor for acceleration visualization (smaller since acc is larger)
+
+        for (int c = 0; c < app->characterData.count; ++c)
+        {
+            if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
+
+            const float frameTime = app->animDatabase.animFrameTime[c];
+            const int clipStart = app->animDatabase.clipStartFrame[c];
+            const int clipEnd = app->animDatabase.clipEndFrame[c];
+            const int clipFrameCount = clipEnd - clipStart;
+            if (clipFrameCount <= 0 || frameTime <= 0.0f) continue;
+
+            int localFrame = (int)(app->scrubberSettings.playTime / frameTime);
+            localFrame = ClampInt(localFrame, 0, clipFrameCount - 1);
+            const int motionFrame = clipStart + localFrame;
+
+            const int jointCount = app->animDatabase.jointCount;
+            const TransformData& xform = app->characterData.xformData[c];
+
+            for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
+            {
+                if (xform.endSite[j]) continue;  // skip end sites
+
+                const size_t idx = (size_t)motionFrame * jointCount + j;
+                const Vector3 pos = xform.globalPositions[j];
+                const Vector3 acc = app->animDatabase.globalJointAccelerations[idx];
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(acc, accScale));
+
+                DrawLine3D(pos, endPos, RED);
+            }
+        }
+    }
+
     // Draw Blend Cursor Skeletons (for debug visualization)
     if (app->controlledCharacter.active && app->config.drawBlendCursors)
     {
@@ -2872,80 +3051,80 @@ static void ApplicationUpdate(void* voidApplicationState)
 
 
 
-    if (app->animDatabase.motionFrameCount > 0 && app->animDatabase.jointCount > 0)
-    {
-        // How far into the future to visualize (seconds)
-        const float futureOffsetSeconds = 1.0f;
+    //if (app->animDatabase.motionFrameCount > 0 && app->animDatabase.jointCount > 0)
+    //{
+    //    // How far into the future to visualize (seconds)
+    //    const float futureOffsetSeconds = 1.0f;
 
-        // For every loaded character (these are the entries in CharacterData)
-        for (int c = 0; c < app->characterData.count; ++c)
-        {
-            // Make sure this character has an associated clip in the motion DB
-            if (c < (int)app->animDatabase.clipStartFrame.size() &&
-                app->animDatabase.clipStartFrame[c] < app->animDatabase.clipEndFrame[c])
-            {
-                //const BVHData& bvh = app->characterData.bvhData[c];
+    //    // For every loaded character (these are the entries in CharacterData)
+    //    for (int c = 0; c < app->characterData.count; ++c)
+    //    {
+    //        // Make sure this character has an associated clip in the motion DB
+    //        if (c < (int)app->animDatabase.clipStartFrame.size() &&
+    //            app->animDatabase.clipStartFrame[c] < app->animDatabase.clipEndFrame[c])
+    //        {
+    //            //const BVHData& bvh = app->characterData.bvhData[c];
 
-                // Compute future local frame index for this clip (nearest sampling)
-                const float clipFrameTime = app->animDatabase.animFrameTime[c];
-                const int clipFrameCount = app->animDatabase.animFrameCount[c];
-                const float futureTime = app->scrubberSettings.playTime + futureOffsetSeconds;
+    //            // Compute future local frame index for this clip (nearest sampling)
+    //            const float clipFrameTime = app->animDatabase.animFrameTime[c];
+    //            const int clipFrameCount = app->animDatabase.animFrameCount[c];
+    //            const float futureTime = app->scrubberSettings.playTime + futureOffsetSeconds;
 
-                int localFrame = 0;
-                if (clipFrameTime > 0.0f)
-                {
-                    localFrame = ClampInt((int)(futureTime / clipFrameTime + 0.5f), 0, clipFrameCount - 1);
-                }
+    //            int localFrame = 0;
+    //            if (clipFrameTime > 0.0f)
+    //            {
+    //                localFrame = ClampInt((int)(futureTime / clipFrameTime + 0.5f), 0, clipFrameCount - 1);
+    //            }
 
-                // Map to motion-DB frame index (compacted DB)
-                const int motionFrameIndex = app->animDatabase.clipStartFrame[c] + localFrame;
-                if (motionFrameIndex < 0 || motionFrameIndex >= app->animDatabase.motionFrameCount)
-                {
-                    continue; // out-of-range (shouldn't usually happen)
-                }
+    //            // Map to motion-DB frame index (compacted DB)
+    //            const int motionFrameIndex = app->animDatabase.clipStartFrame[c] + localFrame;
+    //            if (motionFrameIndex < 0 || motionFrameIndex >= app->animDatabase.motionFrameCount)
+    //            {
+    //                continue; // out-of-range (shouldn't usually happen)
+    //            }
 
-                // Draw skeleton using positions from jointPositions
-                const int jointCount = app->animDatabase.jointCount;
-                const Color drawColor = app->characterData.colors[c];
+    //            // Draw skeleton using positions from jointPositions
+    //            const int jointCount = app->animDatabase.jointCount;
+    //            const Color drawColor = app->characterData.colors[c];
 
-                for (int j = 0; j < jointCount; ++j)
-                {
-                    const size_t idx = (size_t)motionFrameIndex * jointCount + j;
-                    const Vector3 jp = app->animDatabase.globalJointPositions[idx];
+    //            for (int j = 0; j < jointCount; ++j)
+    //            {
+    //                const size_t idx = (size_t)motionFrameIndex * jointCount + j;
+    //                const Vector3 jp = app->animDatabase.globalJointPositions[idx];
 
-                    // If this joint is an end-site for this character, draw slightly different primitive
-                    bool isEnd = false;
-                    if (j < app->characterData.xformData[c].jointCount)
-                    {
-                        isEnd = app->characterData.xformData[c].endSite[j];
-                    }
+    //                // If this joint is an end-site for this character, draw slightly different primitive
+    //                bool isEnd = false;
+    //                if (j < app->characterData.xformData[c].jointCount)
+    //                {
+    //                    isEnd = app->characterData.xformData[c].endSite[j];
+    //                }
 
-                    if (!isEnd)
-                    {
-                        DrawSphereWires(jp, 0.01f, 4, 6, drawColor);
-                    }
-                    else
-                    {
-                        DrawCubeWiresV(jp, Vector3{ 0.02f, 0.02f, 0.02f }, Color{ 150, 150, 150, 255 });
-                    }
+    //                if (!isEnd)
+    //                {
+    //                    DrawSphereWires(jp, 0.01f, 4, 6, drawColor);
+    //                }
+    //                else
+    //                {
+    //                    DrawCubeWiresV(jp, Vector3{ 0.02f, 0.02f, 0.02f }, Color{ 150, 150, 150, 255 });
+    //                }
 
-                    // Draw line to parent when valid
-                    int parent = -1;
-                    if (j < app->characterData.xformData[c].jointCount)
-                    {
-                        parent = app->characterData.xformData[c].parents[j];
-                    }
+    //                // Draw line to parent when valid
+    //                int parent = -1;
+    //                if (j < app->characterData.xformData[c].jointCount)
+    //                {
+    //                    parent = app->characterData.xformData[c].parents[j];
+    //                }
 
-                    if (parent != -1 && parent < jointCount)
-                    {
-                        const size_t pidx = (size_t)motionFrameIndex * jointCount + parent;
-                        const Vector3 pjp = app->animDatabase.globalJointPositions[pidx];
-                        DrawLine3D(jp, pjp, drawColor);
-                    }
-                }
-            }
-        }
-    }
+    //                if (parent != -1 && parent < jointCount)
+    //                {
+    //                    const size_t pidx = (size_t)motionFrameIndex * jointCount + parent;
+    //                    const Vector3 pjp = app->animDatabase.globalJointPositions[pidx];
+    //                    DrawLine3D(jp, pjp, drawColor);
+    //                }
+    //            }
+    //        }
+    //    }
+    //}
 
 
 
@@ -3063,6 +3242,9 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         // Scrubber
         ImGuiScrubberSettings(&app->scrubberSettings, &app->characterData, app->screenWidth, app->screenHeight);
+
+        // Animation settings
+        ImGuiAnimSettings(&app->config);
 
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
@@ -3468,18 +3650,28 @@ int main(int argc, char** argv)
         CharacterDataLoadFromFile(&app.characterData, argv[i], app.errMsg, 512);
     }
 
-    if (app.characterData.count == 0)
+    const bool loadDefaultFiles = false;
+    if (loadDefaultFiles && app.characterData.count == 0)
     {
         app.errMsg[0] = '\0';
 
         // Auto-load a default scene on startup
         {
-            const char* autoFile = "data\\timi\\xs_20251101_aleblanc_lantern_nav-003.fbx";
-            if (CharacterDataLoadFromFile(&app.characterData, autoFile, app.errMsg, sizeof(app.errMsg)))
+            std::vector<const char*> autoFiles = 
+            { 
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
+            };
+            for (const char* file : autoFiles)
             {
-                // Make the auto-loaded file the active character (if loaded)
-                app.characterData.active = app.characterData.count - 1;
-                TraceLog(LOG_INFO, "Auto-loaded default file at startup: %s", autoFile);
+                if (CharacterDataLoadFromFile(&app.characterData, file, app.errMsg, sizeof(app.errMsg)))
+                {
+                    // Make the auto-loaded file the active character (if loaded)
+                    app.characterData.active = app.characterData.count - 1;
+                    TraceLog(LOG_INFO, "Auto-loaded default file at startup: %s", file);
+                }
             }
         }
     }
@@ -3508,13 +3700,9 @@ int main(int argc, char** argv)
             ControlledCharacterInit(
                 &app.controlledCharacter,
                 &app.characterData.bvhData[0],
-                app.characterData.scales[0]);
+                app.characterData.scales[0],
+                app.config.switchInterval);
         }
-
-        ControlledCharacterInit(
-            &app.controlledCharacter,
-            &app.characterData.bvhData[0],
-            app.characterData.scales[0]);
 
         // Resize capsule buffer to include controlled character
         {
