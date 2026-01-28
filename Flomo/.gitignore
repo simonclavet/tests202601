@@ -1,0 +1,15 @@
+
+CMakeSettings.json
+
+# Large folders - don't track
+data/
+thirdparty/
+build/
+
+# Visual Studio stuff
+.vs/
+*.user
+*.suo
+
+# Other generated files
+imgui.ini

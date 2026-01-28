@@ -1,0 +1,213 @@
+#pragma once
+
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include "utils.h"
+#include "raylib.h"
+
+// Simple app config that persists between runs
+struct AppConfig {
+    // Window
+    int windowX = 100;
+    int windowY = 100;
+    int windowWidth = 2200;
+    int windowHeight = 1500;
+
+    // Camera (Unreal mode state - most general representation)
+    float cameraPosX = 2.0f;
+    float cameraPosY = 1.5f;
+    float cameraPosZ = 5.0f;
+    float cameraYaw = 3.14159f;  // PI - facing towards -Z
+    float cameraPitch = 0.0f;
+    float cameraMoveSpeed = 5.0f;
+    int cameraMode = 1;  // 0 = Orbit, 1 = Unreal
+
+    // Render settings (persisted)
+    // Colors stored as separate ints so parsing/writing JSON remains simple here.
+    Color backgroundColor = { 255, 255, 255, 255 };
+    float sunLightConeAngle = 0.2f;
+    float sunLightStrength = 0.25f;
+    float sunAzimuth = 3.14159f / 4.0f;
+    float sunAltitude = 0.8f;
+    Color sunColor = { 253, 255, 232, 255 };
+
+    float skyLightStrength = 0.15f;
+    Color skyColor = { 174, 183, 190, 255 };
+
+    float groundLightStrength = 0.1f;
+    float ambientLightStrength = 1.0f;
+
+    float exposure = 0.9f;
+
+    // Toggles
+    bool drawOrigin = true;
+    bool drawGrid = false;
+    bool drawChecker = true;
+    bool drawCapsules = true;
+    bool drawWireframes = false;
+    bool drawSkeleton = true;
+    bool drawTransforms = false;
+    bool drawAO = true;
+    bool drawShadows = true;
+    bool drawEndSites = true;
+    bool drawFPS = false;
+    bool drawUI = true;
+
+    bool drawFeatures = false;
+    bool drawBlendCursors = true;  // Debug: show individual blend cursor skeletons
+
+    // Validity
+    bool valid = false;
+};
+
+
+static const char* CONFIG_FILENAME = "flomo_config.json";
+
+// Get config file path (next to executable or in working directory)
+static inline const char* GetConfigPath()
+{
+    static char path[512];
+    snprintf(path, sizeof(path), "%s", CONFIG_FILENAME);
+    return path;
+}
+
+
+// Load config from JSON file
+static inline AppConfig LoadAppConfig(int argc, char** argv)
+{
+    AppConfig config = {};
+
+    // Try to open file; if absent we still apply command-line overrides below.
+    FILE* file = fopen(GetConfigPath(), "r");
+    char* buffer = nullptr;
+    if (file) {
+        fseek(file, 0, SEEK_END);
+        const long size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        buffer = (char*)malloc(size + 1);
+        if (buffer) {
+            fread(buffer, 1, size, file);
+            buffer[size] = '\0';
+        }
+        fclose(file);
+    }
+
+    // Apply JSON (if any) and then command-line overrides (via Resolve helpers).
+    config.windowX = ResolveIntConfig(buffer, "windowX", config.windowX, argc, argv);
+    config.windowY = ResolveIntConfig(buffer, "windowY", config.windowY, argc, argv);
+    config.windowWidth = ResolveIntConfig(buffer, "windowWidth", config.windowWidth, argc, argv);
+    config.windowHeight = ResolveIntConfig(buffer, "windowHeight", config.windowHeight, argc, argv);
+
+    config.cameraPosX = ResolveFloatConfig(buffer, "cameraPosX", config.cameraPosX, argc, argv);
+    config.cameraPosY = ResolveFloatConfig(buffer, "cameraPosY", config.cameraPosY, argc, argv);
+    config.cameraPosZ = ResolveFloatConfig(buffer, "cameraPosZ", config.cameraPosZ, argc, argv);
+    config.cameraYaw = ResolveFloatConfig(buffer, "cameraYaw", config.cameraYaw, argc, argv);
+    config.cameraPitch = ResolveFloatConfig(buffer, "cameraPitch", config.cameraPitch, argc, argv);
+    config.cameraMoveSpeed = ResolveFloatConfig(buffer, "cameraMoveSpeed", config.cameraMoveSpeed, argc, argv);
+    config.cameraMode = ResolveIntConfig(buffer, "cameraMode", config.cameraMode, argc, argv);
+
+
+    // Render fields (colors as arrays)
+    config.backgroundColor = ResolveColorConfig(buffer, "backgroundColor", config.backgroundColor, argc, argv);
+
+    config.sunLightConeAngle = ResolveFloatConfig(buffer, "sunLightConeAngle", config.sunLightConeAngle, argc, argv);
+    config.sunLightStrength = ResolveFloatConfig(buffer, "sunLightStrength", config.sunLightStrength, argc, argv);
+    config.sunAzimuth = ResolveFloatConfig(buffer, "sunAzimuth", config.sunAzimuth, argc, argv);
+    config.sunAltitude = ResolveFloatConfig(buffer, "sunAltitude", config.sunAltitude, argc, argv);
+    config.sunColor = ResolveColorConfig(buffer, "sunColor", config.sunColor, argc, argv);
+
+    config.skyLightStrength = ResolveFloatConfig(buffer, "skyLightStrength", config.skyLightStrength, argc, argv);
+    config.skyColor = ResolveColorConfig(buffer, "skyColor", config.skyColor, argc, argv);
+
+
+    config.groundLightStrength = ResolveFloatConfig(buffer, "groundLightStrength", config.groundLightStrength, argc, argv);
+    config.ambientLightStrength = ResolveFloatConfig(buffer, "ambientLightStrength", config.ambientLightStrength, argc, argv);
+
+    config.exposure = ResolveFloatConfig(buffer, "exposure", config.exposure, argc, argv);
+
+    config.drawOrigin = ResolveBoolConfig(buffer, "drawOrigin", config.drawOrigin, argc, argv);
+    config.drawGrid = ResolveBoolConfig(buffer, "drawGrid", config.drawGrid, argc, argv);
+    config.drawChecker = ResolveBoolConfig(buffer, "drawChecker", config.drawChecker, argc, argv);
+    config.drawCapsules = ResolveBoolConfig(buffer, "drawCapsules", config.drawCapsules, argc, argv);
+    config.drawWireframes = ResolveBoolConfig(buffer, "drawWireframes", config.drawWireframes, argc, argv);
+    config.drawSkeleton = ResolveBoolConfig(buffer, "drawSkeleton", config.drawSkeleton, argc, argv);
+    config.drawTransforms = ResolveBoolConfig(buffer, "drawTransforms", config.drawTransforms, argc, argv);
+    config.drawAO = ResolveBoolConfig(buffer, "drawAO", config.drawAO, argc, argv);
+    config.drawShadows = ResolveBoolConfig(buffer, "drawShadows", config.drawShadows, argc, argv);
+    config.drawEndSites = ResolveBoolConfig(buffer, "drawEndSites", config.drawEndSites, argc, argv);
+    config.drawFPS = ResolveBoolConfig(buffer, "drawFPS", config.drawFPS, argc, argv);
+    config.drawUI = ResolveBoolConfig(buffer, "drawUI", config.drawUI, argc, argv);
+
+    config.drawFeatures = ResolveBoolConfig(buffer, "drawFeatures", config.drawFeatures, argc, argv);
+    config.drawBlendCursors = ResolveBoolConfig(buffer, "drawBlendCursors", config.drawBlendCursors, argc, argv);
+
+    if (buffer) free(buffer);
+
+    // Validate window values
+    if (config.windowX >= 0 && config.windowY >= 0 &&
+        config.windowWidth > 100 && config.windowHeight > 100) {
+        config.valid = true;
+    }
+
+    return config;
+}
+
+static inline void SaveAppConfig(const AppConfig& cfg)
+{
+    FILE* file = fopen(GetConfigPath(), "w");
+    if (!file) {
+        return;
+    }
+
+    fprintf(file, "{\n");
+    fprintf(file, "    \"windowX\": %d,\n", cfg.windowX);
+    fprintf(file, "    \"windowY\": %d,\n", cfg.windowY);
+    fprintf(file, "    \"windowWidth\": %d,\n", cfg.windowWidth);
+    fprintf(file, "    \"windowHeight\": %d,\n", cfg.windowHeight);
+    fprintf(file, "    \"cameraPosX\": %.4f,\n", cfg.cameraPosX);
+    fprintf(file, "    \"cameraPosY\": %.4f,\n", cfg.cameraPosY);
+    fprintf(file, "    \"cameraPosZ\": %.4f,\n", cfg.cameraPosZ);
+    fprintf(file, "    \"cameraYaw\": %.4f,\n", cfg.cameraYaw);
+    fprintf(file, "    \"cameraPitch\": %.4f,\n", cfg.cameraPitch);
+    fprintf(file, "    \"cameraMoveSpeed\": %.4f,\n", cfg.cameraMoveSpeed);
+    fprintf(file, "    \"cameraMode\": %d,\n", cfg.cameraMode);
+
+    // Render settings (colors as arrays)
+    fprintf(file, "    \"backgroundColor\": [ %d, %d, %d ],\n", cfg.backgroundColor.r, cfg.backgroundColor.g, cfg.backgroundColor.b);
+
+    fprintf(file, "    \"sunLightConeAngle\": %.6f,\n", cfg.sunLightConeAngle);
+    fprintf(file, "    \"sunLightStrength\": %.6f,\n", cfg.sunLightStrength);
+    fprintf(file, "    \"sunAzimuth\": %.6f,\n", cfg.sunAzimuth);
+    fprintf(file, "    \"sunAltitude\": %.6f,\n", cfg.sunAltitude);
+    fprintf(file, "    \"sunColor\": [ %d, %d, %d ],\n", cfg.sunColor.r, cfg.sunColor.g, cfg.sunColor.b);
+
+    fprintf(file, "    \"skyLightStrength\": %.6f,\n", cfg.skyLightStrength);
+    fprintf(file, "    \"skyColor\": [ %d, %d, %d ],\n", cfg.skyColor.r, cfg.skyColor.g, cfg.skyColor.b);
+
+    fprintf(file, "    \"groundLightStrength\": %.6f,\n", cfg.groundLightStrength);
+    fprintf(file, "    \"ambientLightStrength\": %.6f,\n", cfg.ambientLightStrength);
+
+    fprintf(file, "    \"exposure\": %.6f,\n", cfg.exposure);
+
+    fprintf(file, "    \"drawOrigin\": %s,\n", cfg.drawOrigin ? "true" : "false");
+    fprintf(file, "    \"drawGrid\": %s,\n", cfg.drawGrid ? "true" : "false");
+    fprintf(file, "    \"drawChecker\": %s,\n", cfg.drawChecker ? "true" : "false");
+    fprintf(file, "    \"drawCapsules\": %s,\n", cfg.drawCapsules ? "true" : "false");
+    fprintf(file, "    \"drawWireframes\": %s,\n", cfg.drawWireframes ? "true" : "false");
+    fprintf(file, "    \"drawSkeleton\": %s,\n", cfg.drawSkeleton ? "true" : "false");
+    fprintf(file, "    \"drawTransforms\": %s,\n", cfg.drawTransforms ? "true" : "false");
+    fprintf(file, "    \"drawAO\": %s,\n", cfg.drawAO ? "true" : "false");
+    fprintf(file, "    \"drawShadows\": %s,\n", cfg.drawShadows ? "true" : "false");
+    fprintf(file, "    \"drawEndSites\": %s,\n", cfg.drawEndSites ? "true" : "false");
+    fprintf(file, "    \"drawFPS\": %s,\n", cfg.drawFPS ? "true" : "false");
+    fprintf(file, "    \"drawUI\": %s\n", cfg.drawUI ? "true" : "false");
+
+    fprintf(file, "    \"drawFeatures\": %s,\n", cfg.drawFeatures ? "true" : "false");
+    fprintf(file, "    \"drawBlendCursors\": %s\n", cfg.drawBlendCursors ? "true" : "false");
+
+    fprintf(file, "}\n");
+
+    fclose(file);
+}
