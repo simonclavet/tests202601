@@ -15,7 +15,7 @@
 //----------------------------------------------------------------------------------
 
 // Structure for containing a sampled pose as joint transforms
-typedef struct
+struct TransformData
 {
     int jointCount;
     std::vector<int> parents;
@@ -25,7 +25,7 @@ typedef struct
     std::vector<Vector3> globalPositions;
     std::vector<Quaternion> globalRotations;
 
-} TransformData;
+};
 
 static inline void TransformDataInit(TransformData* data)
 {

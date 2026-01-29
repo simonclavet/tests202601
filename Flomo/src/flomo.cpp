@@ -198,15 +198,21 @@ static inline void CharacterDataInit(CharacterData* data, int argc, char** argv)
 
 static inline void CharacterDataFree(CharacterData* data)
 {
-    for (int i = 0; i < data->count; i++)
-    {
-        TransformDataFree(&data->xformData[i]);
-        TransformDataFree(&data->xformTmp0[i]);
-        TransformDataFree(&data->xformTmp1[i]);
-        TransformDataFree(&data->xformTmp2[i]);
-        TransformDataFree(&data->xformTmp3[i]);
-        BVHDataFree(&data->bvhData[i]);
-    }
+    data->xformData.clear();
+    data->xformTmp0.clear();
+    data->xformTmp1.clear();
+    data->xformTmp2.clear();
+    data->xformTmp3.clear();
+    data->bvhData.clear();
+    data->scales.clear();
+    data->names.clear();
+    data->autoScales.clear();
+    data->colors.clear();
+    data->opacities.clear();
+    data->radii.clear();
+    data->filePaths.clear();
+    data->count = 0;
+
 }
 
 // Helper to get color for a new character
@@ -390,7 +396,7 @@ struct AnimDatabase {
     int featureDim = -1;
     Array2D<float> features;
     int hipJointIndex = -1;            // resolved index for "Hips" in canonical skeleton
-    int toeIndices[2] = { -1, -1 };
+    int toeIndices[SIDES_COUNT] = { -1, -1 };
     vector<string> featureNames;
 };
 
@@ -909,6 +915,38 @@ static void AnimDatabaseRandomTime(const AnimDatabase* db, int* animIndex, float
     *time = randomFrame * frameTime;
 }
 
+// Computes interpolation frame indices and alpha for animation sampling
+static inline void GetInterFrameAlpha(
+    const AnimDatabase* db,
+    int animIndex,
+    float animTime,
+    int& outF0,
+    int& outF1,
+    float& outAlpha)
+{
+    const float frameTime = db->animFrameTime[animIndex];
+    const int frameCount = db->animFrameCount[animIndex];
+
+    outF0 = 0;
+    outF1 = 0;
+    outAlpha = 0.0f;
+
+    if (frameTime > 0.0f && frameCount > 0)
+    {
+        const float maxFrame = (float)(frameCount - 1);
+        float frameF = animTime / frameTime;
+
+        if (frameF < 0.0f) frameF = 0.0f;
+        if (frameF > maxFrame) frameF = maxFrame;
+
+        outF0 = (int)floorf(frameF);
+        outF1 = outF0 + 1;
+        if (outF1 >= frameCount) outF1 = frameCount - 1;
+        outAlpha = frameF - (float)outF0;
+    }
+}
+
+
 // sample interpolated local pose from AnimDatabase at time animTime, using Rot6d for rotations
 // optionally also samples angular velocities if outAngularVelocities is not null
 // velocityTimeOffset: offset added to animTime when sampling velocities (use -dt/2 for midpoint sampling)
@@ -923,34 +961,13 @@ static inline void SampleCursorPoseLerp6d(
     Vector3* outRootPos,
     Rot6d* outRootRot6d)
 {
-    const float frameTime = db->animFrameTime[animIndex];
-    const int frameCount = db->animFrameCount[animIndex];
     const int jointCount = db->jointCount;
     const int clipStart = db->clipStartFrame[animIndex];
-    const float maxFrame = (float)(frameCount - 1);
-
-    // helper to compute frame indices and alpha for a given time
-    auto computeFrameAlpha = [&](float t, int& outF0, int& outF1, float& outAlpha)
-    {
-        outF0 = 0;
-        outF1 = 0;
-        outAlpha = 0.0f;
-        if (frameTime > 0.0f && frameCount > 0)
-        {
-            float frameF = t / frameTime;
-            if (frameF < 0.0f) frameF = 0.0f;
-            if (frameF > maxFrame) frameF = maxFrame;
-            outF0 = (int)floorf(frameF);
-            outF1 = outF0 + 1;
-            if (outF1 >= frameCount) outF1 = frameCount - 1;
-            outAlpha = frameF - (float)outF0;
-        }
-    };
 
     // sample pose at animTime
     int f0, f1;
     float alpha;
-    computeFrameAlpha(animTime, f0, f1, alpha);
+    GetInterFrameAlpha(db, animIndex, animTime, f0, f1, alpha);
 
     span<const Vector3> posRow0 = db->localJointPositions.row_view(clipStart + f0);
     span<const Vector3> posRow1 = db->localJointPositions.row_view(clipStart + f1);
@@ -968,7 +985,7 @@ static inline void SampleCursorPoseLerp6d(
     {
         int vf0, vf1;
         float vAlpha;
-        computeFrameAlpha(animTime + velocityTimeOffset, vf0, vf1, vAlpha);
+        GetInterFrameAlpha(db, animIndex, animTime, vf0, vf1, vAlpha);
 
         span<const Vector3> velRow0 = db->localJointAngularVelocities.row_view(clipStart + vf0);
         span<const Vector3> velRow1 = db->localJointAngularVelocities.row_view(clipStart + vf1);
@@ -980,6 +997,38 @@ static inline void SampleCursorPoseLerp6d(
 
     if (outRootPos) *outRootPos = outPositions[0];
     if (outRootRot6d) *outRootRot6d = outRotations6d[0];
+}
+
+// sample global toe velocity from db->globalJointVelocities at animTime
+// used for foot IK velocity blending
+static inline void SampleGlobalToeVelocity(
+    const AnimDatabase* db,
+    int animIndex,
+    float animTime,
+    /*out*/ Vector3 outToeVelocity[SIDES_COUNT])
+{
+    const int clipStart = db->clipStartFrame[animIndex];
+
+    // sample pose at animTime
+    int f0, f1;
+    float alpha;
+    GetInterFrameAlpha(db, animIndex, animTime, f0, f1, alpha);
+
+    span<const Vector3> velRow0 = db->globalJointVelocities.row_view(clipStart + f0);
+    span<const Vector3> velRow1 = db->globalJointVelocities.row_view(clipStart + f1);
+
+    for (int side : sides)
+    {
+        const int toeIdx = db->toeIndices[side];
+        if (toeIdx >= 0)
+        {
+            outToeVelocity[side] = Vector3Lerp(velRow0[toeIdx], velRow1[toeIdx], alpha);
+        }
+        else
+        {
+            outToeVelocity[side] = Vector3Zero();
+        }
+    }
 }
 
 struct BlendCursor {
@@ -1014,6 +1063,9 @@ struct BlendCursor {
     float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
     Vector3 prevRootVelocity = Vector3Zero(); // previous frame's velocity
     float prevRootYawRate = 0.0f;            // previous frame's yaw rate
+
+    // Global toe velocities for foot IK (sampled from db->globalJointVelocities)
+    Vector3 globalToeVelocity[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
 };
 
 //----------------------------------------------------------------------------------
@@ -1082,6 +1134,12 @@ struct ControlledCharacter {
     Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
     float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
     bool rootMotionInitialized = false;
+
+    // Toe velocity tracking (for foot IK)
+    Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame global positions
+    Vector3 toeActualVelocity[SIDES_COUNT];       // computed from FK: (current - prev) / dt
+    Vector3 toeBlendedVelocity[SIDES_COUNT];      // blended from cursor global toe velocities
+    bool toeTrackingInitialized = false;
 };
 
 // Initialize the controlled character when first animation is loaded
@@ -1335,6 +1393,11 @@ static void ControlledCharacterUpdate(
             &sampledRootPos,
             &sampledRootRot6d);
 
+        // Sample global toe velocities from database (for foot IK)
+        // These are in animation-world space, we'll transform them to character-world after getting root yaw
+        Vector3 animSpaceToeVel[SIDES_COUNT];
+        SampleGlobalToeVelocity(db, cur.animIndex, cur.animTime - dt * 0.5f, animSpaceToeVel);
+
         // Update weight via spring integrator
         DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
 
@@ -1355,6 +1418,17 @@ static void ControlledCharacterUpdate(
         const float prevYaw = Rot6dGetYaw(prevLocalRootRot6d);
         const float currYaw = Rot6dGetYaw(currLocalRootRot6d);
         const Rot6d invPrevYawRot = Rot6dFromYaw(-prevYaw);
+        const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
+
+        // Transform toe velocities from animation-world to character-world
+        // 1. Remove animation's root yaw (to get heading-relative velocity)
+        // 2. Rotate by character's worldRotation
+        for (int side : sides)
+        {
+            Vector3 toeVelLocal;
+            Rot6dTransformVector(invCurrYawRot, animSpaceToeVel[side], toeVelLocal);
+            cur.globalToeVelocity[side] = Vector3RotateByQuaternion(toeVelLocal, cc->worldRotation);
+        }
 
         Vector3 deltaLocal;
         Rot6dTransformVector(invPrevYawRot, deltaPosAnim, deltaLocal);
@@ -1414,6 +1488,26 @@ static void ControlledCharacterUpdate(
             continue;
         }
         cur.normalizedWeight = (totalRootWeight > 1e-6f) ? (cur.weightSpring.x / totalRootWeight) : 0.0f;
+    }
+
+    // Blend toe velocities from cursors using normalized weights
+    for (int side : sides)
+    {
+        cc->toeBlendedVelocity[side] = Vector3Zero();
+    }
+    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+    {
+        const BlendCursor& cur = cc->cursors[ci];
+        if (!cur.active) continue;
+        const float w = cur.normalizedWeight;
+        if (w <= 1e-6f) continue;
+
+        for (int side : sides)
+        {
+            cc->toeBlendedVelocity[side] = Vector3Add(
+                cc->toeBlendedVelocity[side],
+                Vector3Scale(cur.globalToeVelocity[side], w));
+        }
     }
 
     // Compute FK for each active cursor (for debug visualization)
@@ -1691,6 +1785,26 @@ static void ControlledCharacterUpdate(
         cc->xformData.globalPositions[i] = Vector3Add(Vector3RotateByQuaternion(cc->xformData.globalPositions[i], cc->worldRotation), cc->worldPosition);
         cc->xformData.globalRotations[i] = QuaternionMultiply(cc->worldRotation, cc->xformData.globalRotations[i]);
     }
+
+    // Compute actual toe velocity from FK result
+    for (int side : sides)
+    {
+        const int toeIdx = db->toeIndices[side];
+        if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount) continue;
+
+        const Vector3 currentPos = cc->xformData.globalPositions[toeIdx];
+        if (cc->toeTrackingInitialized && dt > 1e-6f)
+        {
+            cc->toeActualVelocity[side] = Vector3Scale(
+                Vector3Subtract(currentPos, cc->prevToeGlobalPos[side]), 1.0f / dt);
+        }
+        else
+        {
+            cc->toeActualVelocity[side] = Vector3Zero();
+        }
+        cc->prevToeGlobalPos[side] = currentPos;
+    }
+    cc->toeTrackingInitialized = true;
 }
 
 
@@ -2123,6 +2237,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Velocities", &config->drawVelocities);
         ImGui::Checkbox("Draw Accelerations", &config->drawAccelerations);
         ImGui::Checkbox("Draw Root Velocities", &config->drawRootVelocities);
+        ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
 
     }
     ImGui::End();
@@ -2392,6 +2507,15 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         if (app->characterData.count > prevBvhCount)
         {
+            // Ensure active character is valid
+            if (app->characterData.active < 0 || app->characterData.active >= app->characterData.count)
+            {
+                app->characterData.active = app->characterData.count - 1;
+            }
+
+            // Reset scrubber to known state before updating
+            ScrubberSettingsInit(&app->scrubberSettings, app->argc, app->argv);
+
             ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
             ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
 
@@ -3210,6 +3334,32 @@ static void ApplicationUpdate(void* voidApplicationState)
             const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cc.smoothedRootVelocity, velScale));
             DrawLine3D(startPos, endPos, WHITE);
             DrawSphere(endPos, 0.025f, WHITE);
+        }
+    }
+
+    // Draw toe velocities (actual vs blended)
+    if (app->controlledCharacter.active && app->config.drawToeVelocities && app->animDatabase.valid)
+    {
+        const ControlledCharacter& cc = app->controlledCharacter;
+        const AnimDatabase& db = app->animDatabase;
+        const float velScale = 0.3f;  // scale for velocity visualization
+
+        for (int side : sides)
+        {
+            const int toeIdx = db.toeIndices[side];
+            if (toeIdx < 0 || toeIdx >= cc.xformData.jointCount) continue;
+
+            const Vector3 toePos = cc.xformData.globalPositions[toeIdx];
+
+            // Actual velocity (yellow) - computed from FK result
+            const Vector3 actualEnd = Vector3Add(toePos, Vector3Scale(cc.toeActualVelocity[side], velScale));
+            DrawLine3D(toePos, actualEnd, YELLOW);
+            DrawSphere(actualEnd, 0.015f, YELLOW);
+
+            // Blended velocity (cyan) - weighted average from cursors
+            const Vector3 blendedEnd = Vector3Add(toePos, Vector3Scale(cc.toeBlendedVelocity[side], velScale));
+            DrawLine3D(toePos, blendedEnd, SKYBLUE);
+            DrawSphere(blendedEnd, 0.015f, SKYBLUE);
         }
     }
 

@@ -60,6 +60,7 @@ struct AppConfig {
     bool drawVelocities = false;   // Draw joint velocity vectors
     bool drawAccelerations = false; // Draw joint acceleration vectors
     bool drawRootVelocities = false; // Draw root motion velocity from each cursor
+    bool drawToeVelocities = false;  // Draw toe velocity vectors (actual vs blended)
 
     // Animation settings
     float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
@@ -169,6 +170,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawVelocities = ResolveBoolConfig(buffer, "drawVelocities", config.drawVelocities, argc, argv);
     config.drawAccelerations = ResolveBoolConfig(buffer, "drawAccelerations", config.drawAccelerations, argc, argv);
     config.drawRootVelocities = ResolveBoolConfig(buffer, "drawRootVelocities", config.drawRootVelocities, argc, argv);
+    config.drawToeVelocities = ResolveBoolConfig(buffer, "drawToeVelocities", config.drawToeVelocities, argc, argv);
 
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
@@ -243,6 +245,7 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"drawVelocities\": %s,\n", cfg.drawVelocities ? "true" : "false");
     fprintf(file, "    \"drawAccelerations\": %s,\n", cfg.drawAccelerations ? "true" : "false");
     fprintf(file, "    \"drawRootVelocities\": %s,\n", cfg.drawRootVelocities ? "true" : "false");
+    fprintf(file, "    \"drawToeVelocities\": %s,\n", cfg.drawToeVelocities ? "true" : "false");
 
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
     fprintf(file, "    \"switchInterval\": %.4f,\n", cfg.switchInterval);
