@@ -37,6 +37,10 @@
     "drawBlendCursors": true,
     "drawVelocities": false,
     "drawAccelerations": false,
-    "defaultBlendTime": 0.1100,
-    "switchInterval": 5.0000
+    "drawRootVelocities": false,
+    "defaultBlendTime": 0.0900,
+    "switchInterval": 5.0000,
+    "useVelBlending": true,
+    "blendPosReturnHalflife": 0.3500,
+    "hipsRotationHalflife": 0.2100
 }

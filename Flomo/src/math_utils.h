@@ -286,10 +286,10 @@ static inline void SimpleSpringDamper(
     float& x,
     float& v,
     float x_goal,
-    float halflife,
+    float blendtime,
     float dt)
 {
-    const float y = HalflifeToDamping(halflife) / 2.0f;
+    const float y = HalflifeToDamping(blendtime / 2.0f) / 2.0f;
     const float eydt = FastNegExp(y * dt);
 
     SimpleSpringDamperUsingDampingEydt(x, v, x_goal, y, eydt, dt);
@@ -306,10 +306,11 @@ struct DoubleSpringDamperState
 static inline void DoubleSpringDamper(
     DoubleSpringDamperState& state,
     float x_goal,
-    float halflife,
+    float blendtime,
     float dt)
 {
-    const float y = HalflifeToDamping(halflife) / 2.0f;
+    // half of the blendtime for each damper
+    const float y = HalflifeToDamping(blendtime / 4.0f) / 2.0f;
     const float eydt = FastNegExp(y * dt);
 
     SimpleSpringDamperUsingDampingEydt(state.xi, state.vi, x_goal, y, eydt, dt);
@@ -555,6 +556,40 @@ void Rot6dNormalize(Rot6d& rot)
 static inline Rot6d Rot6dIdentity()
 {
     return Rot6d{ 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+}
+
+// extract Y-rotation (yaw) angle from Rot6d
+// the first column (a) of a Y-rotation matrix is [cos(y), 0, -sin(y)]
+// so yaw = atan2(-az, ax)
+static inline float Rot6dGetYaw(const Rot6d& rot)
+{
+    return atan2f(-rot.az, rot.ax);
+}
+
+// create a Y-only rotation Rot6d from an angle
+static inline Rot6d Rot6dFromYaw(float yaw)
+{
+    const float c = cosf(yaw);
+    const float s = sinf(yaw);
+    // Y-rotation matrix:
+    // | cos   0  sin |
+    // |  0    1   0  |
+    // |-sin   0  cos |
+    // first column (a) = [cos, 0, -sin], second column (b) = [0, 1, 0]
+    return Rot6d{ c, 0.0f, -s, 0.0f, 1.0f, 0.0f };
+}
+
+// remove Y-rotation component from a Rot6d, returning just the tilt/roll
+// result = inverse(yaw) * rot
+// safe to call with rot == out (handles aliasing)
+static inline void Rot6dRemoveYComponent(const Rot6d& rot, Rot6d& out)
+{
+    const float yaw = Rot6dGetYaw(rot);
+    const Rot6d invYaw = Rot6dFromYaw(-yaw);
+    Rot6d tmp;
+    Rot6dMultiply(invYaw, rot, tmp);
+    Rot6dNormalize(tmp);  // ensure orthonormal after multiplication
+    out = tmp;
 }
 
 void Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt, Vector3& outOmega)

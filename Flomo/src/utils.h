@@ -329,18 +329,47 @@ private:
     std::vector<T> data_;
 
 public:
-    // Constructor
+    // Default constructor (empty array)
+    Array2D()
+        : rows_(0), cols_(0), data_()
+    {
+    }
+
+    // Constructor with dimensions
     Array2D(int rows, int cols)
-        : rows_(rows), cols_(cols), data_(rows* cols)
+        : rows_(rows), cols_(cols), data_(rows * cols)
     {
         assert(rows >= 0 && cols >= 0 && "Array2D dimensions must be non-negative");
     }
 
     // Constructor with initial value
     Array2D(int rows, int cols, const T& initial_value)
-        : rows_(rows), cols_(cols), data_(rows* cols, initial_value)
+        : rows_(rows), cols_(cols), data_(rows * cols, initial_value)
     {
         assert(rows >= 0 && cols >= 0 && "Array2D dimensions must be non-negative");
+    }
+
+    // Resize the array (invalidates existing data)
+    void resize(int rows, int cols)
+    {
+        assert(rows >= 0 && cols >= 0 && "Array2D dimensions must be non-negative");
+        rows_ = rows;
+        cols_ = cols;
+        data_.resize(rows * cols);
+    }
+
+    // Clear the array (set to empty)
+    void clear()
+    {
+        rows_ = 0;
+        cols_ = 0;
+        data_.clear();
+    }
+
+    // Check if empty
+    bool empty() const noexcept
+    {
+        return data_.empty();
     }
 
     // Non-const element access with bounds checking

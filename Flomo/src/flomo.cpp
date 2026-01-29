@@ -57,6 +57,8 @@
 #include "imgui.h"
 #include "rlImGui.h"
 
+using namespace std;
+
 // Declare the CUDA functions
 extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
 extern "C" void cuda_check_error(const char* msg);
@@ -64,19 +66,19 @@ extern "C" void cuda_check_error(const char* msg);
 static void TestCudaAndLibtorch()
 {
     const int N = 1000000;  // 1 million elements
-    std::vector<float> a(N, 1.0f);
-    std::vector<float> b(N, 2.0f);
-    std::vector<float> c(N, 0.0f);
+    vector<float> a(N, 1.0f);
+    vector<float> b(N, 2.0f);
+    vector<float> c(N, 0.0f);
 
-    std::cout << "Running CUDA addition..." << std::endl;
+    cout << "Running CUDA addition..." << endl;
 
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start = chrono::high_resolution_clock::now();
 
     run_cuda_addition(a.data(), b.data(), c.data(), N);
     cuda_check_error("main execution");
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
     bool correct = true;
     for (int i = 0; i < 10; i++) {
@@ -86,27 +88,27 @@ static void TestCudaAndLibtorch()
         }
     }
 
-    std::cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << std::endl;
-    std::cout << "Time: " << duration.count() << " microseconds" << std::endl;
-    std::cout << "First 5 results: ";
+    cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << endl;
+    cout << "Time: " << duration.count() << " microseconds" << endl;
+    cout << "First 5 results: ";
     for (int i = 0; i < 5; i++) {
-        std::cout << c[i] << " ";
+        cout << c[i] << " ";
     }
-    std::cout << std::endl;
+    cout << endl;
 
     torch::Device device(torch::kCPU);
     if (torch::cuda::is_available()) {
         device = torch::Device(torch::kCUDA);
-        std::cout << "LibTorch: Using CUDA device" << std::endl;
+        cout << "LibTorch: Using CUDA device" << endl;
     }
     else {
-        std::cout << "LibTorch: Using CPU device" << std::endl;
+        cout << "LibTorch: Using CPU device" << endl;
     }
 
     torch::Tensor tensor = torch::rand({ 3, 3 }).to(device);
     auto result = tensor * 2;
-    std::cout << "Random tensor:\n" << tensor << std::endl;
-    std::cout << "Tensor * 2:\n" << result << std::endl;
+    cout << "Random tensor:\n" << tensor << endl;
+    cout << "Tensor * 2:\n" << result << endl;
 }
 
 //----------------------------------------------------------------------------------
@@ -124,38 +126,38 @@ struct CharacterData {
     int active;
 
     // Character BVH Data
-    std::vector<BVHData> bvhData;
+    vector<BVHData> bvhData;
 
     // Scales of each character
-    std::vector<float> scales;
+    vector<float> scales;
 
     // Names of each character
-    std::vector<std::string> names;
+    vector<string> names;
 
     // Automatic scaling for each character
-    std::vector<float> autoScales;
+    vector<float> autoScales;
 
     // Color of each character
-    std::vector<Color> colors;
+    vector<Color> colors;
 
     // Opacity of each character
-    std::vector<float> opacities;
+    vector<float> opacities;
 
     // Maximum capsule radius of each character
-    std::vector<float> radii;
+    vector<float> radii;
 
     // Original file path for each character
-    std::vector<std::string> filePaths;
+    vector<string> filePaths;
 
     // Transform buffers for each character
-    std::vector<TransformData> xformData;
-    std::vector<TransformData> xformTmp0;
-    std::vector<TransformData> xformTmp1;
-    std::vector<TransformData> xformTmp2;
-    std::vector<TransformData> xformTmp3;
+    vector<TransformData> xformData;
+    vector<TransformData> xformTmp0;
+    vector<TransformData> xformTmp1;
+    vector<TransformData> xformTmp2;
+    vector<TransformData> xformTmp3;
 
     // Joint combo string for each character (for GUI combo box)
-    std::vector<std::string> jointNamesCombo;
+    vector<string> jointNamesCombo;
 
     // If the color picker is active
     bool colorPickerActive;
@@ -166,7 +168,7 @@ struct CharacterData {
     // Default values for new characters
     float defaultOpacity;
     float defaultRadius;
-    std::vector<Color> defaultColors;
+    vector<Color> defaultColors;
 };
 
 // Initializes all the CharacterData to a safe state
@@ -314,7 +316,7 @@ static bool CharacterDataLoadFromFile(
     }
 
     // Build joint names combo string (semicolon-separated for GUI)
-    std::string combo;
+    string combo;
     for (int i = 0; i < data->bvhData[idx].jointCount; i++)
     {
         if (i > 0) combo += ";";
@@ -347,9 +349,9 @@ struct AnimDatabase {
     int animCount = -1;;
 
     // Per-animation info
-    std::vector<int> animStartFrame;   // Global frame index where each anim starts
-    std::vector<int> animFrameCount;   // Number of frames in each anim
-    std::vector<float> animFrameTime;  // Frame time for each anim (usually same)
+    vector<int> animStartFrame;   // Global frame index where each anim starts
+    vector<int> animFrameCount;   // Number of frames in each anim
+    vector<float> animFrameTime;  // Frame time for each anim (usually same)
 
     // Total frames across all animations
     int totalFrames = -1;;
@@ -368,30 +370,28 @@ struct AnimDatabase {
     // if some clips have mismatched skeletons and are skipped)
     int motionFrameCount = -1;;
 
-    // Flat arrays holding per-frame global joint transforms:
-    // index = frameIndex * jointCount + jointIndex
-    std::vector<Vector3> globalJointPositions;     // global positions
-    std::vector<Quaternion> globalJointRotations;  // global rotations
-    std::vector<Vector3> globalJointVelocities;    // velocities (defined at midpoint between frames)
-    std::vector<Vector3> globalJointAccelerations; // accelerations (derivative of velocity)
+    // Per-frame joint transforms: [motionFrameCount x jointCount]
+    Array2D<Vector3> globalJointPositions;      // global positions
+    Array2D<Quaternion> globalJointRotations;   // global rotations
+    Array2D<Vector3> globalJointVelocities;     // velocities (defined at midpoint between frames)
+    Array2D<Vector3> globalJointAccelerations;  // accelerations (derivative of velocity)
 
-    // local joint transforms (localPositions/localRotations for the canonical skeleton)
-    // These are useful to avoid repeating global->local conversion when blending.
-    std::vector<Vector3> localJointPositions;      // local positions (per-frame)
-    std::vector<Quaternion> localJointRotations;   // local rotations (per-frame)
-    std::vector<Rot6d> localJointRotations6d;      // local rotations as Rot6d (for blending without double-cover issues)
+    // local joint transforms (for blending without global->local conversion)
+    Array2D<Vector3> localJointPositions;           // local positions [motionFrameCount x jointCount]
+    Array2D<Rot6d> localJointRotations6d;           // local rotations as Rot6d [motionFrameCount x jointCount]
+    Array2D<Vector3> localJointAngularVelocities;   // local angular velocities [motionFrameCount x jointCount]
 
     // Segmentation of the compacted motion DB into clips:
     // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
-    std::vector<int> clipStartFrame;
-    std::vector<int> clipEndFrame;
+    vector<int> clipStartFrame;
+    vector<int> clipEndFrame;
 
-    // motion matching features
-    int featureDim = -1;;
-    std::vector<float> features;  // flattened: [motionFrameCount * featureDim]
+    // motion matching features [motionFrameCount x featureDim]
+    int featureDim = -1;
+    Array2D<float> features;
     int hipJointIndex = -1;            // resolved index for "Hips" in canonical skeleton
     int toeIndices[2] = { -1, -1 };
-    std::vector<std::string> featureNames;
+    vector<string> featureNames;
 };
 
 
@@ -403,14 +403,14 @@ static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame) {
     return -1;
 }
 
-static inline int FindJointIndexByNames(const BVHData* bvh, const std::vector<std::string>& candidates)
+static inline int FindJointIndexByNames(const BVHData* bvh, const vector<string>& candidates)
 {
     // Exact match pass (case-insensitive)
     for (int j = 0; j < bvh->jointCount; ++j)
     {
-        const std::string& name = bvh->joints[j].name;
+        const string& name = bvh->joints[j].name;
         if (name.empty()) continue;
-        std::string lname = ToLowerCopy(name.c_str());
+        string lname = ToLowerCopy(name.c_str());
         for (int k = 0; k < (int)candidates.size(); ++k)
         {
             if (lname == candidates[k])
@@ -423,9 +423,9 @@ static inline int FindJointIndexByNames(const BVHData* bvh, const std::vector<st
     // Substring fallback pass (case-insensitive)
     for (int j = 0; j < bvh->jointCount; ++j)
     {
-        const std::string& name = bvh->joints[j].name;
+        const string& name = bvh->joints[j].name;
         if (name.empty()) continue;
-        std::string lname = ToLowerCopy(name.c_str());
+        string lname = ToLowerCopy(name.c_str());
         for (int k = 0; k < (int)candidates.size(); ++k)
         {
             if (StrContainsCaseInsensitive(lname, candidates[k]))
@@ -455,7 +455,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->globalJointVelocities.clear();
     db->globalJointAccelerations.clear();
     db->localJointPositions.clear();
-    db->localJointRotations.clear();
+    db->localJointRotations6d.clear();
+    db->localJointAngularVelocities.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
     db->features.clear();
@@ -464,7 +465,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
 }
 
 // Updated AnimDatabaseRebuild: require all animations to match canonical skeleton.
-// Populate localJointPositions/localJointRotations as well as global arrays.
+// Populate localJointPositions/localJointRotations6d as well as global arrays.
 // If any clip mismatches jointCount we invalidate the DB (db->valid = false).
 static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* characterData) {
     db->animCount = characterData->count;
@@ -477,7 +478,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->globalJointVelocities.clear();
     db->globalJointAccelerations.clear();
     db->localJointPositions.clear();
-    db->localJointRotations.clear();
+    db->localJointRotations6d.clear();
+    db->localJointAngularVelocities.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
     db->valid = false; // pessimistic until proven valid
@@ -539,30 +541,15 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         return;
     }
 
-    // allocate compact storage
+    // allocate compact storage [motionFrameCount x jointCount]
     db->motionFrameCount = includedFrames;
-    try {
-        db->globalJointPositions.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->globalJointRotations.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->globalJointVelocities.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->globalJointAccelerations.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->localJointPositions.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->localJointRotations.resize((size_t)db->motionFrameCount * db->jointCount);
-        db->localJointRotations6d.resize((size_t)db->motionFrameCount * db->jointCount);
-    }
-    catch (...) {
-        TraceLog(LOG_ERROR, "AnimDatabase: failed to allocate motion DB storage");
-        db->motionFrameCount = 0;
-        db->globalJointPositions.clear();
-        db->globalJointRotations.clear();
-        db->globalJointVelocities.clear();
-        db->globalJointAccelerations.clear();
-        db->localJointPositions.clear();
-        db->localJointRotations.clear();
-        db->localJointRotations6d.clear();
-        db->valid = false;
-        return;
-    }
+    db->globalJointPositions.resize(db->motionFrameCount, db->jointCount);
+    db->globalJointRotations.resize(db->motionFrameCount, db->jointCount);
+    db->globalJointVelocities.resize(db->motionFrameCount, db->jointCount);
+    db->globalJointAccelerations.resize(db->motionFrameCount, db->jointCount);
+    db->localJointPositions.resize(db->motionFrameCount, db->jointCount);
+    db->localJointRotations6d.resize(db->motionFrameCount, db->jointCount);
+    db->localJointAngularVelocities.resize(db->motionFrameCount, db->jointCount);
 
     // sample each compatible clip frame and fill the flat arrays
     TransformData tmpXform;
@@ -578,18 +565,17 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             TransformDataSampleFrame(&tmpXform, bvh, f, characterData->scales[a]);
             TransformDataForwardKinematics(&tmpXform);
 
+            span<Vector3> globalPos = db->globalJointPositions.row_view(motionFrameIdx);
+            span<Quaternion> globalRot = db->globalJointRotations.row_view(motionFrameIdx);
+            span<Vector3> localPos = db->localJointPositions.row_view(motionFrameIdx);
+            span<Rot6d> localRot = db->localJointRotations6d.row_view(motionFrameIdx);
+
             for (int j = 0; j < db->jointCount; ++j)
             {
-                const size_t dst = (size_t)motionFrameIdx * db->jointCount + j;
-                db->globalJointPositions[dst] = tmpXform.globalPositions[j];
-                db->globalJointRotations[dst] = tmpXform.globalRotations[j];
-
-                // store local-space transforms too (useful for blending without conversion)
-                db->localJointPositions[dst] = tmpXform.localPositions[j];
-                db->localJointRotations[dst] = tmpXform.localRotations[j];
-
-                // also store Rot6d version for blending without double-cover issues
-                Rot6dFromQuaternion(tmpXform.localRotations[j], db->localJointRotations6d[dst]);
+                globalPos[j] = tmpXform.globalPositions[j];
+                globalRot[j] = tmpXform.globalRotations[j];
+                localPos[j] = tmpXform.localPositions[j];
+                Rot6dFromQuaternion(tmpXform.localRotations[j], localRot[j]);
             }
 
             ++motionFrameIdx;
@@ -616,27 +602,25 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const int nextF = isLastFrame ? f : (f + 1);
             const int prevF = isLastFrame ? (f - 1) : f;
 
+            span<Vector3> velRow = db->globalJointVelocities.row_view(f);
+
             // handle edge case: single-frame clip
             if (clipEnd - clipStart <= 1)
             {
                 for (int j = 0; j < db->jointCount; ++j)
                 {
-                    const size_t idx = (size_t)f * db->jointCount + j;
-                    db->globalJointVelocities[idx] = Vector3Zero();
+                    velRow[j] = Vector3Zero();
                 }
                 continue;
             }
 
+            span<const Vector3> pos0Row = db->globalJointPositions.row_view(prevF);
+            span<const Vector3> pos1Row = db->globalJointPositions.row_view(nextF);
+
             for (int j = 0; j < db->jointCount; ++j)
             {
-                const size_t currIdx = (size_t)prevF * db->jointCount + j;
-                const size_t nextIdx = (size_t)nextF * db->jointCount + j;
-                const size_t dstIdx = (size_t)f * db->jointCount + j;
-
-                const Vector3 pos0 = db->globalJointPositions[currIdx];
-                const Vector3 pos1 = db->globalJointPositions[nextIdx];
-                const Vector3 vel = Vector3Scale(Vector3Subtract(pos1, pos0), invFrameTime);
-                db->globalJointVelocities[dstIdx] = vel;
+                const Vector3 vel = Vector3Scale(Vector3Subtract(pos1Row[j], pos0Row[j]), invFrameTime);
+                velRow[j] = vel;
             }
         }
     }
@@ -657,27 +641,62 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const int nextF = isLastFrame ? f : (f + 1);
             const int prevF = isLastFrame ? (f - 1) : f;
 
+            span<Vector3> accRow = db->globalJointAccelerations.row_view(f);
+
             // handle edge case: single-frame or two-frame clip
             if (clipEnd - clipStart <= 2)
             {
                 for (int j = 0; j < db->jointCount; ++j)
                 {
-                    const size_t idx = (size_t)f * db->jointCount + j;
-                    db->globalJointAccelerations[idx] = Vector3Zero();
+                    accRow[j] = Vector3Zero();
                 }
                 continue;
             }
 
+            span<const Vector3> vel0Row = db->globalJointVelocities.row_view(prevF);
+            span<const Vector3> vel1Row = db->globalJointVelocities.row_view(nextF);
+
             for (int j = 0; j < db->jointCount; ++j)
             {
-                const size_t currIdx = (size_t)prevF * db->jointCount + j;
-                const size_t nextIdx = (size_t)nextF * db->jointCount + j;
-                const size_t dstIdx = (size_t)f * db->jointCount + j;
+                const Vector3 acc = Vector3Scale(Vector3Subtract(vel1Row[j], vel0Row[j]), invFrameTime);
+                accRow[j] = acc;
+            }
+        }
+    }
 
-                const Vector3 vel0 = db->globalJointVelocities[currIdx];
-                const Vector3 vel1 = db->globalJointVelocities[nextIdx];
-                const Vector3 acc = Vector3Scale(Vector3Subtract(vel1, vel0), invFrameTime);
-                db->globalJointAccelerations[dstIdx] = acc;
+    // Compute local angular velocities for each joint at each frame
+    // Angular velocity at frame i is defined at midpoint between frame i and i+1
+    // For last frame of each clip, copy from previous frame
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+            const int nextF = isLastFrame ? f : (f + 1);
+            const int prevF = isLastFrame ? (f - 1) : f;
+
+            span<Vector3> angVelRow = db->localJointAngularVelocities.row_view(f);
+
+            // handle edge case: single-frame clip
+            if (clipEnd - clipStart <= 1)
+            {
+                for (int j = 0; j < db->jointCount; ++j)
+                {
+                    angVelRow[j] = Vector3Zero();
+                }
+                continue;
+            }
+
+            span<const Rot6d> rot0Row = db->localJointRotations6d.row_view(prevF);
+            span<const Rot6d> rot1Row = db->localJointRotations6d.row_view(nextF);
+
+            for (int j = 0; j < db->jointCount; ++j)
+            {
+                Rot6dGetVelocity(rot0Row[j], rot1Row[j], frameTime, angVelRow[j]);
             }
         }
     }
@@ -688,11 +707,11 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     // set db->valid true now that we completed full build
     db->valid = true;
 
-    std::vector<std::string> jointNames;
+    vector<string> jointNames;
     jointNames.reserve((size_t)canonBvh->jointCount);
     for (int j = 0; j < canonBvh->jointCount; ++j)
     {
-        // BVHJointData::name is now std::string
+        // BVHJointData::name is now string
         jointNames.push_back(canonBvh->joints[j].name);
     }
 
@@ -702,12 +721,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->toeIndices[SIDE_RIGHT] = -1;
 
     // HIP candidates (lowercase)
-    std::vector<std::string> hipCandidates = { "hips", "hip", "pelvis", "root" };
+    vector<string> hipCandidates = { "hips", "hip", "pelvis", "root" };
 
     // Toe candidates (lowercase)
-    const std::vector<std::string> leftToeCandidates = { "lefttoebase", "lefttoe", "left_toe", "l_toe" };
-    const std::vector<std::string> rightToeCandidates = { "righttoebase", "righttoe", "right_toe", "r_toe" };
-    const std::vector<std::vector<std::string>> toeCandidates = { leftToeCandidates, rightToeCandidates };
+    const vector<string> leftToeCandidates = { "lefttoebase", "lefttoe", "left_toe", "l_toe" };
+    const vector<string> rightToeCandidates = { "righttoebase", "righttoe", "right_toe", "r_toe" };
+    const vector<vector<string>> toeCandidates = { leftToeCandidates, rightToeCandidates };
 
     // Use helper to find hip and toes (exact then substring)
     db->hipJointIndex = FindJointIndexByNames(canonBvh, hipCandidates);
@@ -739,37 +758,40 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->features.clear();
     db->featureNames.clear();
 
-    db->features.resize((size_t)db->motionFrameCount * db->featureDim, 0.0f);
+    db->features.resize(db->motionFrameCount, db->featureDim);
+    db->features.fill(0.0f);
 
     // Populate features from jointPositions and jointRotations
     for (int f = 0; f < db->motionFrameCount; ++f)
     {
         const bool isFirstFrame = f == 0;
 
+        span<const Vector3> posRow = db->globalJointPositions.row_view(f);
+        span<const Quaternion> rotRow = db->globalJointRotations.row_view(f);
+        span<float> featRow = db->features.row_view(f);
+
         Vector3 hipPos = { 0.0f, 0.0f, 0.0f };
         Vector3 leftPos = { 0.0f, 0.0f, 0.0f };
         Vector3 rightPos = { 0.0f, 0.0f, 0.0f };
 
-        const size_t base = (size_t)f * db->jointCount;
         if (db->hipJointIndex >= 0) {
-            hipPos = db->globalJointPositions[base + db->hipJointIndex];
+            hipPos = posRow[db->hipJointIndex];
         }
 
         const int leftIdx = db->toeIndices[SIDE_LEFT];
         const int rightIdx = db->toeIndices[SIDE_RIGHT];
 
         if (leftIdx >= 0) {
-            leftPos = db->globalJointPositions[base + leftIdx];
+            leftPos = posRow[leftIdx];
         }
         if (rightIdx >= 0) {
-            rightPos = db->globalJointPositions[base + rightIdx];
+            rightPos = posRow[rightIdx];
         }
 
         // Extract hip yaw (if available) once per frame
         Quaternion hipYaw = QuaternionIdentity();
         if (db->hipJointIndex >= 0) {
-            const Quaternion hipRot = db->globalJointRotations[base + db->hipJointIndex];
-            hipYaw = QuaternionYComponent(hipRot);
+            hipYaw = QuaternionYComponent(rotRow[db->hipJointIndex]);
         }
         const Quaternion invHipYaw = QuaternionInvert(hipYaw);
 
@@ -784,17 +806,17 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
         // POSITION: toePos->Left(X, Z), Right(X, Z)
         if constexpr (FEATURE_TOE_POS) {
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localLeftPos.x;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localLeftPos.z;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localRightPos.x;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localRightPos.z;
+            featRow[currentFeature++] = localLeftPos.x;
+            featRow[currentFeature++] = localLeftPos.z;
+            featRow[currentFeature++] = localRightPos.x;
+            featRow[currentFeature++] = localRightPos.z;
 
             if (isFirstFrame)
             {
-                db->featureNames.push_back(std::string("LeftToePosX"));
-                db->featureNames.push_back(std::string("LeftToePosZ"));
-                db->featureNames.push_back(std::string("RightToePosX"));
-                db->featureNames.push_back(std::string("RightToePosZ"));
+                db->featureNames.push_back(string("LeftToePosX"));
+                db->featureNames.push_back(string("LeftToePosZ"));
+                db->featureNames.push_back(string("RightToePosX"));
+                db->featureNames.push_back(string("RightToePosZ"));
             }
         }
 
@@ -809,48 +831,45 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 const float dt = db->animFrameTime[clipIdx] > 1e-8f ? db->animFrameTime[clipIdx] : 0.0f;
 
                 if (f > clipStart && dt > 0.0f) {
-                    const size_t basePrev = (size_t)(f - 1) * db->jointCount;
+                    span<const Vector3> posPrevRow = db->globalJointPositions.row_view(f - 1);
 
                     if (leftIdx >= 0) {
-                        Vector3 leftPosPrev = db->globalJointPositions[basePrev + leftIdx];
-                        Vector3 deltaLeft = Vector3Subtract(leftPos, leftPosPrev);
+                        Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
                         const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
                         localLeftVel = Vector3RotateByQuaternion(velLeftWorld, invHipYaw);
                     }
 
                     if (rightIdx >= 0) {
-                        Vector3 rightPosPrev = db->globalJointPositions[basePrev + rightIdx];
-                        Vector3 deltaRight = Vector3Subtract(rightPos, rightPosPrev);
+                        Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
                         const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
                         localRightVel = Vector3RotateByQuaternion(velRightWorld, invHipYaw);
                     }
                 }
             }
 
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localLeftVel.x;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localLeftVel.z;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localRightVel.x;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = localRightVel.z;
+            featRow[currentFeature++] = localLeftVel.x;
+            featRow[currentFeature++] = localLeftVel.z;
+            featRow[currentFeature++] = localRightVel.x;
+            featRow[currentFeature++] = localRightVel.z;
 
             if (isFirstFrame) {
-                db->featureNames.push_back(std::string("LeftToeVelX"));
-                db->featureNames.push_back(std::string("LeftToeVelZ"));
-                db->featureNames.push_back(std::string("RightToeVelX"));
-                db->featureNames.push_back(std::string("RightToeVelZ"));
+                db->featureNames.push_back(string("LeftToeVelX"));
+                db->featureNames.push_back(string("LeftToeVelZ"));
+                db->featureNames.push_back(string("RightToeVelX"));
+                db->featureNames.push_back(string("RightToeVelZ"));
             }
         }
 
         // DIFFERENCE: toeDifference = Left - Right (in hip horizontal frame) => (dx, dz)
         if constexpr (FEATURE_TOE_DIFF) {
-
             const float diffX = localLeftPos.x - localRightPos.x;
             const float diffZ = localLeftPos.z - localRightPos.z;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = diffX;
-            db->features[(size_t)f * db->featureDim + currentFeature++] = diffZ;
+            featRow[currentFeature++] = diffX;
+            featRow[currentFeature++] = diffZ;
 
             if (isFirstFrame) {
-                db->featureNames.push_back(std::string("ToeDiffX"));
-                db->featureNames.push_back(std::string("ToeDiffZ"));
+                db->featureNames.push_back(string("ToeDiffX"));
+                db->featureNames.push_back(string("ToeDiffZ"));
             }
         }
 
@@ -890,119 +909,77 @@ static void AnimDatabaseRandomTime(const AnimDatabase* db, int* animIndex, float
     *time = randomFrame * frameTime;
 }
 
-// sample interpolated local pose from AnimDatabase at time animTime
-static inline void SampleCursorPoseLerp(
-    const AnimDatabase* db,
-    int animIndex,
-    float animTime,
-    std::vector<Vector3>& outPositions,
-    std::vector<Quaternion>& outRotations,
-    Vector3* outRootPos,
-    Quaternion* outRootRot)
-{
-    const float frameTime = db->animFrameTime[animIndex];
-    const int frameCount = db->animFrameCount[animIndex];
-    const int jointCount = db->jointCount;
-    const int clipStart = db->clipStartFrame[animIndex];
-
-    int f0 = 0;
-    int f1 = 0;
-    float alpha = 0.0f;
-
-    if (frameTime > 0.0f && frameCount > 0)
-    {
-        float frameF = animTime / frameTime;
-        if (frameF < 0.0f) frameF = 0.0f;
-        const float maxFrame = (float)(frameCount - 1);
-        if (frameF > maxFrame) frameF = maxFrame;
-
-        f0 = (int)floorf(frameF);
-        f1 = f0 + 1;
-        if (f1 >= frameCount) f1 = frameCount - 1;
-        alpha = frameF - (float)f0;
-    }
-
-    const size_t base0 = (size_t)(clipStart + f0) * (size_t)jointCount;
-    const size_t base1 = (size_t)(clipStart + f1) * (size_t)jointCount;
-
-    for (int j = 0; j < jointCount; ++j)
-    {
-        const Vector3 p0 = db->localJointPositions[base0 + j];
-        const Vector3 p1 = db->localJointPositions[base1 + j];
-        outPositions[j] = Vector3Lerp(p0, p1, alpha);
-
-        Quaternion q0 = db->localJointRotations[base0 + j];
-        Quaternion q1 = db->localJointRotations[base1 + j];
-        const float dot = q0.x * q1.x + q0.y * q1.y + q0.z * q1.z + q0.w * q1.w;
-        if (dot < 0.0f)
-        {
-            q1.x = -q1.x;
-            q1.y = -q1.y;
-            q1.z = -q1.z;
-            q1.w = -q1.w;
-        }
-        Quaternion qLerp = QuaternionLerp(q0, q1, alpha);
-        qLerp = QuaternionNormalize(qLerp);
-        outRotations[j] = qLerp;
-    }
-
-    if (outRootPos) *outRootPos = outPositions[0];
-    if (outRootRot) *outRootRot = outRotations[0];
-}
-
 // sample interpolated local pose from AnimDatabase at time animTime, using Rot6d for rotations
+// optionally also samples angular velocities if outAngularVelocities is not null
+// velocityTimeOffset: offset added to animTime when sampling velocities (use -dt/2 for midpoint sampling)
 static inline void SampleCursorPoseLerp6d(
     const AnimDatabase* db,
     int animIndex,
     float animTime,
-    std::vector<Vector3>& outPositions,
-    std::vector<Rot6d>& outRotations6d,
-    std::vector<Quaternion>& outRotations,  // also fill quats for root motion (convenience)
+    float velocityTimeOffset,
+    vector<Vector3>& outPositions,
+    vector<Rot6d>& outRotations6d,
+    vector<Vector3>* outAngularVelocities,
     Vector3* outRootPos,
-    Quaternion* outRootRot)
+    Rot6d* outRootRot6d)
 {
     const float frameTime = db->animFrameTime[animIndex];
     const int frameCount = db->animFrameCount[animIndex];
     const int jointCount = db->jointCount;
     const int clipStart = db->clipStartFrame[animIndex];
+    const float maxFrame = (float)(frameCount - 1);
 
-    int f0 = 0;
-    int f1 = 0;
-    float alpha = 0.0f;
-
-    if (frameTime > 0.0f && frameCount > 0)
+    // helper to compute frame indices and alpha for a given time
+    auto computeFrameAlpha = [&](float t, int& outF0, int& outF1, float& outAlpha)
     {
-        float frameF = animTime / frameTime;
-        if (frameF < 0.0f) frameF = 0.0f;
-        const float maxFrame = (float)(frameCount - 1);
-        if (frameF > maxFrame) frameF = maxFrame;
+        outF0 = 0;
+        outF1 = 0;
+        outAlpha = 0.0f;
+        if (frameTime > 0.0f && frameCount > 0)
+        {
+            float frameF = t / frameTime;
+            if (frameF < 0.0f) frameF = 0.0f;
+            if (frameF > maxFrame) frameF = maxFrame;
+            outF0 = (int)floorf(frameF);
+            outF1 = outF0 + 1;
+            if (outF1 >= frameCount) outF1 = frameCount - 1;
+            outAlpha = frameF - (float)outF0;
+        }
+    };
 
-        f0 = (int)floorf(frameF);
-        f1 = f0 + 1;
-        if (f1 >= frameCount) f1 = frameCount - 1;
-        alpha = frameF - (float)f0;
-    }
+    // sample pose at animTime
+    int f0, f1;
+    float alpha;
+    computeFrameAlpha(animTime, f0, f1, alpha);
 
-    const size_t base0 = (size_t)(clipStart + f0) * (size_t)jointCount;
-    const size_t base1 = (size_t)(clipStart + f1) * (size_t)jointCount;
+    span<const Vector3> posRow0 = db->localJointPositions.row_view(clipStart + f0);
+    span<const Vector3> posRow1 = db->localJointPositions.row_view(clipStart + f1);
+    span<const Rot6d> rotRow0 = db->localJointRotations6d.row_view(clipStart + f0);
+    span<const Rot6d> rotRow1 = db->localJointRotations6d.row_view(clipStart + f1);
 
     for (int j = 0; j < jointCount; ++j)
     {
-        const Vector3 p0 = db->localJointPositions[base0 + j];
-        const Vector3 p1 = db->localJointPositions[base1 + j];
-        outPositions[j] = Vector3Lerp(p0, p1, alpha);
+        outPositions[j] = Vector3Lerp(posRow0[j], posRow1[j], alpha);
+        Rot6dLerp(rotRow0[j], rotRow1[j], alpha, outRotations6d[j]);
+    }
 
-        // lerp Rot6d and normalize
-        const Rot6d& r0 = db->localJointRotations6d[base0 + j];
-        const Rot6d& r1 = db->localJointRotations6d[base1 + j];
-        Rot6dLerp(r0, r1, alpha, outRotations6d[j]);
+    // sample angular velocities at animTime + velocityTimeOffset (for midpoint sampling)
+    if (outAngularVelocities)
+    {
+        int vf0, vf1;
+        float vAlpha;
+        computeFrameAlpha(animTime + velocityTimeOffset, vf0, vf1, vAlpha);
 
-        // also produce quat for root motion code (we still need quats for root delta computation)
-        Rot6dToQuaternion(outRotations6d[j], outRotations[j]);
+        span<const Vector3> velRow0 = db->localJointAngularVelocities.row_view(clipStart + vf0);
+        span<const Vector3> velRow1 = db->localJointAngularVelocities.row_view(clipStart + vf1);
+        for (int j = 0; j < jointCount; ++j)
+        {
+            (*outAngularVelocities)[j] = Vector3Lerp(velRow0[j], velRow1[j], vAlpha);
+        }
     }
 
     if (outRootPos) *outRootPos = outPositions[0];
-    if (outRootRot) *outRootRot = outRotations[0];
+    if (outRootRot6d) *outRootRot6d = outRotations6d[0];
 }
 
 struct BlendCursor {
@@ -1015,22 +992,28 @@ struct BlendCursor {
     bool active = false;                        // is cursor in use
 
     // Local-space pose stored per cursor for blending (size = jointCount)
-    std::vector<Vector3> localPositions;
-    std::vector<Quaternion> localRotations;
-    std::vector<Rot6d> localRotations6d;  // Rot6d version for blending
+    vector<Vector3> localPositions;
+    vector<Rot6d> localRotations6d;
+    vector<Vector3> localAngularVelocities;
 
     // Global-space pose for debug visualization (computed via FK after sampling)
-    std::vector<Vector3> globalPositions;
-    std::vector<Quaternion> globalRotations;
+    vector<Vector3> globalPositions;
+    vector<Quaternion> globalRotations;
 
     // Previous local root state used to compute per-cursor root deltas.
     // Stored in the same local-space that we sample into above.
     Vector3 prevLocalRootPos;
-    Quaternion prevLocalRootRot;
+    Rot6d prevLocalRootRot6d = Rot6dIdentity();
 
     // Debug: last computed deltas (for visualization)
     Vector3 lastDeltaWorld;      // XZ world-space position delta this frame
     float lastDeltaYaw;          // Yaw delta this frame (radians)
+
+    // Root motion velocity tracking (for acceleration-based blending)
+    Vector3 rootVelocity = Vector3Zero();    // current root velocity (world space)
+    float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
+    Vector3 prevRootVelocity = Vector3Zero(); // previous frame's velocity
+    float prevRootYawRate = 0.0f;            // previous frame's yaw rate
 };
 
 //----------------------------------------------------------------------------------
@@ -1083,6 +1066,22 @@ struct ControlledCharacter {
     // Debug: last blended root motion delta (for visualization)
     Vector3 lastBlendedDeltaWorld;
     float lastBlendedDeltaYaw;
+
+    // Velocity-based blending state (advances with blended angular velocity, lerps to target)
+    vector<Rot6d> velBlendedRotations6d;       // [jointCount] - smoothed rotations
+    float blendPosReturnTime = 0.1f;       // time to reach halfway to target (lower = snappier)
+    bool velBlendInitialized = false;
+    bool useVelBlending = false;               // toggle for enabling velocity-based blending
+
+    // Separate hips rotation smoothing (no vel blending, just lerp with different blend time)
+    Rot6d hipsSmoothedRot6d = Rot6dIdentity();
+    float hipsRotationBlendTime = 0.3f;         // typically longer than blendPosReturnTime
+    bool hipsInitialized = false;
+
+    // Smoothed root motion state
+    Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
+    float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
+    bool rootMotionInitialized = false;
 };
 
 // Initialize the controlled character when first animation is loaded
@@ -1120,12 +1119,12 @@ static void ControlledCharacterInit(
     // Ensure blend cursors have storage sized to joint count
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
         cc->cursors[i].localPositions.resize(cc->xformData.jointCount);
-        cc->cursors[i].localRotations.resize(cc->xformData.jointCount);
         cc->cursors[i].localRotations6d.resize(cc->xformData.jointCount);
+        cc->cursors[i].localAngularVelocities.resize(cc->xformData.jointCount);
         cc->cursors[i].globalPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].globalRotations.resize(cc->xformData.jointCount);
         cc->cursors[i].prevLocalRootPos = cc->xformData.localPositions[0];
-        cc->cursors[i].prevLocalRootRot = cc->xformData.localRotations[0];
+        Rot6dFromQuaternion(cc->xformData.localRotations[0], cc->cursors[i].prevLocalRootRot6d);
 
         cc->cursors[i].active = false;
         cc->cursors[i].weightSpring = {};  // zero all spring state
@@ -1136,6 +1135,20 @@ static void ControlledCharacterInit(
     TransformDataSampleFrame(&cc->xformData, skeleton, 0, scale);
     cc->prevRootPosition = cc->xformData.localPositions[0];
     cc->prevRootRotation = cc->xformData.localRotations[0];
+
+    // Velocity-based blending state
+    cc->velBlendedRotations6d.resize(cc->xformData.jointCount);
+    cc->velBlendInitialized = false;
+    cc->useVelBlending = false;
+
+    // Hips rotation smoothing state
+    cc->hipsSmoothedRot6d = Rot6dIdentity();
+    cc->hipsInitialized = false;
+
+    // Smoothed root motion state
+    cc->smoothedRootVelocity = Vector3Zero();
+    cc->smoothedRootYawRate = 0.0f;
+    cc->rootMotionInitialized = false;
 
     // Visual defaults (cyan-ish to distinguish from orange original)
     cc->color = Color{ 50, 200, 200, 255 };
@@ -1154,10 +1167,12 @@ static void ControlledCharacterFree(ControlledCharacter* cc)
     // Clear cursor storage vectors
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
         cc->cursors[i].localPositions.clear();
-        cc->cursors[i].localRotations.clear();
+        cc->cursors[i].localRotations6d.clear();
+        cc->cursors[i].localAngularVelocities.clear();
         cc->cursors[i].active = false;
     }
 
+    cc->velBlendedRotations6d.clear();
     cc->active = false;
 }
 
@@ -1180,18 +1195,8 @@ static BlendCursor* FindAvailableCursor(ControlledCharacter* cc)
     return smallest; // may be null only when MAX_BLEND_CURSORS == 0
 }
 
-// Helper: update double spring damper for cursor weight (smoother acceleration at start)
-static inline void UpdateWeightSpring(BlendCursor* cursor, float dt)
-{
-    DoubleSpringDamper(cursor->weightSpring, cursor->targetWeight, cursor->blendTime, dt);
-
-    // clamp the output weight
-    if (cursor->weightSpring.x < 0.0f) cursor->weightSpring.x = 0.0f;
-    if (cursor->weightSpring.x > 1.0f) cursor->weightSpring.x = 1.0f;
-}
-
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
-// - uses db->localJointPositions / localJointRotations for sampling (no per-frame global->local conversion)
+// - uses db->localJointPositions / localJointRotations6d for sampling (no per-frame global->local conversion)
 // - blends per-cursor root deltas in world-space (XZ + yaw) and applies to cc->world*
 static void ControlledCharacterUpdate(
     ControlledCharacter* cc,
@@ -1204,7 +1209,9 @@ static void ControlledCharacterUpdate(
 {
     if (!cc->active || characterData->count == 0) return;
 
-    // REQUIRE a valid AnimDatabase (simplifies all code paths).
+    const int jc = cc->xformData.jointCount;
+
+    // REQUIRE a valid AnimDatabase     
     if (db == nullptr || !db->valid) {
         // Defensive: disable controlled character to avoid inconsistent behaviour.
         TraceLog(LOG_WARNING, "ControlledCharacterUpdate: AnimDatabase not valid - disabling controlled character.");
@@ -1266,19 +1273,20 @@ static void ControlledCharacterUpdate(
             cursor->blendTime = defaultBlendTime;
 
             Vector3 rootPos;
-            Quaternion rootRot;
+            Rot6d rootRot6d;
             SampleCursorPoseLerp6d(
                 db,
                 cursor->animIndex,
                 cursor->animTime,
+                0.0f,  // no velocity offset for initialization
                 cursor->localPositions,
                 cursor->localRotations6d,
-                cursor->localRotations,
+                &cursor->localAngularVelocities,
                 &rootPos,
-                &rootRot);
+                &rootRot6d);
 
             cursor->prevLocalRootPos = rootPos;
-            cursor->prevLocalRootRot = rootRot;
+            cursor->prevLocalRootRot6d = rootRot6d;
         }
 
         cc->animIndex = newAnim;
@@ -1312,84 +1320,63 @@ static void ControlledCharacterUpdate(
         const float clipMax = (cbvh->frameCount - 1) * cbvh->frameTime;
         if (cur.animTime > clipMax) cur.animTime = clipMax;
 
-        // Sample from DB (assumed valid and compatible)
-        //const float frameTime = db->animFrameTime[cur.animIndex];
-        //int localFrame = 0;
-        //if (frameTime > 0.0f) {
-        //    localFrame = ClampInt((int)(cur.animTime / frameTime + 0.5f), 0, db->animFrameCount[cur.animIndex] - 1);
-        //}
-        //const int motionFrameIndex = db->clipStartFrame[cur.animIndex] + localFrame;
-        //const int jc = db->jointCount;
-
-        // Copy local pose from DB (fast, no conversion)
-        //for (int j = 0; j < jc; ++j)
-        //{
-        //    const size_t idx = (size_t)motionFrameIndex * jc + j;
-        //    cur.localPositions[j] = db->localJointPositions[idx];
-        //    cur.localRotations[j] = db->localJointRotations[idx];
-        //}
-
         // Sample interpolated pose from DB (using Rot6d for blending)
+        // Velocity sampled at midpoint of frame interval for better accuracy
         Vector3 sampledRootPos;
-        Quaternion sampledRootRot;
+        Rot6d sampledRootRot6d;
         SampleCursorPoseLerp6d(
             db,
             cur.animIndex,
             cur.animTime,
+            -dt * 0.5f,  // sample velocity at midpoint of frame
             cur.localPositions,
             cur.localRotations6d,
-            cur.localRotations,
+            &cur.localAngularVelocities,
             &sampledRootPos,
-            &sampledRootRot);
+            &sampledRootRot6d);
 
         // Update weight via spring integrator
-        UpdateWeightSpring(&cur, dt);
+        DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
+
+        // clamp the output weight
+        if (cur.weightSpring.x < 0.0f) cur.weightSpring.x = 0.0f;
+        if (cur.weightSpring.x > 1.0f) cur.weightSpring.x = 1.0f;
 
         // Compute per-cursor root delta in animation-local space and convert to world-space
         const Vector3 currLocalRootPos = sampledRootPos;
-        const Quaternion currLocalRootRot = sampledRootRot;
+        const Rot6d currLocalRootRot6d = sampledRootRot6d;
         const Vector3 prevLocalRootPos = cur.prevLocalRootPos;
-        const Quaternion prevLocalRootRot = cur.prevLocalRootRot;
+        const Rot6d prevLocalRootRot6d = cur.prevLocalRootRot6d;
 
         Vector3 deltaPosAnim = Vector3Subtract(currLocalRootPos, prevLocalRootPos);
         deltaPosAnim.y = 0.0f;
 
-        const Quaternion prevYawQ = QuaternionYComponent(prevLocalRootRot);
-        const Quaternion currYawQ = QuaternionYComponent(currLocalRootRot);
-        const Quaternion invPrevYaw = QuaternionInvert(prevYawQ);
+        // extract yaw from Rot6d and rotate delta position to local space
+        const float prevYaw = Rot6dGetYaw(prevLocalRootRot6d);
+        const float currYaw = Rot6dGetYaw(currLocalRootRot6d);
+        const Rot6d invPrevYawRot = Rot6dFromYaw(-prevYaw);
 
-        const Vector3 deltaLocal = Vector3RotateByQuaternion(deltaPosAnim, invPrevYaw);
+        Vector3 deltaLocal;
+        Rot6dTransformVector(invPrevYawRot, deltaPosAnim, deltaLocal);
         const Vector3 deltaWorld = Vector3RotateByQuaternion(deltaLocal, cc->worldRotation);
 
-        //const Quaternion deltaYawQ = QuaternionMultiply(currYawQ, QuaternionInvert(prevYawQ));
-        //const float w = Clamp(deltaYawQ.w, -1.0f, 1.0f);
-        //float deltaYaw = 2.0f * acosf(w);
-        //if (deltaYawQ.y < 0.0f) deltaYaw = -deltaYaw;
-
-        //const Quaternion deltaYawQ = QuaternionMultiply(currYawQ, QuaternionInvert(prevYawQ));
-        //// For a pure-Y quaternion: q = [0, y, 0, w], angle = 2*atan2(y, w)
-        //const float sinHalf = deltaYawQ.y;
-        //const float cosHalf = Clamp(deltaYawQ.w, -1.0f, 1.0f);
-        //const float deltaYaw = 2.0f * atan2f(sinHalf, cosHalf); // returns [-pi, pi]
-
-        const Quaternion deltaYawQraw = QuaternionMultiply(currYawQ, QuaternionInvert(prevYawQ));
-        const Quaternion deltaYawQ = QuaternionNormalize(deltaYawQraw);
-
-        const float sinHalf = deltaYawQ.y;
-        const float cosHalf = Clamp(deltaYawQ.w, -1.0f, 1.0f);
-
-        float deltaYaw = 2.0f * atan2f(sinHalf, cosHalf);
+        // compute yaw delta (simple subtraction since we have angles directly)
+        float deltaYaw = currYaw - prevYaw;
         if (deltaYaw > PI) deltaYaw -= 2.0f * PI;
         else if (deltaYaw < -PI) deltaYaw += 2.0f * PI;
-
-        //if (fabs(deltaYaw) > M_PI) 
-        //{
-        //    TraceLog(LOG_INFO, "cursor deltaYaw: %f", deltaYaw);
-        //}
 
         // Store deltas for debug visualization
         cur.lastDeltaWorld = deltaWorld;
         cur.lastDeltaYaw = deltaYaw;
+
+        // Compute velocity from delta
+        if (dt > 1e-6f)
+        {
+            cur.prevRootVelocity = cur.rootVelocity;
+            cur.prevRootYawRate = cur.rootYawRate;
+            cur.rootVelocity = Vector3Scale(deltaWorld, 1.0f / dt);
+            cur.rootYawRate = deltaYaw / dt;
+        }
 
         const float wgt = cur.weightSpring.x;
         if (wgt > 1e-6f)
@@ -1401,7 +1388,13 @@ static void ControlledCharacterUpdate(
 
         // store current root as prev for next frame
         cur.prevLocalRootPos = currLocalRootPos;
-        cur.prevLocalRootRot = currLocalRootRot;
+        cur.prevLocalRootRot6d = currLocalRootRot6d;
+
+        // Strip yaw from root rotation BEFORE blending to avoid Rot6d singularity
+        // when blending anims facing opposite directions.
+        // Problem: Rot6d averaging of 0° and 180° yaw gives a zero-length vector.
+        // Solution: blend hip "tilt/roll relative to heading" instead of absolute rotation.
+        Rot6dRemoveYComponent(cur.localRotations6d[0], cur.localRotations6d[0]);
 
         // deactivate tiny-weight cursors
         if (cur.weightSpring.x <= 1e-4f && cur.targetWeight <= 1e-4f)
@@ -1430,21 +1423,18 @@ static void ControlledCharacterUpdate(
         BlendCursor& cur = cc->cursors[ci];
         if (!cur.active) continue;
 
-        const int jc = db->jointCount;
-
         // Copy local pose to global (we'll compute FK in-place)
+        // Convert from Rot6d to Quaternion for FK computation
         for (int j = 0; j < jc; ++j)
         {
             cur.globalPositions[j] = cur.localPositions[j];
-            cur.globalRotations[j] = cur.localRotations[j];
+            Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
         }
 
-        // Zero out root XZ translation and remove Y rotation (same as blended pose)
+        // Zero out root XZ translation
+        // Note: Y rotation was already stripped from localRotations6d[0] earlier
         cur.globalPositions[0].x = 0.0f;
         cur.globalPositions[0].z = 0.0f;
-        const Quaternion cursorRootYaw = QuaternionYComponent(cur.localRotations[0]);
-        const Quaternion invCursorYaw = QuaternionInvert(cursorRootYaw);
-        cur.globalRotations[0] = QuaternionMultiply(invCursorYaw, cur.localRotations[0]);
 
         // Forward kinematics
         for (int j = 1; j < jc; ++j)
@@ -1465,48 +1455,111 @@ static void ControlledCharacterUpdate(
             cur.globalRotations[j] = QuaternionMultiply(cc->worldRotation, cur.globalRotations[j]);
         }
     }
+
     assert(totalRootWeight > 1e-6f);
-    // Apply blended root delta if any
-    //const bool anyCursorActive = (totalRootWeight > 1e-6f);
-    //if (anyCursorActive)
-    //{
+
     const Vector3 finalWorldDelta = Vector3Scale(blendedWorldDelta, 1.0f / totalRootWeight);
     const float finalYawDelta = blendedYawDelta / totalRootWeight;
 
     // Store for debug visualization
     cc->lastBlendedDeltaWorld = finalWorldDelta;
     cc->lastBlendedDeltaYaw = finalYawDelta;
-    //TraceLog(LOG_INFO, "finalYawDelta: %f", finalYawDelta);
 
-    cc->worldPosition = Vector3Add(cc->worldPosition, finalWorldDelta);
-    const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalYawDelta);
-    cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
-    //}
-    //else
-    //{
-    //    cc->lastBlendedDeltaWorld = Vector3Zero();
-    //    cc->lastBlendedDeltaYaw = 0.0f;
-    //}
-
-
-    // --- Rot6d blending (no double-cover issues, simple weighted average then normalize) ---
+    // Apply root motion (with optional velocity-based smoothing)
+    if (cc->useVelBlending && dt > 1e-6f)
     {
-        const int jc = cc->xformData.jointCount;
-        std::vector<Vector3> posAccum(jc, Vector3Zero());
-        std::vector<float> weightAccum(jc, 0.0f);
-        std::vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        // Blend velocities and accelerations from cursors using normalized weights
+        Vector3 blendedVelocity = Vector3Zero();
+        float blendedYawRate = 0.0f;
+        Vector3 blendedAcceleration = Vector3Zero();
+        float blendedYawAccel = 0.0f;
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
-            BlendCursor& cur = cc->cursors[ci];
+            const BlendCursor& cur = cc->cursors[ci];
             if (!cur.active) continue;
-            const float w = cur.weightSpring.x;
+            const float w = cur.normalizedWeight;
+            if (w <= 1e-6f) continue;
+
+            // accumulate weighted velocity
+            blendedVelocity = Vector3Add(blendedVelocity, Vector3Scale(cur.rootVelocity, w));
+            blendedYawRate += cur.rootYawRate * w;
+
+            // compute and accumulate weighted acceleration
+            const Vector3 acc = Vector3Scale(Vector3Subtract(cur.rootVelocity, cur.prevRootVelocity), 1.0f / dt);
+            const float yawAcc = (cur.rootYawRate - cur.prevRootYawRate) / dt;
+            blendedAcceleration = Vector3Add(blendedAcceleration, Vector3Scale(acc, w));
+            blendedYawAccel += yawAcc * w;
+        }
+
+        // Initialize on first frame
+        if (!cc->rootMotionInitialized)
+        {
+            cc->smoothedRootVelocity = blendedVelocity;
+            cc->smoothedRootYawRate = blendedYawRate;
+            cc->rootMotionInitialized = true;
+        }
+
+        // Step 1: advance smoothed velocity using blended acceleration
+        cc->smoothedRootVelocity = Vector3Add(cc->smoothedRootVelocity, Vector3Scale(blendedAcceleration, dt));
+        cc->smoothedRootYawRate += blendedYawAccel * dt;
+
+        // Step 2: lerp towards blended target velocity
+        const float blendTime = cc->blendPosReturnTime;
+        if (blendTime > 1e-6f)
+        {
+            const float alpha = 1.0f - powf(0.5f, dt / blendTime);
+            cc->smoothedRootVelocity = Vector3Lerp(cc->smoothedRootVelocity, blendedVelocity, alpha);
+            cc->smoothedRootYawRate = Lerp(cc->smoothedRootYawRate, blendedYawRate, alpha);
+        }
+        else
+        {
+            cc->smoothedRootVelocity = blendedVelocity;
+            cc->smoothedRootYawRate = blendedYawRate;
+        }
+
+        // Apply smoothed velocity
+        const Vector3 smoothedDelta = Vector3Scale(cc->smoothedRootVelocity, dt);
+        const float smoothedYawDelta = cc->smoothedRootYawRate * dt;
+
+        cc->worldPosition = Vector3Add(cc->worldPosition, smoothedDelta);
+        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, smoothedYawDelta);
+        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+    }
+    else
+    {
+        // Direct application without smoothing
+        cc->worldPosition = Vector3Add(cc->worldPosition, finalWorldDelta);
+        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalYawDelta);
+        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+
+        // Still update smoothedRootVelocity for visualization
+        if (dt > 1e-6f)
+        {
+            cc->smoothedRootVelocity = Vector3Scale(finalWorldDelta, 1.0f / dt);
+            cc->smoothedRootYawRate = finalYawDelta / dt;
+        }
+    }
+
+    // --- Rot6d blending using normalized weights (no double-cover issues, simple weighted average then normalize) ---
+    {
+        vector<Vector3> posAccum(jc, Vector3Zero());
+        vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        vector<Vector3> angVelAccum(jc, Vector3Zero());
+
+        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+        {
+            const BlendCursor& cur = cc->cursors[ci];
+            if (!cur.active) continue;
+
+            // use precomputed normalized weight (sums to 1 across active cursors)
+            const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
             for (int j = 0; j < jc; ++j)
             {
                 posAccum[j] = Vector3Add(posAccum[j], Vector3Scale(cur.localPositions[j], w));
-                weightAccum[j] += w;
+                angVelAccum[j] = Vector3Add(angVelAccum[j], Vector3Scale(cur.localAngularVelocities[j], w));
 
                 // weighted accumulation of Rot6d (just add scaled components)
                 const Rot6d& r = cur.localRotations6d[j];
@@ -1519,115 +1572,115 @@ static void ControlledCharacterUpdate(
             }
         }
 
+        // positions use normalized weights directly (no division needed)
         for (int j = 0; j < jc; ++j)
         {
-            const float tw = weightAccum[j] > 1e-6f ? weightAccum[j] : 1.0f;
-            cc->xformData.localPositions[j] = Vector3Scale(posAccum[j], 1.0f / tw);
+            cc->xformData.localPositions[j] = posAccum[j];
+        }
 
-            // normalize blended Rot6d (orthonormalize the two columns) and convert to quat
+        // normalize blended Rot6d to get target rotations
+        vector<Rot6d> blendedRot6d(jc);
+        for (int j = 0; j < jc; ++j)
+        {
             Rot6d blended = rot6dAccum[j];
             const float lenA = sqrtf(blended.ax * blended.ax + blended.ay * blended.ay + blended.az * blended.az);
             if (lenA > 1e-6f)
             {
                 Rot6dNormalize(blended);
-                Rot6dToQuaternion(blended, cc->xformData.localRotations[j]);
+                blendedRot6d[j] = blended;
             }
             else
             {
-                cc->xformData.localRotations[j] = QuaternionIdentity();
+                blendedRot6d[j] = Rot6dIdentity();
+            }
+        }
+
+        // Hips (joint 0) uses separate smoothing with its own blend time (no velocity integration)
+        {
+            if (!cc->hipsInitialized)
+            {
+                cc->hipsSmoothedRot6d = blendedRot6d[0];
+                cc->hipsInitialized = true;
+            }
+
+            const float hipsBlendTime = cc->hipsRotationBlendTime;
+            if (hipsBlendTime > 1e-6f)
+            {
+                const float alpha = 1.0f - powf(0.5f, dt / hipsBlendTime);
+                Rot6dLerp(cc->hipsSmoothedRot6d, blendedRot6d[0], alpha, cc->hipsSmoothedRot6d);
+            }
+            else
+            {
+                cc->hipsSmoothedRot6d = blendedRot6d[0];
+            }
+
+            Rot6dToQuaternion(cc->hipsSmoothedRot6d, cc->xformData.localRotations[0]);
+        }
+
+        // Other joints (1+): velocity-based blending if enabled
+        if (cc->useVelBlending)
+        {
+            // initialize on first frame
+            if (!cc->velBlendInitialized)
+            {
+                for (int j = 1; j < jc; ++j)
+                {
+                    cc->velBlendedRotations6d[j] = blendedRot6d[j];
+                }
+                cc->velBlendInitialized = true;
+            }
+
+            // step 1: advance rotations using blended angular velocity (skip hips)
+            for (int j = 1; j < jc; ++j)
+            {
+                Rot6dRotate(cc->velBlendedRotations6d[j], angVelAccum[j], dt);
+            }
+
+            // step 2: lerp towards blended target
+            const float blendTime = cc->blendPosReturnTime;
+            if (blendTime > 1e-6f)
+            {
+                const float alpha = 1.0f - powf(0.5f, dt / blendTime);
+                for (int j = 1; j < jc; ++j)
+                {
+                    Rot6dLerp(cc->velBlendedRotations6d[j], blendedRot6d[j], alpha, cc->velBlendedRotations6d[j]);
+                }
+            }
+            else
+            {
+                for (int j = 1; j < jc; ++j)
+                {
+                    cc->velBlendedRotations6d[j] = blendedRot6d[j];
+                }
+            }
+
+            // convert to quaternion for FK (skip hips, already done above)
+            for (int j = 1; j < jc; ++j)
+            {
+                Rot6dToQuaternion(cc->velBlendedRotations6d[j], cc->xformData.localRotations[j]);
+            }
+        }
+        else
+        {
+            // standard blending: directly use blended rotations (skip hips, already done above)
+            for (int j = 1; j < jc; ++j)
+            {
+                Rot6dToQuaternion(blendedRot6d[j], cc->xformData.localRotations[j]);
             }
         }
     }
-
-    // --- OLD quat blending (commented out for comparison) ---
-    //{
-    //    const int jc = cc->xformData.jointCount;
-    //    std::vector<Vector3> posAccum(jc, Vector3Zero());
-    //    std::vector<float> weightAccum(jc, 0.0f);
-    //    std::vector<Vector4> quatAccum(jc, Vector4{ 0.0f, 0.0f, 0.0f, 0.0f });
-    //
-    //    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
-    //    {
-    //        BlendCursor& cur = cc->cursors[ci];
-    //        if (!cur.active) continue;
-    //        const float w = cur.weightSpring.x;
-    //        if (w <= 1e-6f) continue;
-    //
-    //        for (int j = 0; j < jc; ++j)
-    //        {
-    //            posAccum[j] = Vector3Add(posAccum[j], Vector3Scale(cur.localPositions[j], w));
-    //            weightAccum[j] += w;
-    //
-    //            Quaternion q = cur.localRotations[j];
-    //            const Vector4 acc = quatAccum[j];
-    //            Quaternion refQ = Quaternion{ acc.x, acc.y, acc.z, acc.w };
-    //            float dot = 0.0f;
-    //            if (acc.x != 0.0f || acc.y != 0.0f || acc.z != 0.0f || acc.w != 0.0f) {
-    //                dot = refQ.x * q.x + refQ.y * q.y + refQ.z * q.z + refQ.w * q.w;
-    //            }
-    //            if (dot < 0.0f) {
-    //                q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w;
-    //            }
-    //            quatAccum[j].x += q.x * w;
-    //            quatAccum[j].y += q.y * w;
-    //            quatAccum[j].z += q.z * w;
-    //            quatAccum[j].w += q.w * w;
-    //        }
-    //    }
-    //
-    //    for (int j = 0; j < jc; ++j)
-    //    {
-    //        const float tw = weightAccum[j] > 1e-6f ? weightAccum[j] : 1.0f;
-    //        cc->xformData.localPositions[j] = Vector3Scale(posAccum[j], 1.0f / tw);
-    //
-    //        Vector4 a = quatAccum[j];
-    //        const float len = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w);
-    //        if (len > 1e-6f) {
-    //            cc->xformData.localRotations[j] = Quaternion{ a.x / len, a.y / len, a.z / len, a.w / len };
-    //        }
-    //        else {
-    //            cc->xformData.localRotations[j] = QuaternionIdentity();
-    //        }
-    //    }
-    //}
 
     // --- After blending local pose, update prev-root bookkeeping ---
     const Vector3 currentRootPos = cc->xformData.localPositions[0];
     const Quaternion currentRootRot = cc->xformData.localRotations[0];
 
-    //if (anyCursorActive) {
-        // we already applied world motion from cursors; store blended pose root as prev for next frame
-        cc->prevRootPosition = currentRootPos;
-        cc->prevRootRotation = currentRootRot;
-    //}
-    //else 
-    //{
-    //    // fallback behaviour: compute delta & apply (legacy single-anim path)
-    //    const Quaternion prevYRot = QuaternionYComponent(cc->prevRootRotation);
-    //    const Quaternion currYRot = QuaternionYComponent(currentRootRot);
-
-    //    Vector3 deltaPos_anim = Vector3Subtract(currentRootPos, cc->prevRootPosition);
-    //    deltaPos_anim.y = 0.0f;
-
-    //    const Vector3 deltaPos_local = Vector3RotateByQuaternion(deltaPos_anim, QuaternionInvert(prevYRot));
-    //    const Vector3 worldDeltaPos = Vector3RotateByQuaternion(deltaPos_local, cc->worldRotation);
-
-    //    const Quaternion deltaYRot = QuaternionMultiply(currYRot, QuaternionInvert(prevYRot));
-
-    //    cc->worldPosition = Vector3Add(cc->worldPosition, worldDeltaPos);
-    //    cc->worldRotation = QuaternionNormalize(QuaternionMultiply(deltaYRot, cc->worldRotation));
-
-    //    cc->prevRootPosition = currentRootPos;
-    //    cc->prevRootRotation = currentRootRot;
-    //}
+    cc->prevRootPosition = currentRootPos;
+    cc->prevRootRotation = currentRootRot;
 
     // Zero out root translation XZ for rendering
     cc->xformData.localPositions[0].x = 0.0f;
     cc->xformData.localPositions[0].z = 0.0f;
-
-    // Remove Y rotation from root for rendering
-    const Quaternion invYRot = QuaternionInvert(QuaternionYComponent(currentRootRot));
-    cc->xformData.localRotations[0] = QuaternionMultiply(invYRot, cc->xformData.localRotations[0]);
+    // Note: Y rotation was already stripped from localRotations6d[0] before blending
 
     // Forward kinematics (local space)
     TransformDataForwardKinematics(&cc->xformData);
@@ -1968,15 +2021,15 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 }
 
                 // Build joint name list for combo
-                std::vector<std::string> joints;
-                std::string comboStr = characterData->jointNamesCombo[characterData->active];
-                std::stringstream ss(comboStr);
-                std::string token;
-                while (std::getline(ss, token, ';')) {
+                vector<string> joints;
+                string comboStr = characterData->jointNamesCombo[characterData->active];
+                stringstream ss(comboStr);
+                string token;
+                while (getline(ss, token, ';')) {
                     joints.push_back(token);
                 }
-                std::vector<const char*> items;
-                for (const std::string& s : joints) items.push_back(s.c_str());
+                vector<const char*> items;
+                for (const string& s : joints) items.push_back(s.c_str());
 
                 ImGui::Combo("##trackbone", &camera->orbit.trackBone, items.data(), (int)items.size());
             }
@@ -2069,6 +2122,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Blend Cursors", &config->drawBlendCursors);
         ImGui::Checkbox("Draw Velocities", &config->drawVelocities);
         ImGui::Checkbox("Draw Accelerations", &config->drawAccelerations);
+        ImGui::Checkbox("Draw Root Velocities", &config->drawRootVelocities);
 
     }
     ImGui::End();
@@ -2102,7 +2156,7 @@ static inline void ImGuiCharacterData(
         }
 
         for (int i = 0; i < characterData->count; i++) {
-            std::string bvhNameShort;
+            string bvhNameShort;
             if (characterData->names[i].length() < 100) {
                 bvhNameShort = characterData->names[i];
             }
@@ -2117,7 +2171,7 @@ static inline void ImGuiCharacterData(
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(color.r / 255.f, color.g / 255.f, color.b / 255.f, color.a / 255.f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(color.r / 255.f, color.g / 255.f, color.b / 255.f, color.a / 255.f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(color.r / 255.f, color.g / 255.f, color.b / 255.f, color.a / 255.f));
-            if (ImGui::Button((std::string("##color") + std::to_string(i)).c_str(), ImVec2(20, 20))) {
+            if (ImGui::Button((string("##color") + to_string(i)).c_str(), ImVec2(20, 20))) {
                 characterData->colorPickerActive = !characterData->colorPickerActive;
             }
             ImGui::PopStyleColor(3);
@@ -2240,10 +2294,16 @@ static inline void ImGuiScrubberSettings(
 static inline void ImGuiAnimSettings(AppConfig* config)
 {
     ImGui::SetNextWindowPos(ImVec2(250, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(200, 100), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(200, 180), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Anim Settings")) {
-        ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.05f, 2.0f, "%.2f s");
+        ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.0f, 2.0f, "%.2f s");
         ImGui::SliderFloat("Switch Interval", &config->switchInterval, 0.1f, 5.0f, "%.2f s");
+        ImGui::Separator();
+        ImGui::Checkbox("Vel Blending", &config->useVelBlending);
+        if (config->useVelBlending) {
+            ImGui::SliderFloat("Return Blend Time", &config->blendPosReturnTime, 0.01f, 1.0f, "%.2f s");
+        }
+        ImGui::SliderFloat("Hips Blend Time", &config->hipsRotationBlendTime, 0.01f, 1.0f, "%.2f s");
     }
     ImGui::End();
 }
@@ -2290,7 +2350,7 @@ struct ApplicationState {
     ModelAnimation genoAnimation;
     Shader genoBasicShader;
     bool genoModelLoaded;
-    std::vector<BVHGenoMapping> genoMappings;
+    vector<BVHGenoMapping> genoMappings;
 
     // Debug timescale system
     // numpad-: halve debugTimescale
@@ -2361,7 +2421,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                 CapsuleDataResize(&app->capsuleData, totalJoints);
             }
 
-            std::string windowTitle = app->characterData.filePaths[app->characterData.active] + " - BVHView";
+            string windowTitle = app->characterData.filePaths[app->characterData.active] + " - BVHView";
             SetWindowTitle(windowTitle.c_str());
         }
     }
@@ -2548,6 +2608,11 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     if (app->controlledCharacter.active && effectiveDt > 0.0f)
     {
+        // sync velocity blending settings from config
+        app->controlledCharacter.useVelBlending = app->config.useVelBlending;
+        app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
+        app->controlledCharacter.hipsRotationBlendTime = app->config.hipsRotationBlendTime;
+
         ControlledCharacterUpdate(
             &app->controlledCharacter,
             &app->characterData,
@@ -2853,7 +2918,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
 
         //qsort(app->capsuleData.capsuleSort, app->capsuleData.capsuleCount, sizeof(CapsuleSort), CapsuleSortCompareLess);
-        std::sort(app->capsuleData.capsuleSort.begin(), app->capsuleData.capsuleSort.begin() + app->capsuleData.capsuleCount,
+        sort(app->capsuleData.capsuleSort.begin(), app->capsuleData.capsuleSort.begin() + app->capsuleData.capsuleCount,
             [](const CapsuleSort& a, const CapsuleSort& b) { return a.value < b.value; });
 
         // Render
@@ -3053,15 +3118,14 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
+            span<const Vector3> velRow = app->animDatabase.globalJointVelocities.row_view(motionFrame);
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
                 if (xform.endSite[j]) continue;  // skip end sites
 
-                const size_t idx = (size_t)motionFrame * jointCount + j;
                 const Vector3 pos = xform.globalPositions[j];
-                const Vector3 vel = app->animDatabase.globalJointVelocities[idx];
-                const Vector3 endPos = Vector3Add(pos, Vector3Scale(vel, velScale));
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(velRow[j], velScale));
 
                 DrawLine3D(pos, endPos, BLUE);
             }
@@ -3089,30 +3153,69 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
+            span<const Vector3> accRow = app->animDatabase.globalJointAccelerations.row_view(motionFrame);
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
                 if (xform.endSite[j]) continue;  // skip end sites
 
-                const size_t idx = (size_t)motionFrame * jointCount + j;
                 const Vector3 pos = xform.globalPositions[j];
-                const Vector3 acc = app->animDatabase.globalJointAccelerations[idx];
-                const Vector3 endPos = Vector3Add(pos, Vector3Scale(acc, accScale));
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(accRow[j], accScale));
 
                 DrawLine3D(pos, endPos, RED);
             }
         }
     }
 
+    // Shared colors for cursor visualization (used by root velocities and skeleton drawing)
+    const Color cursorColors[ControlledCharacter::MAX_BLEND_CURSORS] = {
+        RED, GREEN, BLUE, YELLOW, MAGENTA,
+        ORANGE, PINK, SKYBLUE, LIME, VIOLET
+    };
+
+    // Draw root motion velocities from each cursor
+    if (app->controlledCharacter.active && app->config.drawRootVelocities)
+    {
+        const ControlledCharacter& cc = app->controlledCharacter;
+        const float velScale = 0.5f;  // scale for velocity visualization
+        const float yOffset = 0.05f;  // slight vertical offset to avoid z-fighting
+
+        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+        {
+            const BlendCursor& cur = cc.cursors[ci];
+            if (!cur.active) continue;
+            if (cur.normalizedWeight < 0.01f) continue;  // skip very low weight cursors
+
+            // draw from character's world position (all cursors share same world pos)
+            const Vector3 startPos = Vector3Add(cc.worldPosition, Vector3{ 0.0f, yOffset * (ci + 1), 0.0f });
+            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cur.rootVelocity, velScale));
+
+            const Color col = cursorColors[ci];
+            DrawLine3D(startPos, endPos, col);
+
+            // draw small sphere at end to make it more visible
+            DrawSphere(endPos, 0.02f, col);
+
+            // also draw yaw rate as a small arc/line perpendicular to velocity
+            // (positive yaw = counter-clockwise when viewed from above)
+            //const float yawVis = cur.rootYawRate * velScale * 0.5f;
+            //const Vector3 yawDir = Vector3{ -sinf(yawVis), 0.0f, cosf(yawVis) };
+            //const Vector3 yawEnd = Vector3Add(startPos, Vector3Scale(yawDir, 0.3f));
+            //DrawLine3D(startPos, yawEnd, col);
+        }
+
+        // also draw the smoothed velocity in white
+        {
+            const Vector3 startPos = Vector3Add(cc.worldPosition, Vector3{ 0.0f, yOffset * 0.5f, 0.0f });
+            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cc.smoothedRootVelocity, velScale));
+            DrawLine3D(startPos, endPos, WHITE);
+            DrawSphere(endPos, 0.025f, WHITE);
+        }
+    }
+
     // Draw Blend Cursor Skeletons (for debug visualization)
     if (app->controlledCharacter.active && app->config.drawBlendCursors)
     {
-        // Distinct colors for each cursor slot
-        const Color cursorColors[ControlledCharacter::MAX_BLEND_CURSORS] = {
-            RED, GREEN, BLUE, YELLOW, MAGENTA,
-            ORANGE, PINK, SKYBLUE, LIME, VIOLET
-        };
-
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
             const BlendCursor& cur = app->controlledCharacter.cursors[ci];
@@ -3247,7 +3350,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     //        int leftToeIdx = -1;
     //        for (int j = 0; j < bvh.jointCount; ++j)
     //        {
-    //            if (bvh.joints[j].name != nullptr && std::strcmp(bvh.joints[j].name, "LeftToeBase") == 0)
+    //            if (bvh.joints[j].name != nullptr && strcmp(bvh.joints[j].name, "LeftToeBase") == 0)
     //            {
     //                leftToeIdx = j;
     //                break;
@@ -3268,7 +3371,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     //        int leftToeIdx = -1;
     //        for (int j = 0; j < cbvh->jointCount; ++j)
     //        {
-    //            if (cbvh->joints[j].name != nullptr && std::strcmp(cbvh->joints[j].name, "LeftToeBase") == 0)
+    //            if (cbvh->joints[j].name != nullptr && strcmp(cbvh->joints[j].name, "LeftToeBase") == 0)
     //            {
     //                leftToeIdx = j;
     //                break;
@@ -3369,15 +3472,16 @@ static void ApplicationUpdate(void* voidApplicationState)
             int plotCount = count;
             if (plotCount > 1024) plotCount = 1024;
 
-            std::vector<float> featX(plotCount);
-            std::vector<float> featZ(plotCount);
+            vector<float> featX(plotCount);
+            vector<float> featZ(plotCount);
 
             const int startIdx = count - plotCount;
             int pi = 0;
             for (int f = startIdx; f < count; ++f)
             {
-                featX[pi] = app->animDatabase.features[(size_t)f * app->animDatabase.featureDim + 0];
-                featZ[pi] = app->animDatabase.features[(size_t)f * app->animDatabase.featureDim + 1];
+                span<const float> featRow = app->animDatabase.features.row_view(f);
+                featX[pi] = featRow[0];
+                featZ[pi] = featRow[1];
                 ++pi;
             }
 
@@ -3414,12 +3518,12 @@ static void ApplicationUpdate(void* voidApplicationState)
 
                     // Display each named feature value
                     const int fd = app->animDatabase.featureDim;
+                    span<const float> featRow = app->animDatabase.features.row_view(motionIndex);
                     for (int fi = 0; fi < fd; ++fi)
                     {
                         const char* fname = (fi < (int)app->animDatabase.featureNames.size()) ?
                             app->animDatabase.featureNames[fi].c_str() : "Feature";
-                        const float fval = app->animDatabase.features[(size_t)motionIndex * fd + fi];
-                        ImGui::Text("%s: % .6f", fname, fval);
+                        ImGui::Text("%s: % .6f", fname, featRow[fi]);
                     }
                 }
                 else
@@ -3765,7 +3869,7 @@ int main(int argc, char** argv)
 
         // Auto-load a default scene on startup
         {
-            std::vector<const char*> autoFiles = 
+            vector<const char*> autoFiles = 
             { 
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
@@ -3819,7 +3923,7 @@ int main(int argc, char** argv)
             CapsuleDataResize(&app.capsuleData, totalJoints);
         }
 
-        std::string windowTitle = app.characterData.filePaths[app.characterData.active] + " - BVHView";
+        string windowTitle = app.characterData.filePaths[app.characterData.active] + " - BVHView";
         SetWindowTitle(windowTitle.c_str());
     }
 

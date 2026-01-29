@@ -59,10 +59,16 @@ struct AppConfig {
     bool drawBlendCursors = true;  // Debug: show individual blend cursor skeletons
     bool drawVelocities = false;   // Draw joint velocity vectors
     bool drawAccelerations = false; // Draw joint acceleration vectors
+    bool drawRootVelocities = false; // Draw root motion velocity from each cursor
 
     // Animation settings
-    float defaultBlendTime = 2.0f;  // time for blend cursor spring to reach 95% of target
+    float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
     float switchInterval = 3.0f;    // time between random animation switches
+
+    // Velocity-based blending
+    bool useVelBlending = false;    // enable velocity-based rotation blending
+    float blendPosReturnTime = 0.1f; // time to bring the velocity advanced pose to the blended position
+    float hipsRotationBlendTime = 0.2f;   // separate blendtime for hips (no vel blending, just lerp)
 
     // Validity
     bool valid = false;
@@ -162,9 +168,14 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawBlendCursors = ResolveBoolConfig(buffer, "drawBlendCursors", config.drawBlendCursors, argc, argv);
     config.drawVelocities = ResolveBoolConfig(buffer, "drawVelocities", config.drawVelocities, argc, argv);
     config.drawAccelerations = ResolveBoolConfig(buffer, "drawAccelerations", config.drawAccelerations, argc, argv);
+    config.drawRootVelocities = ResolveBoolConfig(buffer, "drawRootVelocities", config.drawRootVelocities, argc, argv);
 
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
+
+    config.useVelBlending = ResolveBoolConfig(buffer, "useVelBlending", config.useVelBlending, argc, argv);
+    config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
+    config.hipsRotationBlendTime = ResolveFloatConfig(buffer, "hipsRotationBlendTime", config.hipsRotationBlendTime, argc, argv);
 
     //if (buffer) free(buffer);
 
@@ -231,9 +242,14 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"drawBlendCursors\": %s,\n", cfg.drawBlendCursors ? "true" : "false");
     fprintf(file, "    \"drawVelocities\": %s,\n", cfg.drawVelocities ? "true" : "false");
     fprintf(file, "    \"drawAccelerations\": %s,\n", cfg.drawAccelerations ? "true" : "false");
+    fprintf(file, "    \"drawRootVelocities\": %s,\n", cfg.drawRootVelocities ? "true" : "false");
 
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
-    fprintf(file, "    \"switchInterval\": %.4f\n", cfg.switchInterval);
+    fprintf(file, "    \"switchInterval\": %.4f,\n", cfg.switchInterval);
+
+    fprintf(file, "    \"useVelBlending\": %s,\n", cfg.useVelBlending ? "true" : "false");
+    fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", cfg.blendPosReturnTime);
+    fprintf(file, "    \"hipsRotationBlendTime\": %.4f\n", cfg.hipsRotationBlendTime);
 
     fprintf(file, "}\n");
 
