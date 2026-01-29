@@ -1,574 +1,551 @@
-﻿here is a single, coherent, readable C++ file - style rewrite of the motion - matching loop, with:
-
-Clean variable names
-
-Linear flow
-
-Raylib math(Vector3, Quaternion, Matrix)
-
-Flat pose / feature storage using libtorch tensors
-
-Very detailed comments, especially on the weird / non - obvious parts of motion matching
-
-No abstractions hiding logic
-
-Designed to be educational first, engine - optimized later
-
-This is meant to be read like a reference implementation, not production code.
-
-motion_matching.cpp
-#include <torch/torch.h>
-#include <raylib.h>
-#include <vector>
-#include <array>
+﻿#include <vector>
+#include <unordered_map>
+#include <algorithm>
 #include <cmath>
-#include <limits>
+#include <cassert>
 
-/*
-    ============================
-    DATA STRUCTURES
-    ============================
+// Constants
+static constexpr float ANIMATION_DT = 1.0f / 60.0f;
 
-    Important idea:
-    ---------------
-    We separate:
-    - math (raylib: Vector3, Quaternion, Matrix)
-    - data storage (libtorch tensors = flat float arrays)
-    - logic (motion matching, search, inertialization, FK)
+// Simple pose representation - just a vector of floats
+using Pose = std::vector<float>;
 
-    This avoids mixing math types with memory layout.
-*/
+// Animation data structure with precomputed velocities
+struct Animation {
+    std::vector<Pose> poses;      // Poses sampled at 60Hz
+    std::vector<Pose> velocities; // Constant velocities between poses (per second)
 
+    Animation() = default;
 
-/* =============================
-   Motion database (offline data)
-   ============================= */
-
-    struct MotionDatabase
-{
-    // Shapes:
-    // jointPositions   : [frame, joint, 3]
-    // jointRotations   : [frame, joint, 4]   (quat xyzw)
-    // jointVelocities  : [frame, joint, 3]
-    // jointAngularVel  : [frame, joint, 3]
-
-    torch::Tensor globalJointPositions;
-    torch::Tensor globalJointRotations;
-    torch::Tensor jointVelocities;
-    torch::Tensor jointAngularVel;
-
-    // Animation clips segmentation
-    std::vector<int> clipStartFrame;
-    std::vector<int> clipEndFrame;
-
-    // Skeleton hierarchy
-    std::vector<int> parentJoint;
-};
-
-
-/* =============================
-   Root motion state (runtime)
-   ============================= */
-
-struct RootMotionState
-{
-    Vector3 position = { 0,0,0 };
-    Vector3 velocity = { 0,0,0 };
-    Vector3 acceleration = { 0,0,0 };
-
-    Quaternion rotation = { 0,0,0,1 };
-    Vector3 angularVel = { 0,0,0 };
-};
-
-
-/* =============================
-   Inertialization buffers
-   =============================
-
-   These store "corrections" when switching animations.
-   Instead of snapping to new pose, we decay offsets smoothly.
-
-   This is NOT blending.
-   This is physically-inspired smoothing (spring-damper model).
-*/
-
-struct InertialBuffers
-{
-    // [joint, 3]
-    torch::Tensor positionOffset;
-    torch::Tensor velocityOffset;
-
-    // [joint, 4] and [joint, 3]
-    torch::Tensor rotationOffset;
-    torch::Tensor angularOffset;
-};
-
-
-/* =============================
-   Global state
-   ============================= */
-
-static int activeClip = 0;
-static int activeFrame = 0;
-static float searchCooldown = 0.15f;
-
-constexpr float SEARCH_INTERVAL = 0.15f;
-constexpr float FLOAT_MAX = std::numeric_limits<float>::max();
-
-
-/*
-    ============================
-    MAIN UPDATE FUNCTION
-    ============================
-
-    This function runs once per frame.
-    It performs:
-
-    1. Input → desired motion
-    2. Trajectory prediction
-    3. Feature vector construction
-    4. Database search (KD-tree)
-    5. Transition smoothing (inertialization)
-    6. Animation time stepping
-    7. Root motion update
-    8. Joint pose update
-    9. Forward kinematics
-    10. Mesh pose upload
-*/
-
-void UpdateMotionMatchingSystem(
-    MotionDatabase& database,
-    RootMotionState& root,
-    InertialBuffers& inertial,
-    float deltaTime)
-{
-    /* ============================================================
-       STEP 1 — PLAYER INPUT → DESIRED MOTION
-       ============================================================ */
-
-    Vector3 moveInput = GetGamepadStickLeft();   // movement direction
-    Vector3 lookInput = GetGamepadStickRight();  // facing direction
-
-    // Desired velocity in world space
-    Vector3 desiredVelocity = Vector3Scale(moveInput, 5.0f);
-
-    /*
-        Weird part:
-        -----------
-        Facing direction does NOT always come from movement.
-        - If right stick exists → look direction controls facing
-        - Otherwise movement controls facing
-
-        This allows strafing / aiming systems.
-    */
-    Vector3 desiredFacing = { 0,0,1 };
-
-    if (Vector3Length(lookInput) > 0.01f)
-        desiredFacing = Vector3Normalize(lookInput);
-    else if (Vector3Length(moveInput) > 0.01f)
-        desiredFacing = Vector3Normalize(moveInput);
-
-
-    /* ============================================================
-       STEP 2 — TRAJECTORY PREDICTION
-       ============================================================ */
-
-       /*
-           Motion matching does NOT match on current pose only.
-           It matches on *future intention*.
-
-           We predict where the character will be in the future
-           using critically-damped springs (smooth convergence).
-       */
-
-    Quaternion desiredRotation =
-        QuaternionFromVector3ToVector3({ 0,0,1 }, desiredFacing);
-
-    constexpr float velocityHalfLife = 0.2f;
-    constexpr float rotationHalfLife = 0.2f;
-
-    // Future prediction times (seconds)
-    std::array<float, 3> futureTimes = {
-        20.0f / 60.0f,
-        40.0f / 60.0f,
-        60.0f / 60.0f
-    };
-
-    std::array<Vector3, 3> futurePositions;
-    std::array<Quaternion, 3> futureRotations;
-
-    PredictTrajectoryPosition(
-        root.position,
-        root.velocity,
-        root.acceleration,
-        desiredVelocity,
-        velocityHalfLife,
-        futureTimes,
-        futurePositions);
-
-    PredictTrajectoryRotation(
-        root.rotation,
-        root.angularVel,
-        desiredRotation,
-        rotationHalfLife,
-        futureTimes,
-        futureRotations);
-
-
-    /* ============================================================
-       STEP 3 — BUILD FEATURE VECTOR
-       ============================================================ */
-
-       /*
-           Weird part:
-           -----------
-           We DO NOT store full 3D data in features.
-
-           We usually store:
-           - x/z positions (ground plane)
-           - x/z facing directions
-           - ignore y (height)
-
-           This makes matching invariant to terrain height
-           and massively reduces feature dimension.
-       */
-
-    torch::Tensor featureQuery = torch::zeros({ 14 }, torch::kFloat32);
-    float* f = featureQuery.data_ptr<float>();
-
-    int k = 0;
-    for (int i = 0; i < 3; ++i)
-    {
-        // future position (x,z)
-        f[k++] = futurePositions[i].x;
-        f[k++] = futurePositions[i].z;
-
-        // future facing (x,z)
-        Vector3 dir = QuaternionRotateVector(futureRotations[i], { 0,0,1 });
-        f[k++] = dir.x;
-        f[k++] = dir.z;
+    explicit Animation(const std::vector<Pose>& poses)
+        : poses(poses) {
+        assert(!poses.empty() && "Animation must have at least one pose");
+        assert(poses.size() >= 2 && "Animation must have at least 2 frames for velocities");
+        precomputeVelocities();
     }
 
-    // current facing
-    Vector3 currentForward = QuaternionRotateVector(root.rotation, { 0,0,1 });
-    f[k++] = currentForward.x;
-    f[k++] = currentForward.z;
+    // Precompute velocities: v[i] = (p[i+1] - p[i]) / dt
+    void precomputeVelocities() {
+        if (poses.empty()) return;
 
+        size_t poseSize = poses[0].size();
+        velocities.resize(poses.size()); // Same size as poses
 
-    /* ============================================================
-       STEP 4 — DATABASE SEARCH
-       ============================================================ */
+        for (size_t i = 0; i < poses.size(); ++i) {
+            velocities[i].resize(poseSize, 0.0f);
 
-       /*
-           Weird part:
-           -----------
-           Motion matching is NOT continuous search.
-           Searching every frame is expensive and unstable.
+            if (i < poses.size() - 1) {
+                for (size_t j = 0; j < poseSize; ++j) {
+                    velocities[i][j] = (poses[i + 1][j] - poses[i][j]) / ANIMATION_DT;
+                }
+            }
+            // Last frame has zero velocity
+        }
+    }
 
-           We only search every ~150ms.
-           Between searches, animation continues naturally.
-       */
+    // Get duration in seconds: (framecount - 1) * dt
+    float getDuration() const {
+        return (poses.size() - 1) * ANIMATION_DT;
+    }
 
-    if (searchCooldown <= 0.0f)
-    {
-        int bestClip = activeClip;
-        int bestFrame = activeFrame;
-        float bestCost = FLOAT_MAX;
+    // Get pose at specific time with linear interpolation
+    Pose getPoseAtTime(float time) const {
+        assert(time >= 0.0f && time <= getDuration() &&
+            "Time must be within animation duration");
 
-        /*
-            Bias toward staying in same animation.
-            This prevents jitter and micro-switching.
-        */
-        if (activeFrame < database.clipEndFrame[activeClip] - 60)
-        {
-            bestCost =
-                FeatureDistance(featureQuery, databaseFeatures[activeFrame])
-                - 0.01f;
+        if (poses.empty()) return {};
+
+        // Direct frame lookup with interpolation
+        float frameIndex = time / ANIMATION_DT;
+        int frame0 = static_cast<int>(frameIndex);
+        int frame1 = frame0 + 1;
+        float alpha = frameIndex - frame0;
+
+        // Handle boundary case
+        if (frame0 >= static_cast<int>(poses.size()) - 1) {
+            return poses.back();
         }
 
-        /*
-            KD-tree search:
-            ---------------
-            We search all animation clips and find the closest feature match.
-        */
-        for (int clip = 0; clip < kdTrees.size(); ++clip)
-        {
-            float cost;
-            int localFrame;
+        // Clamp frame1
+        frame1 = std::min(frame1, static_cast<int>(poses.size()) - 1);
 
-            kdTrees[clip].Query(
-                featureQuery.data_ptr<float>(),
-                cost,
-                localFrame,
-                bestCost);
+        // Linear interpolation
+        const Pose& p0 = poses[frame0];
+        const Pose& p1 = poses[frame1];
 
-            if (cost < bestCost)
-            {
-                bestCost = cost;
-                bestClip = clip;
-                bestFrame = database.clipStartFrame[clip] + localFrame;
+        if (p0.size() != p1.size()) return p0;
+
+        Pose result(p0.size());
+        for (size_t i = 0; i < p0.size(); ++i) {
+            result[i] = p0[i] + alpha * (p1[i] - p0[i]);
+        }
+
+        return result;
+    }
+
+    // Get velocity at specific time (constant between frames)
+    Pose getVelocityAtTime(float time) const {
+        assert(time >= 0.0f && time <= getDuration() &&
+            "Time must be within animation duration");
+
+        if (velocities.empty()) {
+            return std::vector<float>(poses[0].size(), 0.0f);
+        }
+
+        // Find which frame interval we're in
+        int frameIndex = static_cast<int>(time / ANIMATION_DT);
+        frameIndex = std::min(frameIndex, static_cast<int>(velocities.size()) - 1);
+        frameIndex = std::max(frameIndex, 0);
+
+        return velocities[frameIndex];
+    }
+};
+
+// Critically damped spring implementation (optimized)
+class CriticallyDampedSpring {
+private:
+    float k;       // Stiffness
+    float d;       // Damping
+    float vel;     // Current velocity
+
+public:
+    CriticallyDampedSpring(float stiffness = 10.0f)
+        : k(stiffness), d(2.0f * std::sqrt(stiffness)), vel(0.0f) {}
+
+    // Fast update
+    float update(float current, float target, float deltaTime) {
+        if (deltaTime <= 0.0f) return current;
+
+        const float x = current - target;
+
+        // Early out if very close
+        if (x * x < 1e-6f && vel * vel < 1e-6f) {
+            return target;
+        }
+
+        // Simplified spring update
+        const float acceleration = -k * x - d * vel;
+        vel += acceleration * deltaTime;
+        current += vel * deltaTime;
+
+        return current;
+    }
+
+    void resetVelocity() { vel = 0.0f; }
+    float getVelocity() const { return vel; }
+};
+
+// Animation cursor
+struct AnimationCursor {
+    int animId;           // Reference to animation data
+    float currentTime;    // Current playback time in seconds
+    float weight;         // Current blending weight (0-1)
+    float targetWeight;   // Target blending weight (0-1)
+    CriticallyDampedSpring weightSpring;  // Spring for weight transitions
+    bool isActive;        // Whether this cursor is in use
+
+    AnimationCursor()
+        : animId(-1), currentTime(0.0f), weight(0.0f), targetWeight(0.0f),
+        weightSpring(30.0f), isActive(false) {}
+
+    void initialize(int id, float startTime, float target, float stiffness) {
+        animId = id;
+        currentTime = startTime;
+        weight = 0.0f;
+        targetWeight = target;
+        weightSpring = CriticallyDampedSpring(stiffness);
+        isActive = true;
+    }
+
+    void reset() {
+        animId = -1;
+        weight = 0.0f;
+        targetWeight = 0.0f;
+        isActive = false;
+    }
+
+    // Update weight using spring
+    void updateWeight(float deltaTime) {
+        weight = weightSpring.update(weight, targetWeight, deltaTime);
+    }
+
+    // Set target weight and reset spring if needed
+    void setTargetWeight(float target, bool resetSpring = false) {
+        targetWeight = std::max(0.0f, std::min(target, 1.0f));
+        if (resetSpring) {
+            weightSpring.resetVelocity();
+            weight = targetWeight;
+        }
+    }
+
+    // Check if this cursor can be removed
+    bool canRemove() const {
+        return !isActive || (weight <= 0.0001f && targetWeight <= 0.0001f);
+    }
+};
+
+// Main animation blending system
+class AnimationBlender {
+private:
+    static constexpr int MAX_CURSORS = 5;  // Fixed pool size
+
+    std::unordered_map<int, Animation> animations;
+    AnimationCursor cursorPool[MAX_CURSORS];
+
+    // State storage
+    Pose currentPose;           // Current blended pose (output)
+    Pose velBlendedPose;        // Velocity-blended pose
+    Pose velBlendedVel;         // Velocity of velBlendedPose
+
+    // Temporary storage
+    Pose normalBlendedPose;
+    Pose blendedVel;
+
+    float previousUpdateTime;
+    float blendTime;           // Time for blending between animations
+    float posStiffness;        // Stiffness for position correction
+    bool poseInitialized;
+
+    // Find inactive cursor or one with smallest weight
+    AnimationCursor* findAvailableCursor() {
+        AnimationCursor* available = nullptr;
+        AnimationCursor* smallestWeight = nullptr;
+        float minWeight = 1e9f;
+
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (!cursorPool[i].isActive) {
+                available = &cursorPool[i];
+                break;
+            }
+            else if (cursorPool[i].weight < minWeight) {
+                minWeight = cursorPool[i].weight;
+                smallestWeight = &cursorPool[i];
             }
         }
 
+        return available ? available : smallestWeight;
+    }
 
-        /* ========================================================
-           STEP 5 — TRANSITION SMOOTHING (INERTIALIZATION)
-           ======================================================== */
+    // Find cursor by animId
+    AnimationCursor* findCursor(int animId) {
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive && cursorPool[i].animId == animId) {
+                return &cursorPool[i];
+            }
+        }
+        return nullptr;
+    }
 
-           /*
-               Weird part:
-               -----------
-               We DO NOT blend poses.
-               We compute the difference between poses and decay it over time.
+    // Fast pose blending without allocation
+    void blendPosesInPlace(Pose& result, float& totalWeight,
+        const Pose& pose, float weight) {
+        if (weight <= 0.0001f || pose.empty()) return;
 
-               This avoids:
-               - foot sliding
-               - collapsing knees
-               - volume loss
-               - interpolation artifacts
-           */
-
-        if (bestClip != activeClip || bestFrame != activeFrame)
-        {
-            BeginInertialPositionTransition(
-                inertial.positionOffset,
-                inertial.velocityOffset,
-                database.globalJointPositions[activeFrame],
-                database.jointVelocities[activeFrame],
-                database.globalJointPositions[bestFrame],
-                database.jointVelocities[bestFrame]);
-
-            BeginInertialRotationTransition(
-                inertial.rotationOffset,
-                inertial.angularOffset,
-                database.globalJointRotations[activeFrame],
-                database.jointAngularVel[activeFrame],
-                database.globalJointRotations[bestFrame],
-                database.jointAngularVel[bestFrame]);
-
-            activeClip = bestClip;
-            activeFrame = bestFrame;
+        if (totalWeight == 0.0f) {
+            result = pose;
+            for (size_t i = 0; i < result.size(); ++i) {
+                result[i] *= weight;
+            }
+        }
+        else {
+            if (result.size() != pose.size()) {
+                result.resize(pose.size(), 0.0f);
+            }
+            for (size_t i = 0; i < pose.size(); ++i) {
+                result[i] += pose[i] * weight;
+            }
         }
 
-        searchCooldown = SEARCH_INTERVAL;
+        totalWeight += weight;
     }
 
-
-    /* ============================================================
-       STEP 6 — ANIMATION TIME ADVANCE
-       ============================================================ */
-
-       /*
-           Weird part:
-           -----------
-           Database is usually 60 FPS.
-           Game runs at 30 FPS.
-           So we advance by 2 frames.
-       */
-    activeFrame += 2;
-
-    activeFrame = Clamp(
-        activeFrame,
-        database.clipStartFrame[activeClip],
-        database.clipEndFrame[activeClip] - 1);
-
-    searchCooldown -= deltaTime;
-
-    /*
-        Force search near clip end
-        (prevents getting stuck at end frames)
-    */
-    if (activeFrame >= database.clipEndFrame[activeClip] - 4)
-        searchCooldown = 0.0f;
-
-
-    /* ============================================================
-       STEP 7 — ROOT MOTION UPDATE
-       ============================================================ */
-
-       /*
-           Weird part:
-           -----------
-           Root is not inertialized here.
-           Only joints are inertialized.
-           Root is driven by animation + input.
-       */
-
-    UpdateSpringPosition(
-        root.position,
-        root.velocity,
-        root.acceleration,
-        desiredVelocity,
-        deltaTime);
-
-    root.velocity =
-        QuaternionRotateVector(
-            root.rotation,
-            QuaternionInverseRotateVector(
-                database.globalJointRotations[activeFrame][0],
-                database.jointVelocities[activeFrame][0]));
-
-    root.angularVel =
-        QuaternionRotateVector(
-            root.rotation,
-            QuaternionInverseRotateVector(
-                database.globalJointRotations[activeFrame][0],
-                database.jointAngularVel[activeFrame][0]));
-
-    root.position = Vector3Add(
-        root.position,
-        Vector3Scale(root.velocity, deltaTime));
-
-    root.rotation = QuaternionMultiply(
-        QuaternionFromAxisAngle(
-            Vector3Normalize(root.angularVel),
-            Vector3Length(root.angularVel) * deltaTime),
-        root.rotation);
-
-
-    /* ============================================================
-       STEP 8 — JOINT POSE UPDATE (INERTIALIZATION)
-       ============================================================ */
-
-    constexpr float poseHalfLife = 0.075f;
-
-    torch::Tensor finalJointPositions;
-    torch::Tensor finalJointRotations;
-
-    UpdateInertialPositions(
-        inertial.positionOffset,
-        inertial.velocityOffset,
-        database.globalJointPositions[activeFrame],
-        database.jointVelocities[activeFrame],
-        poseHalfLife,
-        deltaTime,
-        finalJointPositions);
-
-    UpdateInertialRotations(
-        inertial.rotationOffset,
-        inertial.angularOffset,
-        database.globalJointRotations[activeFrame],
-        database.jointAngularVel[activeFrame],
-        poseHalfLife,
-        deltaTime,
-        finalJointRotations);
-
-
-    /* ============================================================
-       STEP 9 — FORWARD KINEMATICS
-       ============================================================ */
-
-       /*
-           Weird part:
-           -----------
-           FK is done manually instead of engine skeleton system.
-           This allows:
-           - full control
-           - deterministic behavior
-           - custom root handling
-           - easy ML integration
-       */
-
-    std::vector<Matrix> globalTransforms(database.parentJoint.size());
-
-    // Root transform
-    Matrix rootMatrix = QuaternionToMatrix(root.rotation);
-    rootMatrix.m12 = root.position.x;
-    rootMatrix.m13 = root.position.y;
-    rootMatrix.m14 = root.position.z;
-
-    globalTransforms[0] = rootMatrix;
-
-    for (size_t j = 1; j < database.parentJoint.size(); ++j)
-    {
-        Quaternion localRot = {
-            finalJointRotations[j - 1][0].item<float>(),
-            finalJointRotations[j - 1][1].item<float>(),
-            finalJointRotations[j - 1][2].item<float>(),
-            finalJointRotations[j - 1][3].item<float>()
-        };
-
-        Vector3 localPos = {
-            finalJointPositions[j - 1][0].item<float>(),
-            finalJointPositions[j - 1][1].item<float>(),
-            finalJointPositions[j - 1][2].item<float>()
-        };
-
-        Matrix localMatrix = QuaternionToMatrix(localRot);
-        localMatrix.m12 = localPos.x;
-        localMatrix.m13 = localPos.y;
-        localMatrix.m14 = localPos.z;
-
-        globalTransforms[j] =
-            MatrixMultiply(
-                globalTransforms[database.parentJoint[j]],
-                localMatrix);
+    // Fast normalization
+    void normalizePose(Pose& pose, float totalWeight) {
+        if (totalWeight > 0.0001f) {
+            const float invTotalWeight = 1.0f / totalWeight;
+            for (size_t i = 0; i < pose.size(); ++i) {
+                pose[i] *= invTotalWeight;
+            }
+        }
     }
 
+    // Remove inactive cursors
+    void cleanupCursors() {
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive && cursorPool[i].canRemove()) {
+                cursorPool[i].reset();
+            }
+        }
+    }
 
-    /* ============================================================
-       STEP 10 — APPLY POSE TO MESH
-       ============================================================ */
+public:
+    AnimationBlender(float blendDuration = 0.2f,
+        float posStiffnessParam = 5.0f)
+        : previousUpdateTime(0.0f),
+        blendTime(blendDuration),
+        posStiffness(posStiffnessParam),
+        poseInitialized(false) {
+        // Initialize cursor pool
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            cursorPool[i] = AnimationCursor();
+        }
+    }
 
-    ApplyPoseToModel(
-        model,
-        bindPosePositions,
-        bindPoseRotations,
-        globalTransforms);
-}
+    // Add animation to the library
+    void addAnimation(int id, const Animation& anim) {
+        assert(anim.poses.size() >= 2 && "Animation must have at least 2 frames");
+        animations[id] = anim;
+    }
 
-Why this version is pedagogically correct
-It shows the real structure of motion matching :
+    // Remove animation from the library
+    void removeAnimation(int id) {
+        animations.erase(id);
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive && cursorPool[i].animId == id) {
+                cursorPool[i].reset();
+            }
+        }
+    }
 
-Intent → prediction → features → search → transition → motion
+    // Start a new animation
+    void startAnim(int animId, float startTime = 0.0f) {
+        auto animIt = animations.find(animId);
+        if (animIt == animations.end()) return;
 
-It explains the non - obvious parts :
+        assert(startTime >= 0.0f && startTime <= animIt->second.getDuration() &&
+            "Start time must be within animation duration");
 
-Why features are 2D
+        // Fade out existing cursors
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive) {
+                cursorPool[i].setTargetWeight(0.0f);
+            }
+        }
 
-Why prediction matters
+        // Check if already playing
+        auto* existingCursor = findCursor(animId);
+        if (existingCursor) {
+            existingCursor->currentTime = startTime;
+            existingCursor->setTargetWeight(1.0f, true);
+        }
+        else {
+            // Find available cursor
+            AnimationCursor* cursor = findAvailableCursor();
+            if (cursor) {
+                cursor->reset();
+                cursor->initialize(animId, startTime, 1.0f, 1.0f / (blendTime * blendTime));
 
-Why inertialization ≠ blending
+                // Start at full weight if no other active animations
+                bool anyActive = false;
+                for (int i = 0; i < MAX_CURSORS; ++i) {
+                    if (cursorPool[i].isActive && cursorPool[i].weight > 0.001f) {
+                        anyActive = true;
+                        break;
+                    }
+                }
 
-Why root is handled differently
+                if (!anyActive) {
+                    cursor->weight = 1.0f;
+                    cursor->weightSpring.resetVelocity();
+                }
+            }
+        }
+    }
 
-Why searching is periodic
+    // Update all active animations
+    void update(float currentTime) {
+        const float deltaTime = previousUpdateTime > 0.0f ?
+            currentTime - previousUpdateTime : 0.0f;
+        previousUpdateTime = currentTime;
 
-Why database FPS ≠ game FPS
+        if (deltaTime <= 0.0f) return;
 
-Why FK is manual
+        // Check if any active cursors
+        bool anyActive = false;
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive && cursorPool[i].weight > 0.001f) {
+                anyActive = true;
+                break;
+            }
+        }
 
-Why pose offsets exist
+        if (!anyActive) {
+            if (poseInitialized) return;
+            if (!currentPose.empty()) {
+                std::fill(currentPose.begin(), currentPose.end(), 0.0f);
+                poseInitialized = true;
+            }
+            return;
+        }
 
-It cleanly separates :
+        // Update cursors and accumulate
+        float totalWeight = 0.0f;
+        normalBlendedPose.clear();
+        blendedVel.clear();
 
-math
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (!cursorPool[i].isActive || cursorPool[i].weight <= 0.001f) {
+                continue;
+            }
 
-data
+            auto animIt = animations.find(cursorPool[i].animId);
+            if (animIt == animations.end()) {
+                continue;
+            }
 
-logic
+            // Update playback time
+            cursorPool[i].currentTime += deltaTime;
+            const float animDuration = animIt->second.getDuration();
+            if (cursorPool[i].currentTime > animDuration) {
+                cursorPool[i].currentTime = animDuration;
+            }
 
-animation
+            // Update blend weight
+            cursorPool[i].updateWeight(deltaTime);
+            const float weight = cursorPool[i].weight;
 
-control
+            // Get pose and accumulate
+            const Pose& cursorPose = animIt->second.getPoseAtTime(cursorPool[i].currentTime);
+            blendPosesInPlace(normalBlendedPose, totalWeight, cursorPose, weight);
 
-physics
+            // Get velocity and accumulate
+            const Pose& cursorVel = animIt->second.getVelocityAtTime(cursorPool[i].currentTime);
+            if (!cursorVel.empty()) {
+                if (blendedVel.empty()) {
+                    blendedVel.resize(cursorVel.size(), 0.0f);
+                }
 
-Mental model(important)
+                if (blendedVel.size() == cursorVel.size()) {
+                    for (size_t j = 0; j < cursorVel.size(); ++j) {
+                        blendedVel[j] += cursorVel[j] * weight;
+                    }
+                }
+            }
+        }
 
-Motion matching is not animation blending.
-It is :
+        // Clean up
+        cleanupCursors();
 
-"Search a giant motion database for the frame that already does what I want."
+        if (totalWeight < 0.0001f || normalBlendedPose.empty()) {
+            return;
+        }
 
-Everything else (inertialization, prediction, biasing, cooldowns) exists only to :
+        // Normalize
+        normalizePose(normalBlendedPose, totalWeight);
 
-avoid jitter
+        if (!blendedVel.empty() && totalWeight > 0.0001f) {
+            const float invWeight = 1.0f / totalWeight;
+            for (size_t i = 0; i < blendedVel.size(); ++i) {
+                blendedVel[i] *= invWeight;
+            }
+        }
 
-avoid snapping
+        // Initialize if needed
+        if (!poseInitialized) {
+            velBlendedPose = normalBlendedPose;
+            velBlendedVel.resize(normalBlendedPose.size(), 0.0f);
+            currentPose = normalBlendedPose;
+            poseInitialized = true;
+        }
+        else {
+            // Ensure correct size
+            if (velBlendedPose.size() != normalBlendedPose.size()) {
+                velBlendedPose.resize(normalBlendedPose.size(), 0.0f);
+                velBlendedVel.resize(normalBlendedPose.size(), 0.0f);
+            }
 
-preserve continuity
+            // Step 1: Set velocity to blended velocity
+            if (!blendedVel.empty() && blendedVel.size() == velBlendedVel.size()) {
+                velBlendedVel = blendedVel;
+            }
 
-preserve momentum
+            // Step 2: Advance position with velocity
+            for (size_t i = 0; i < velBlendedPose.size(); ++i) {
+                velBlendedPose[i] += velBlendedVel[i] * deltaTime;
+            }
 
-preserve physical plausibility
+            // Step 3: Lerp position toward normal blended pose
+            const float posAlpha = posStiffness * deltaTime;
+            if (posAlpha < 1.0f) {
+                const float invPosAlpha = 1.0f - posAlpha;
+                for (size_t i = 0; i < velBlendedPose.size(); ++i) {
+                    velBlendedPose[i] = velBlendedPose[i] * invPosAlpha + normalBlendedPose[i] * posAlpha;
+                }
+            }
+            else {
+                velBlendedPose = normalBlendedPose;
+            }
+
+            // Output
+            currentPose = velBlendedPose;
+        }
+    }
+
+    // Get the current blended pose
+    const Pose& getBlendedPose() const {
+        return currentPose;
+    }
+
+    // Set stiffness parameter
+    void setStiffness(float posStiffnessParam) {
+        posStiffness = posStiffnessParam;
+    }
+
+    // Get stiffness parameter
+    float getStiffness() const {
+        return posStiffness;
+    }
+
+    // Get blend time
+    float getBlendTime() const {
+        return blendTime;
+    }
+
+    // Set blend time
+    void setBlendTime(float blendDuration) {
+        blendTime = blendDuration;
+    }
+
+    // Get number of active animations
+    int getActiveAnimationCount() const {
+        int count = 0;
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive) count++;
+        }
+        return count;
+    }
+
+    // Check if a specific animation is currently playing
+    bool isAnimPlaying(int animId) const {
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            if (cursorPool[i].isActive && cursorPool[i].animId == animId &&
+                cursorPool[i].weight > 0.001f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Clear all active animations
+    void clearActiveAnimations() {
+        for (int i = 0; i < MAX_CURSORS; ++i) {
+            cursorPool[i].reset();
+        }
+
+        if (!currentPose.empty()) {
+            std::fill(currentPose.begin(), currentPose.end(), 0.0f);
+            std::fill(velBlendedPose.begin(), velBlendedPose.end(), 0.0f);
+            std::fill(velBlendedVel.begin(), velBlendedVel.end(), 0.0f);
+        }
+    }
+
+    // Reset pose system
+    void resetPose() {
+        currentPose.clear();
+        velBlendedPose.clear();
+        velBlendedVel.clear();
+        normalBlendedPose.clear();
+        blendedVel.clear();
+        poseInitialized = false;
+    }
+};

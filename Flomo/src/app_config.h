@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include "utils.h"
 #include "raylib.h"
+#include <fstream>
 
 // Simple app config that persists between runs
 struct AppConfig {
@@ -84,21 +85,32 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
 {
     AppConfig config = {};
 
-    // Try to open file; if absent we still apply command-line overrides below.
-    FILE* file = fopen(GetConfigPath(), "r");
-    char* buffer = nullptr;
-    if (file) {
-        fseek(file, 0, SEEK_END);
-        const long size = ftell(file);
-        fseek(file, 0, SEEK_SET);
+    std::vector<char> buffer_vec;
+    std::ifstream file(GetConfigPath(), std::ios::binary | std::ios::ate);
 
-        buffer = (char*)malloc(size + 1);
-        if (buffer) {
-            fread(buffer, 1, size, file);
-            buffer[size] = '\0';
-        }
-        fclose(file);
+    if (file) {
+        buffer_vec.resize(static_cast<size_t>(file.tellg()) + 1);
+        file.seekg(0);
+        file.read(buffer_vec.data(), buffer_vec.size() - 1);
+        buffer_vec.back() = '\0';  // Ensure null termination
     }
+    const char* buffer = buffer_vec.data();
+
+    //// Try to open file; if absent we still apply command-line overrides below.
+    //FILE* file = fopen(GetConfigPath(), "r");
+    //char* buffer = nullptr;
+    //if (file) {
+    //    fseek(file, 0, SEEK_END);
+    //    const long size = ftell(file);
+    //    fseek(file, 0, SEEK_SET);
+
+    //    buffer = (char*)malloc(size + 1);
+    //    if (buffer) {
+    //        fread(buffer, 1, size, file);
+    //        buffer[size] = '\0';
+    //    }
+    //    fclose(file);
+    //}
 
     // Apply JSON (if any) and then command-line overrides (via Resolve helpers).
     config.windowX = ResolveIntConfig(buffer, "windowX", config.windowX, argc, argv);
@@ -154,7 +166,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
 
-    if (buffer) free(buffer);
+    //if (buffer) free(buffer);
 
     // Validate window values
     if (config.windowX >= 0 && config.windowY >= 0 &&

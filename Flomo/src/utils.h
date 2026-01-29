@@ -7,6 +7,7 @@
 #include "assert.h"
 #include <cstdlib>
 #include <iostream>
+#include <span> 
 
 #ifdef __GNUC__
 #define ASSERT_EVEN_IN_RELEASE_FUNCTION __PRETTY_FUNCTION__
@@ -316,3 +317,135 @@ static inline int SideFromStringInt(const char* s, int defaultVal)
     if (StrContainsCaseInsensitive(lower, "right")) return SIDE_RIGHT;
     return defaultVal;
 }
+
+
+
+template<typename T>
+class Array2D
+{
+private:
+    int rows_;
+    int cols_;
+    std::vector<T> data_;
+
+public:
+    // Constructor
+    Array2D(int rows, int cols)
+        : rows_(rows), cols_(cols), data_(rows* cols)
+    {
+        assert(rows >= 0 && cols >= 0 && "Array2D dimensions must be non-negative");
+    }
+
+    // Constructor with initial value
+    Array2D(int rows, int cols, const T& initial_value)
+        : rows_(rows), cols_(cols), data_(rows* cols, initial_value)
+    {
+        assert(rows >= 0 && cols >= 0 && "Array2D dimensions must be non-negative");
+    }
+
+    // Non-const element access with bounds checking
+    T& at(int row_view, int col)
+    {
+        assert(row_view >= 0 && row_view < rows_ && col >= 0 && col < cols_
+            && "Array2D index out of bounds");
+        return data_[row_view * cols_ + col];
+    }
+
+    // Const element access with bounds checking
+    const T& at(int row_view, int col) const
+    {
+        assert(row_view >= 0 && row_view < rows_ && col >= 0 && col < cols_
+            && "Array2D index out of bounds");
+        return data_[row_view * cols_ + col];
+    }
+
+    // Non-const row view
+    std::span<T> row_view(int row_idx)
+    {
+        assert(row_idx >= 0 && row_idx < rows_ && "Array2D row index out of bounds");
+        return std::span<T>(data_.data() + row_idx * cols_, cols_);
+    }
+
+    // Const row view
+    std::span<const T> row_view(int row_idx) const
+    {
+        assert(row_idx >= 0 && row_idx < rows_ && "Array2D row index out of bounds");
+        return std::span<const T>(data_.data() + row_idx * cols_, cols_);
+    }
+
+    // Fill all elements with the same value
+    void fill(const T& value)
+    {
+        std::fill(data_.begin(), data_.end(), value);
+    }
+
+    // Get dimensions
+    int rows() const noexcept
+    {
+        return rows_;
+    }
+
+    int cols() const noexcept
+    {
+        return cols_;
+    }
+
+    int size() const noexcept
+    {
+        return rows_ * cols_;
+    }
+
+    // Raw data access
+    T* data() noexcept
+    {
+        return data_.data();
+    }
+
+    const T* data() const noexcept
+    {
+        return data_.data();
+    }
+
+    // Non-const operator[] for unchecked access
+    T& operator()(int row_view, int col) noexcept
+    {
+        return data_[row_view * cols_ + col];
+    }
+
+    // Const operator[] for unchecked access
+    const T& operator()(int row_view, int col) const noexcept
+    {
+        return data_[row_view * cols_ + col];
+    }
+
+    // Iterator support
+    typename std::vector<T>::iterator begin() noexcept
+    {
+        return data_.begin();
+    }
+
+    typename std::vector<T>::iterator end() noexcept
+    {
+        return data_.end();
+    }
+
+    typename std::vector<T>::const_iterator begin() const noexcept
+    {
+        return data_.begin();
+    }
+
+    typename std::vector<T>::const_iterator end() const noexcept
+    {
+        return data_.end();
+    }
+
+    typename std::vector<T>::const_iterator cbegin() const noexcept
+    {
+        return data_.cbegin();
+    }
+
+    typename std::vector<T>::const_iterator cend() const noexcept
+    {
+        return data_.cend();
+    }
+};

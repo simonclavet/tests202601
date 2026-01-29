@@ -25,10 +25,10 @@ enum
 struct BVHParser
 {
     std::string filename;   // now a C++ string
-    int offset;
+    int offset = 0;
     const char* data;
-    int row_view;
-    int col;
+    int row_view = 0;
+    int col = 0;
     char err[BVH_PARSER_ERR_MAX];
 };
 

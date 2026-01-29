@@ -118,3 +118,8 @@ Flomo/
 ### CUDA Settings
 - Architecture: SM 86 (RTX 30 series)
 - Flags: `--extended-lambda`, `--expt-relaxed-constexpr`, `-lineinfo`
+
+
+plan for jan 29:
+posvel rep for anims
+motion matching

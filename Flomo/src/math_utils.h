@@ -410,23 +410,35 @@ void Rot6dTransformVector(const Rot6d& rot, const Vector3& v, Vector3& out)
 
 void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
 {
+    // third column via cross product: c = a × b
     const float cx = rot.ay * rot.bz - rot.az * rot.by;
     const float cy = rot.az * rot.bx - rot.ax * rot.bz;
     const float cz = rot.ax * rot.by - rot.ay * rot.bx;
+
+    // matrix layout:
+    // m00=rot.ax  m01=rot.bx  m02=cx
+    // m10=rot.ay  m11=rot.by  m12=cy
+    // m20=rot.az  m21=rot.bz  m22=cz
+    //
+    // standard matrix-to-quat formulas:
+    // x = (m21 - m12) / s = (rot.bz - cy) / s
+    // y = (m02 - m20) / s = (cx - rot.az) / s
+    // z = (m10 - m01) / s = (rot.ay - rot.bx) / s
+    // w = (varies by branch)
 
     const float tr = rot.ax + rot.by + cz;
     if (tr > 0.0f)
     {
         const float s = std::sqrt(tr + 1.0f) * 2.0f;
         outQ.w = 0.25f * s;
-        outQ.x = (cy - rot.bz) / s;
-        outQ.y = (rot.az - cx) / s;
-        outQ.z = (rot.bx - rot.ay) / s;
+        outQ.x = (rot.bz - cy) / s;
+        outQ.y = (cx - rot.az) / s;
+        outQ.z = (rot.ay - rot.bx) / s;
     }
     else if ((rot.ax > rot.by) && (rot.ax > cz))
     {
         const float s = std::sqrt(1.0f + rot.ax - rot.by - cz) * 2.0f;
-        outQ.w = (cy - rot.bz) / s;
+        outQ.w = (rot.bz - cy) / s;
         outQ.x = 0.25f * s;
         outQ.y = (rot.ay + rot.bx) / s;
         outQ.z = (rot.az + cx) / s;
@@ -434,7 +446,7 @@ void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
     else if (rot.by > cz)
     {
         const float s = std::sqrt(1.0f + rot.by - rot.ax - cz) * 2.0f;
-        outQ.w = (rot.az - cx) / s;
+        outQ.w = (cx - rot.az) / s;
         outQ.x = (rot.ay + rot.bx) / s;
         outQ.y = 0.25f * s;
         outQ.z = (rot.bz + cy) / s;
@@ -442,7 +454,7 @@ void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
     else
     {
         const float s = std::sqrt(1.0f + cz - rot.ax - rot.by) * 2.0f;
-        outQ.w = (rot.bx - rot.ay) / s;
+        outQ.w = (rot.ay - rot.bx) / s;
         outQ.x = (rot.az + cx) / s;
         outQ.y = (rot.bz + cy) / s;
         outQ.z = 0.25f * s;
@@ -516,6 +528,33 @@ void Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
     Rot6dToQuaternion(start, qStart);
     Rot6dToQuaternion(end, qEnd);
     Rot6dFromQuaternion(QuaternionSlerp(qStart, qEnd, t), out);
+}
+
+// orthonormalize a Rot6d (useful after weighted accumulation)
+void Rot6dNormalize(Rot6d& rot)
+{
+    // normalize a-column
+    const float invLenA = FastInvSqrt(rot.ax * rot.ax + rot.ay * rot.ay + rot.az * rot.az);
+    rot.ax *= invLenA;
+    rot.ay *= invLenA;
+    rot.az *= invLenA;
+
+    // remove a-component from b, then normalize b
+    const float dot = rot.ax * rot.bx + rot.ay * rot.by + rot.az * rot.bz;
+    rot.bx -= dot * rot.ax;
+    rot.by -= dot * rot.ay;
+    rot.bz -= dot * rot.az;
+
+    const float invLenB = FastInvSqrt(rot.bx * rot.bx + rot.by * rot.by + rot.bz * rot.bz);
+    rot.bx *= invLenB;
+    rot.by *= invLenB;
+    rot.bz *= invLenB;
+}
+
+// identity Rot6d
+static inline Rot6d Rot6dIdentity()
+{
+    return Rot6d{ 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
 }
 
 void Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt, Vector3& outOmega)

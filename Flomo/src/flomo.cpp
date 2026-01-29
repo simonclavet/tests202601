@@ -379,6 +379,7 @@ struct AnimDatabase {
     // These are useful to avoid repeating global->local conversion when blending.
     std::vector<Vector3> localJointPositions;      // local positions (per-frame)
     std::vector<Quaternion> localJointRotations;   // local rotations (per-frame)
+    std::vector<Rot6d> localJointRotations6d;      // local rotations as Rot6d (for blending without double-cover issues)
 
     // Segmentation of the compacted motion DB into clips:
     // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
@@ -547,6 +548,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->globalJointAccelerations.resize((size_t)db->motionFrameCount * db->jointCount);
         db->localJointPositions.resize((size_t)db->motionFrameCount * db->jointCount);
         db->localJointRotations.resize((size_t)db->motionFrameCount * db->jointCount);
+        db->localJointRotations6d.resize((size_t)db->motionFrameCount * db->jointCount);
     }
     catch (...) {
         TraceLog(LOG_ERROR, "AnimDatabase: failed to allocate motion DB storage");
@@ -557,6 +559,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->globalJointAccelerations.clear();
         db->localJointPositions.clear();
         db->localJointRotations.clear();
+        db->localJointRotations6d.clear();
         db->valid = false;
         return;
     }
@@ -584,6 +587,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 // store local-space transforms too (useful for blending without conversion)
                 db->localJointPositions[dst] = tmpXform.localPositions[j];
                 db->localJointRotations[dst] = tmpXform.localRotations[j];
+
+                // also store Rot6d version for blending without double-cover issues
+                Rot6dFromQuaternion(tmpXform.localRotations[j], db->localJointRotations6d[dst]);
             }
 
             ++motionFrameIdx;
@@ -944,19 +950,74 @@ static inline void SampleCursorPoseLerp(
     if (outRootRot) *outRootRot = outRotations[0];
 }
 
+// sample interpolated local pose from AnimDatabase at time animTime, using Rot6d for rotations
+static inline void SampleCursorPoseLerp6d(
+    const AnimDatabase* db,
+    int animIndex,
+    float animTime,
+    std::vector<Vector3>& outPositions,
+    std::vector<Rot6d>& outRotations6d,
+    std::vector<Quaternion>& outRotations,  // also fill quats for root motion (convenience)
+    Vector3* outRootPos,
+    Quaternion* outRootRot)
+{
+    const float frameTime = db->animFrameTime[animIndex];
+    const int frameCount = db->animFrameCount[animIndex];
+    const int jointCount = db->jointCount;
+    const int clipStart = db->clipStartFrame[animIndex];
+
+    int f0 = 0;
+    int f1 = 0;
+    float alpha = 0.0f;
+
+    if (frameTime > 0.0f && frameCount > 0)
+    {
+        float frameF = animTime / frameTime;
+        if (frameF < 0.0f) frameF = 0.0f;
+        const float maxFrame = (float)(frameCount - 1);
+        if (frameF > maxFrame) frameF = maxFrame;
+
+        f0 = (int)floorf(frameF);
+        f1 = f0 + 1;
+        if (f1 >= frameCount) f1 = frameCount - 1;
+        alpha = frameF - (float)f0;
+    }
+
+    const size_t base0 = (size_t)(clipStart + f0) * (size_t)jointCount;
+    const size_t base1 = (size_t)(clipStart + f1) * (size_t)jointCount;
+
+    for (int j = 0; j < jointCount; ++j)
+    {
+        const Vector3 p0 = db->localJointPositions[base0 + j];
+        const Vector3 p1 = db->localJointPositions[base1 + j];
+        outPositions[j] = Vector3Lerp(p0, p1, alpha);
+
+        // lerp Rot6d and normalize
+        const Rot6d& r0 = db->localJointRotations6d[base0 + j];
+        const Rot6d& r1 = db->localJointRotations6d[base1 + j];
+        Rot6dLerp(r0, r1, alpha, outRotations6d[j]);
+
+        // also produce quat for root motion code (we still need quats for root delta computation)
+        Rot6dToQuaternion(outRotations6d[j], outRotations[j]);
+    }
+
+    if (outRootPos) *outRootPos = outPositions[0];
+    if (outRootRot) *outRootRot = outRotations[0];
+}
+
 struct BlendCursor {
-    int animIndex = -1;                       // which animation/clip
+    int animIndex = -1;                         // which animation/clip
     float animTime = 0.0f;                      // playback time in that clip
-    float weight = 0.0f;                        // current weight
+    DoubleSpringDamperState weightSpring = {};  // spring state for weight blending (x = current weight)
     float normalizedWeight = 0.0f;              // weight / totalWeight (sums to 1 across active cursors)
     float targetWeight = 0.0f;                  // desired weight
-    float weightVel = 0.0f;                     // velocity for spring integrator
-    float blendTime = 0.3f;                     // time for spring to reach 95% of target
+    float blendTime = 0.3f;                     // halflife for double spring damper
     bool active = false;                        // is cursor in use
 
     // Local-space pose stored per cursor for blending (size = jointCount)
     std::vector<Vector3> localPositions;
     std::vector<Quaternion> localRotations;
+    std::vector<Rot6d> localRotations6d;  // Rot6d version for blending
 
     // Global-space pose for debug visualization (computed via FK after sampling)
     std::vector<Vector3> globalPositions;
@@ -1060,15 +1121,15 @@ static void ControlledCharacterInit(
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
         cc->cursors[i].localPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].localRotations.resize(cc->xformData.jointCount);
+        cc->cursors[i].localRotations6d.resize(cc->xformData.jointCount);
         cc->cursors[i].globalPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].globalRotations.resize(cc->xformData.jointCount);
         cc->cursors[i].prevLocalRootPos = cc->xformData.localPositions[0];
         cc->cursors[i].prevLocalRootRot = cc->xformData.localRotations[0];
 
         cc->cursors[i].active = false;
-        cc->cursors[i].weight = 0.0f;
+        cc->cursors[i].weightSpring = {};  // zero all spring state
         cc->cursors[i].targetWeight = 0.0f;
-        cc->cursors[i].weightVel = 0.0f;
     }
 
     // Sample initial pose to get starting root state
@@ -1110,30 +1171,23 @@ static BlendCursor* FindAvailableCursor(ControlledCharacter* cc)
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
     {
         if (!cc->cursors[i].active) return &cc->cursors[i];
-        if (cc->cursors[i].weight < minWeight)
+        if (cc->cursors[i].weightSpring.x < minWeight)
         {
-            minWeight = cc->cursors[i].weight;
+            minWeight = cc->cursors[i].weightSpring.x;
             smallest = &cc->cursors[i];
         }
     }
     return smallest; // may be null only when MAX_BLEND_CURSORS == 0
 }
 
-// Helper: update a critically-damped spring for cursor weight
+// Helper: update double spring damper for cursor weight (smoother acceleration at start)
 static inline void UpdateWeightSpring(BlendCursor* cursor, float dt)
 {
-    // compute stiffness from blendTime: k = (4.75 / blendTime)^2 gives 95% settling
-    const float omega = 4.75f / cursor->blendTime;
-    const float k = omega * omega;
-    const float d = 2.0f * omega;  // critical damping: d = 2*sqrt(k) = 2*omega
-    const float x = cursor->weight - cursor->targetWeight;
-    const float acc = -k * x - d * cursor->weightVel;
-    cursor->weightVel += acc * dt;
-    cursor->weight += cursor->weightVel * dt;
+    DoubleSpringDamper(cursor->weightSpring, cursor->targetWeight, cursor->blendTime, dt);
 
-    // clamp
-    if (cursor->weight < 0.0f) cursor->weight = 0.0f;
-    if (cursor->weight > 1.0f) cursor->weight = 1.0f;
+    // clamp the output weight
+    if (cursor->weightSpring.x < 0.0f) cursor->weightSpring.x = 0.0f;
+    if (cursor->weightSpring.x > 1.0f) cursor->weightSpring.x = 1.0f;
 }
 
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
@@ -1200,23 +1254,25 @@ static void ControlledCharacterUpdate(
             cursor->active = true;
             cursor->animIndex = newAnim;
             cursor->animTime = startTime;
-            cursor->weight = 0.0f;
+            cursor->weightSpring = {};  // reset spring state
 
             if (firstFrame) {
-                cursor->weight = 1.0f; // immediate full weight on first frame
+                // immediate full weight on first frame - set all spring state to 1
+                cursor->weightSpring.x = 1.0f;
+                cursor->weightSpring.xi = 1.0f;
             }
 
-            cursor->weightVel = 0.0f;
             cursor->targetWeight = 1.0f;
             cursor->blendTime = defaultBlendTime;
 
             Vector3 rootPos;
             Quaternion rootRot;
-            SampleCursorPoseLerp(
+            SampleCursorPoseLerp6d(
                 db,
                 cursor->animIndex,
                 cursor->animTime,
                 cursor->localPositions,
+                cursor->localRotations6d,
                 cursor->localRotations,
                 &rootPos,
                 &rootRot);
@@ -1273,14 +1329,15 @@ static void ControlledCharacterUpdate(
         //    cur.localRotations[j] = db->localJointRotations[idx];
         //}
 
-        // Sample interpolated pose from DB
+        // Sample interpolated pose from DB (using Rot6d for blending)
         Vector3 sampledRootPos;
         Quaternion sampledRootRot;
-        SampleCursorPoseLerp(
+        SampleCursorPoseLerp6d(
             db,
             cur.animIndex,
             cur.animTime,
             cur.localPositions,
+            cur.localRotations6d,
             cur.localRotations,
             &sampledRootPos,
             &sampledRootRot);
@@ -1334,7 +1391,7 @@ static void ControlledCharacterUpdate(
         cur.lastDeltaWorld = deltaWorld;
         cur.lastDeltaYaw = deltaYaw;
 
-        const float wgt = cur.weight;
+        const float wgt = cur.weightSpring.x;
         if (wgt > 1e-6f)
         {
             blendedWorldDelta = Vector3Add(blendedWorldDelta, Vector3Scale(deltaWorld, wgt));
@@ -1347,7 +1404,7 @@ static void ControlledCharacterUpdate(
         cur.prevLocalRootRot = currLocalRootRot;
 
         // deactivate tiny-weight cursors
-        if (cur.weight <= 1e-4f && cur.targetWeight <= 1e-4f)
+        if (cur.weightSpring.x <= 1e-4f && cur.targetWeight <= 1e-4f)
         {
             cur.active = false;
             cur.animIndex = -1;
@@ -1363,7 +1420,7 @@ static void ControlledCharacterUpdate(
             cur.normalizedWeight = 0.0f;
             continue;
         }
-        cur.normalizedWeight = (totalRootWeight > 1e-6f) ? (cur.weight / totalRootWeight) : 0.0f;
+        cur.normalizedWeight = (totalRootWeight > 1e-6f) ? (cur.weightSpring.x / totalRootWeight) : 0.0f;
     }
 
     // Compute FK for each active cursor (for debug visualization)
@@ -1432,17 +1489,18 @@ static void ControlledCharacterUpdate(
     //}
 
 
+    // --- Rot6d blending (no double-cover issues, simple weighted average then normalize) ---
     {
         const int jc = cc->xformData.jointCount;
         std::vector<Vector3> posAccum(jc, Vector3Zero());
         std::vector<float> weightAccum(jc, 0.0f);
-        std::vector<Vector4> quatAccum(jc, Vector4{ 0.0f, 0.0f, 0.0f, 0.0f });
+        std::vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
             BlendCursor& cur = cc->cursors[ci];
             if (!cur.active) continue;
-            const float w = cur.weight;
+            const float w = cur.weightSpring.x;
             if (w <= 1e-6f) continue;
 
             for (int j = 0; j < jc; ++j)
@@ -1450,20 +1508,14 @@ static void ControlledCharacterUpdate(
                 posAccum[j] = Vector3Add(posAccum[j], Vector3Scale(cur.localPositions[j], w));
                 weightAccum[j] += w;
 
-                Quaternion q = cur.localRotations[j];
-                const Vector4 acc = quatAccum[j];
-                Quaternion refQ = Quaternion{ acc.x, acc.y, acc.z, acc.w };
-                float dot = 0.0f;
-                if (acc.x != 0.0f || acc.y != 0.0f || acc.z != 0.0f || acc.w != 0.0f) {
-                    dot = refQ.x * q.x + refQ.y * q.y + refQ.z * q.z + refQ.w * q.w;
-                }
-                if (dot < 0.0f) {
-                    q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w;
-                }
-                quatAccum[j].x += q.x * w;
-                quatAccum[j].y += q.y * w;
-                quatAccum[j].z += q.z * w;
-                quatAccum[j].w += q.w * w;
+                // weighted accumulation of Rot6d (just add scaled components)
+                const Rot6d& r = cur.localRotations6d[j];
+                rot6dAccum[j].ax += r.ax * w;
+                rot6dAccum[j].ay += r.ay * w;
+                rot6dAccum[j].az += r.az * w;
+                rot6dAccum[j].bx += r.bx * w;
+                rot6dAccum[j].by += r.by * w;
+                rot6dAccum[j].bz += r.bz * w;
             }
         }
 
@@ -1472,16 +1524,72 @@ static void ControlledCharacterUpdate(
             const float tw = weightAccum[j] > 1e-6f ? weightAccum[j] : 1.0f;
             cc->xformData.localPositions[j] = Vector3Scale(posAccum[j], 1.0f / tw);
 
-            Vector4 a = quatAccum[j];
-            const float len = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w);
-            if (len > 1e-6f) {
-                cc->xformData.localRotations[j] = Quaternion{ a.x / len, a.y / len, a.z / len, a.w / len };
+            // normalize blended Rot6d (orthonormalize the two columns) and convert to quat
+            Rot6d blended = rot6dAccum[j];
+            const float lenA = sqrtf(blended.ax * blended.ax + blended.ay * blended.ay + blended.az * blended.az);
+            if (lenA > 1e-6f)
+            {
+                Rot6dNormalize(blended);
+                Rot6dToQuaternion(blended, cc->xformData.localRotations[j]);
             }
-            else {
+            else
+            {
                 cc->xformData.localRotations[j] = QuaternionIdentity();
             }
         }
     }
+
+    // --- OLD quat blending (commented out for comparison) ---
+    //{
+    //    const int jc = cc->xformData.jointCount;
+    //    std::vector<Vector3> posAccum(jc, Vector3Zero());
+    //    std::vector<float> weightAccum(jc, 0.0f);
+    //    std::vector<Vector4> quatAccum(jc, Vector4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    //
+    //    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+    //    {
+    //        BlendCursor& cur = cc->cursors[ci];
+    //        if (!cur.active) continue;
+    //        const float w = cur.weightSpring.x;
+    //        if (w <= 1e-6f) continue;
+    //
+    //        for (int j = 0; j < jc; ++j)
+    //        {
+    //            posAccum[j] = Vector3Add(posAccum[j], Vector3Scale(cur.localPositions[j], w));
+    //            weightAccum[j] += w;
+    //
+    //            Quaternion q = cur.localRotations[j];
+    //            const Vector4 acc = quatAccum[j];
+    //            Quaternion refQ = Quaternion{ acc.x, acc.y, acc.z, acc.w };
+    //            float dot = 0.0f;
+    //            if (acc.x != 0.0f || acc.y != 0.0f || acc.z != 0.0f || acc.w != 0.0f) {
+    //                dot = refQ.x * q.x + refQ.y * q.y + refQ.z * q.z + refQ.w * q.w;
+    //            }
+    //            if (dot < 0.0f) {
+    //                q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w;
+    //            }
+    //            quatAccum[j].x += q.x * w;
+    //            quatAccum[j].y += q.y * w;
+    //            quatAccum[j].z += q.z * w;
+    //            quatAccum[j].w += q.w * w;
+    //        }
+    //    }
+    //
+    //    for (int j = 0; j < jc; ++j)
+    //    {
+    //        const float tw = weightAccum[j] > 1e-6f ? weightAccum[j] : 1.0f;
+    //        cc->xformData.localPositions[j] = Vector3Scale(posAccum[j], 1.0f / tw);
+    //
+    //        Vector4 a = quatAccum[j];
+    //        const float len = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w);
+    //        if (len > 1e-6f) {
+    //            cc->xformData.localRotations[j] = Quaternion{ a.x / len, a.y / len, a.z / len, a.w / len };
+    //        }
+    //        else {
+    //            cc->xformData.localRotations[j] = QuaternionIdentity();
+    //        }
+    //    }
+    //}
 
     // --- After blending local pose, update prev-root bookkeeping ---
     const Vector3 currentRootPos = cc->xformData.localPositions[0];
@@ -3390,7 +3498,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
                 // Weight bar
                 ImGui::Text("  W: %.3f -> %.3f (norm: %.3f)",
-                    cur.weight, cur.targetWeight, cur.normalizedWeight);
+                    cur.weightSpring.x, cur.targetWeight, cur.normalizedWeight);
 
                 // Progress bar showing normalized weight
                 ImGui::ProgressBar(cur.normalizedWeight, ImVec2(-1, 0), "");
@@ -3650,7 +3758,7 @@ int main(int argc, char** argv)
         CharacterDataLoadFromFile(&app.characterData, argv[i], app.errMsg, 512);
     }
 
-    const bool loadDefaultFiles = false;
+    const bool loadDefaultFiles = true;
     if (loadDefaultFiles && app.characterData.count == 0)
     {
         app.errMsg[0] = '\0';
