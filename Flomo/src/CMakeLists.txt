@@ -42,6 +42,10 @@ set(FLOMO_HEADERS
     geno_renderer.h
     app_config.h
     balltree.h
+    leg_ik.h
+    character_data.h
+    anim_database.h
+    controlled_character.h
     ${CMAKE_SOURCE_DIR}/thirdparty/ufbx/ufbx.h
     ${IMGUI_DIR}/imgui.h
     ${RLIMGUI_DIR}/rlImGui.h

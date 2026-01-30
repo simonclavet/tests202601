@@ -299,14 +299,14 @@ static inline int OtherSideInt(int side)
 }
 
 // Convert side int to lowercase string ("left"/"right").
-static inline const char* SideToStringInt(int side)
+static inline const char* StringFromSide(int side)
 {
     return (side == SIDE_LEFT) ? "left" : "right";
 }
 
 // Parse a side from a C string, case-insensitive and forgiving.
 // Accepts "left", "l", "right", "r" (any case). Returns defaultVal on failure.
-static inline int SideFromStringInt(const char* s, int defaultVal)
+static inline int SideFromString(const char* s, int defaultVal)
 {
     if (!s) return defaultVal;
     std::string lower = ToLowerCopy(s);

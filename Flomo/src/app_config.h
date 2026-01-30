@@ -61,6 +61,7 @@ struct AppConfig {
     bool drawAccelerations = false; // Draw joint acceleration vectors
     bool drawRootVelocities = false; // Draw root motion velocity from each cursor
     bool drawToeVelocities = false;  // Draw toe velocity vectors (actual vs blended)
+    bool drawFootIK = false;         // Draw foot IK debug (virtual toe positions, etc.)
 
     // Animation settings
     float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
@@ -70,6 +71,11 @@ struct AppConfig {
     bool useVelBlending = false;    // enable velocity-based rotation blending
     float blendPosReturnTime = 0.1f; // time to bring the velocity advanced pose to the blended position
     float hipsRotationBlendTime = 0.2f;   // separate blendtime for hips (no vel blending, just lerp)
+
+    // Foot IK
+    bool enableFootIK = true;  // enable/disable foot IK towards virtual toe positions
+    float footIKRatio = 0.0f;  // 0.0 = flat foot (walking), 1.0 = pointed foot (swimming/falling)
+
 
     // Validity
     bool valid = false;
@@ -171,6 +177,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawAccelerations = ResolveBoolConfig(buffer, "drawAccelerations", config.drawAccelerations, argc, argv);
     config.drawRootVelocities = ResolveBoolConfig(buffer, "drawRootVelocities", config.drawRootVelocities, argc, argv);
     config.drawToeVelocities = ResolveBoolConfig(buffer, "drawToeVelocities", config.drawToeVelocities, argc, argv);
+    config.drawFootIK = ResolveBoolConfig(buffer, "drawFootIK", config.drawFootIK, argc, argv);
 
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
@@ -178,7 +185,8 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.useVelBlending = ResolveBoolConfig(buffer, "useVelBlending", config.useVelBlending, argc, argv);
     config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
     config.hipsRotationBlendTime = ResolveFloatConfig(buffer, "hipsRotationBlendTime", config.hipsRotationBlendTime, argc, argv);
-
+    config.enableFootIK = ResolveBoolConfig(buffer, "enableFootIK", config.enableFootIK, argc, argv);
+    config.footIKRatio = ResolveFloatConfig(buffer, "footIKRatio", config.footIKRatio, argc, argv);
     //if (buffer) free(buffer);
 
     // Validate window values
@@ -246,13 +254,15 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"drawAccelerations\": %s,\n", cfg.drawAccelerations ? "true" : "false");
     fprintf(file, "    \"drawRootVelocities\": %s,\n", cfg.drawRootVelocities ? "true" : "false");
     fprintf(file, "    \"drawToeVelocities\": %s,\n", cfg.drawToeVelocities ? "true" : "false");
+    fprintf(file, "    \"drawFootIK\": %s,\n", cfg.drawFootIK ? "true" : "false");
 
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
     fprintf(file, "    \"switchInterval\": %.4f,\n", cfg.switchInterval);
 
     fprintf(file, "    \"useVelBlending\": %s,\n", cfg.useVelBlending ? "true" : "false");
     fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", cfg.blendPosReturnTime);
-    fprintf(file, "    \"hipsRotationBlendTime\": %.4f\n", cfg.hipsRotationBlendTime);
+    fprintf(file, "    \"hipsRotationBlendTime\": %.4f,\n", cfg.hipsRotationBlendTime);
+    fprintf(file, "    \"footIKRatio\": %.4f\n", cfg.footIKRatio);
 
     fprintf(file, "}\n");
 

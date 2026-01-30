@@ -3,6 +3,7 @@
 // need raylib already included
 #include "raymath.h"
 #include "raylib.h"
+#include <cmath>
 
 //----------------------------------------------------------------------------------
 // Additional Raylib Functions
@@ -43,6 +44,13 @@ static inline int MinInt(int x, int y)
     return x < y ? x : y;
 }
 
+
+// Acos that prevents domain errors (NaNs) if inputs are slightly > 1.0 or < -1.0
+static inline float SafeAcos(float x) {
+    if (x > 1.0f) return 0.0f;
+    if (x < -1.0f) return PI;
+    return std::acos(x);
+}
 
 // This is a safe version of QuaternionBetween which returns a 180 deg rotation
 // at the singularity where vectors are facing exactly in opposite directions

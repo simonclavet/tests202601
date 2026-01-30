@@ -10,6 +10,7 @@
 
 #include "raylib.h"
 #include "raymath.h"
+#include "utils.h"
 
 //----------------------------------------------------------------------------------
 // BVH Parser - Text Parsing Utilities
@@ -715,4 +716,45 @@ static bool BVHDataSave(const BVHData* bvh, const char* filename, char* errMsg, 
     fclose(f);
     printf("INFO: Saved '%s' successfully\n", filename);
     return true;
+}
+
+//----------------------------------------------------------------------------------
+// Joint Search Utilities
+//----------------------------------------------------------------------------------
+
+// Find a joint index by matching against a list of candidate names (case-insensitive).
+// First tries exact match, then substring match.
+static inline int FindJointIndexByNames(const BVHData* bvh, const std::vector<std::string>& candidates)
+{
+    // Exact match pass (case-insensitive)
+    for (int j = 0; j < bvh->jointCount; ++j)
+    {
+        const std::string& name = bvh->joints[j].name;
+        if (name.empty()) continue;
+        std::string lname = ToLowerCopy(name.c_str());
+        for (int k = 0; k < (int)candidates.size(); ++k)
+        {
+            if (lname == candidates[k])
+            {
+                return j;
+            }
+        }
+    }
+
+    // Substring fallback pass (case-insensitive)
+    for (int j = 0; j < bvh->jointCount; ++j)
+    {
+        const std::string& name = bvh->joints[j].name;
+        if (name.empty()) continue;
+        std::string lname = ToLowerCopy(name.c_str());
+        for (int k = 0; k < (int)candidates.size(); ++k)
+        {
+            if (StrContainsCaseInsensitive(lname, candidates[k]))
+            {
+                return j;
+            }
+        }
+    }
+
+    return -1;
 }
