@@ -2237,6 +2237,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
+    TestCudaAndLibtorch();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;
@@ -2262,7 +2263,6 @@ int main(int argc, char** argv)
     PROFILE_INIT();
     PROFILE_TICKERS_INIT();
 
-    //TestCudaAndLibtorch();
 
     // Init Application State
 
@@ -2285,9 +2285,10 @@ int main(int argc, char** argv)
         SetWindowPosition(app.config.windowX, app.config.windowY);
     }
 
-    // Init Dear ImGui with 2x scale
+    // Init Dear ImGui - scale based on monitor DPI
+    const Vector2 dpiScale = GetWindowScaleDPI();
     rlImGuiBeginInitImGui();
-    ImGui::GetIO().FontGlobalScale = 2.0f;
+    ImGui::GetIO().FontGlobalScale = dpiScale.x;
     ImGui::StyleColorsDark();
     rlImGuiEndInitImGui();
 

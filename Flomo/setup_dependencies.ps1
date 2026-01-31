@@ -10,8 +10,86 @@ $thirdpartyDir = Join-Path $scriptDir "thirdparty"
 $torchVersion = "2.5.1"
 $cudaVersion = "cu121"
 
+# required versions
+$requiredCmakeVersion = [Version]"3.21"
+$requiredCudaVersion = [Version]"13.1"
+
 Write-Host "Flomo Dependency Setup" -ForegroundColor Cyan
 Write-Host "======================" -ForegroundColor Cyan
+Write-Host ""
+
+# check prerequisites
+Write-Host "Checking prerequisites..." -ForegroundColor Cyan
+
+# check cmake
+$cmakeCmd = Get-Command cmake -ErrorAction SilentlyContinue
+if (-not $cmakeCmd) {
+    Write-Host "[MISSING] CMake not found!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Install CMake 3.21+ using one of these methods:" -ForegroundColor Yellow
+    Write-Host "  winget install Kitware.CMake"
+    Write-Host "  or download from: https://cmake.org/download/"
+    Write-Host ""
+    Write-Host "Make sure CMake is added to your PATH." -ForegroundColor Yellow
+    exit 1
+}
+
+$cmakeVersionOutput = cmake --version | Select-Object -First 1
+if ($cmakeVersionOutput -match "cmake version (\d+\.\d+(\.\d+)?)") {
+    $cmakeVersion = [Version]$Matches[1]
+    if ($cmakeVersion -lt $requiredCmakeVersion) {
+        Write-Host "[ERROR] CMake $cmakeVersion found, but $requiredCmakeVersion+ required" -ForegroundColor Red
+        Write-Host "  winget upgrade Kitware.CMake"
+        exit 1
+    }
+    Write-Host "[OK] CMake $cmakeVersion" -ForegroundColor Green
+}
+else {
+    Write-Host "[WARNING] Could not parse CMake version, continuing anyway..." -ForegroundColor Yellow
+}
+
+# check cuda (nvcc)
+$nvccCmd = Get-Command nvcc -ErrorAction SilentlyContinue
+if (-not $nvccCmd) {
+    Write-Host "[MISSING] CUDA (nvcc) not found!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "This project requires CUDA 13.1+ with SM 86 support (RTX 30 series+)." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Download CUDA Toolkit directly (no login required):" -ForegroundColor Yellow
+    Write-Host "  https://developer.download.nvidia.com/compute/cuda/13.1.1/local_installers/cuda_13.1.1_windows.exe" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "After installation, make sure nvcc is in your PATH." -ForegroundColor Yellow
+    Write-Host "Default location: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin" -ForegroundColor Gray
+    exit 1
+}
+
+$nvccVersionOutput = nvcc --version | Select-Object -Last 1
+if ($nvccVersionOutput -match "release (\d+\.\d+)") {
+    $cudaVersionInstalled = [Version]$Matches[1]
+    if ($cudaVersionInstalled -lt $requiredCudaVersion) {
+        Write-Host "[ERROR] CUDA $cudaVersionInstalled found, but $requiredCudaVersion+ required" -ForegroundColor Red
+        Write-Host "  Download: https://developer.download.nvidia.com/compute/cuda/13.1.1/local_installers/cuda_13.1.1_windows.exe"
+        exit 1
+    }
+    Write-Host "[OK] CUDA $cudaVersionInstalled" -ForegroundColor Green
+}
+else {
+    Write-Host "[WARNING] Could not parse CUDA version, continuing anyway..." -ForegroundColor Yellow
+}
+
+# check git (needed for cloning repos)
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitCmd) {
+    Write-Host "[MISSING] Git not found!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Install Git using:" -ForegroundColor Yellow
+    Write-Host "  winget install Git.Git"
+    Write-Host "  or download from: https://git-scm.com/download/win"
+    exit 1
+}
+Write-Host "[OK] Git found" -ForegroundColor Green
+
+Write-Host ""
 Write-Host "Thirdparty dir: $thirdpartyDir"
 Write-Host ""
 
