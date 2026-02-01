@@ -26,9 +26,15 @@ static inline float Saturate(float x)
 
 // smoothstep: smooth interpolation with zero derivative at endpoints
 // t should be in [0, 1], returns value in [0, 1]
-static inline float Smoothstep(float t)
+static inline float SmoothStep(float t)
 {
     return t * t * (3.0f - 2.0f * t);
+}
+
+// Smooth lerp: interpolates from a to b using smoothstep for smoother transitions
+static inline float SmoothLerp(float a, float b, float t)
+{
+    return Lerp(a, b, SmoothStep(t));
 }
 
 static inline float Square(float x)
@@ -57,6 +63,26 @@ static inline float SafeAcos(float x) {
     if (x > 1.0f) return 0.0f;
     if (x < -1.0f) return PI;
     return std::acos(x);
+}
+
+// 2D length utilities (XZ plane, ignoring Y)
+static inline float Vector3LengthSqr2D(Vector3 v)
+{
+    return v.x * v.x + v.z * v.z;
+}
+
+static inline float Vector3Length2D(Vector3 v)
+{
+    return sqrtf(v.x * v.x + v.z * v.z);
+}   
+
+// Clamped inverse lerp: returns t in [0,1] such that Lerp(a, b, t) = value
+// Automatically clamps the result to [0,1] range
+static inline float ClampedInvLerp(float a, float b, float value)
+{
+    if (fabsf(b - a) < 1e-6f) return 0.0f;  // Avoid division by zero
+    const float t = (value - a) / (b - a);
+    return Clamp(t, 0.0f, 1.0f);
 }
 
 // This is a safe version of QuaternionBetween which returns a 180 deg rotation

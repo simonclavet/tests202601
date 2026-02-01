@@ -7,6 +7,118 @@
 #include "raylib.h"
 #include <fstream>
 
+
+
+// Motion Matching Feature Types
+enum class FeatureType : int
+{
+    ToePos = 0,          // left+right toe positions (X,Z) => 4 dims
+    ToeVel,              // left+right toe velocities (X,Z) => 4 dims
+    ToeDiff,             // left-right difference (X,Z) => 2 dims
+    FutureVelDir,        // future root velocity direction (XZ) at sample points => 2 * points
+
+    COUNT                // Must be last - used for array sizing
+};
+
+// Returns human-readable name for feature type
+static inline const char* FeatureTypeName(FeatureType type)
+{
+    switch (type)
+    {
+    case FeatureType::ToePos: return "Toe Position";
+    case FeatureType::ToeVel: return "Toe Velocity";
+    case FeatureType::ToeDiff: return "Toe Difference";
+    case FeatureType::FutureVelDir: return "Future Velocity";
+    default: return "Unknown";
+    }
+}
+
+// Descriptor for a single feature type
+struct FeatureTypeDescriptor
+{
+    float weight = 1.0f;  // Weight/importance of this feature in matching (0 = disabled)
+};
+
+struct MotionMatchingFeaturesConfig
+{
+    // Per-feature-type descriptors (indexed by FeatureType enum)
+    FeatureTypeDescriptor features[static_cast<int>(FeatureType::COUNT)];
+
+    // Future trajectory configuration (only used if FutureVelDir weight > 0)
+    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };  // time offsets (seconds)
+
+    // Helper: check if a feature is enabled (weight > 0)
+    bool IsFeatureEnabled(FeatureType type) const
+    {
+        const int idx = static_cast<int>(type);
+        return features[idx].weight > 0.0f;
+    }
+
+    // Helper: get weight for a feature type
+    float GetFeatureWeight(FeatureType type) const
+    {
+        const int idx = static_cast<int>(type);
+        return features[idx].weight;
+    }
+
+    // Helper: set weight for a feature type
+    void SetFeatureWeight(FeatureType type, float weight)
+    {
+        const int idx = static_cast<int>(type);
+        features[idx].weight = weight;
+    }
+};
+
+
+// Load motion matching config from JSON buffer
+static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMatchingFeaturesConfig& config)
+{
+    if (!jsonBuffer) return;
+
+    // Parse feature weights
+    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
+    {
+        const FeatureType type = static_cast<FeatureType>(i);
+        const char* name = FeatureTypeName(type);
+        config.features[i].weight = ParseFloatValue(jsonBuffer, name, config.features[i].weight);
+    }
+
+    // Parse future trajectory times array
+    // Look for "futureTrajPointTimes": [0.2, 0.4, 0.8]
+    const char* arrayKey = "futureTrajPointTimes";
+    const char* found = strstr(jsonBuffer, arrayKey);
+    if (found)
+    {
+        const char* bracket = strchr(found, '[');
+        if (bracket)
+        {
+            config.futureTrajPointTimes.clear();
+            const char* p = bracket + 1;
+
+            // Parse comma-separated floats until we hit ']'
+            while (*p && *p != ']')
+            {
+                // Skip whitespace
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+                if (*p == ']') break;
+
+                // Parse float
+                char* end = nullptr;
+                float val = strtof(p, &end);
+                if (end != p)  // Successfully parsed
+                {
+                    config.futureTrajPointTimes.push_back(val);
+                    p = end;
+                }
+
+                // Skip comma and whitespace
+                while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+            }
+        }
+    }
+}
+
+
 // Simple app config that persists between runs
 struct AppConfig {
     // Window
@@ -80,10 +192,27 @@ struct AppConfig {
     
     bool drawPlayerInput = false;
 
+    // Motion Matching Configuration
+    MotionMatchingFeaturesConfig mmConfigEditor; // version for edition: use featureConfig in animdatabase for the one actually used
+
+
     // Validity
     bool valid = false;
 };
 
+
+// Initialize motion matching config with default values
+static inline void MotionMatchingConfigInit(MotionMatchingFeaturesConfig& config)
+{
+    // Initialize all feature weights to 1.0
+    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
+    {
+        config.features[i].weight = 1.0f;
+    }
+
+    // Default future trajectory sample times
+    config.futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };
+}
 
 static const char* CONFIG_FILENAME = "flomo_config.json";
 
@@ -195,6 +324,16 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.unlockDuration = ResolveFloatConfig(buffer, "unlockDuration", config.unlockDuration, argc, argv);
     config.drawPlayerInput = ResolveBoolConfig(buffer, "drawPlayerInput", false, argc, argv);
 
+    // Initialize motion matching config with defaults first
+    MotionMatchingConfigInit(config.mmConfigEditor);
+
+    // Then load from JSON (if available)
+    if (buffer)
+    {
+        MotionMatchingConfigFromJson(buffer, config.mmConfigEditor);
+    }
+
+
     // Validate window values
     if (config.windowX >= 0 && config.windowY >= 0 &&
         config.windowWidth > 100 && config.windowHeight > 100) {
@@ -202,6 +341,35 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     }
 
     return config;
+}
+
+
+// Save motion matching config to JSON string
+static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeaturesConfig& config)
+{
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"featureWeights\": {\n";
+
+    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
+    {
+        const FeatureType type = static_cast<FeatureType>(i);
+        oss << "    \"" << FeatureTypeName(type) << "\": " << config.features[i].weight;
+        if (i < static_cast<int>(FeatureType::COUNT) - 1) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  },\n";
+    oss << "  \"futureTrajPointTimes\": [";
+    for (size_t i = 0; i < config.futureTrajPointTimes.size(); ++i)
+    {
+        oss << config.futureTrajPointTimes[i];
+        if (i < config.futureTrajPointTimes.size() - 1) oss << ", ";
+    }
+    oss << "]\n";
+    oss << "}";
+
+    return oss.str();
 }
 
 static inline void SaveAppConfig(const AppConfig& cfg)
@@ -274,7 +442,14 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"unlockDuration\": %.4f,\n", cfg.unlockDuration);
     fprintf(file, "    \"drawPlayerInput\": %s\n", cfg.drawPlayerInput ? "true" : "false");
 
+
+    // Save motion matching config
+    std::string mmConfigJson = MotionMatchingConfigToJson(cfg.mmConfigEditor);
+    fprintf(file, "  \"motionMatchingConfig\": %s,\n", mmConfigJson.c_str());
+
     fprintf(file, "}\n");
 
     fclose(file);
 }
+
+

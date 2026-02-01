@@ -89,6 +89,7 @@ Vector3 CalculateIdealKneePos(
     Vector3 hipToTarget,    // Vector from Hip to Target (in Hip Space)
     Vector3 hipToKneeCurrent, // Vector from Hip to Current Knee (in Hip Space)
     const Vector3 kneeToAnkleCurrent, // Shin Vector (in Hip Space)
+    const Vector3 ankleToToeCurrent,   // Foot forward Vector (in Hip Space)
     float lenThigh,
     float lenShin)
 {
@@ -102,23 +103,65 @@ Vector3 CalculateIdealKneePos(
 
     // Clamp is vital here in case target is slightly out of reach due to float errors
     const float alpha = std::acos(Clamp(cosAlpha, -1.0f, 1.0f));
+    
     // 2. Define the Bend Plane
     // Preferred: The plane defined by the current Thigh and Shin vectors.
     // This captures the "Hinge Axis" of the knee.
-    Vector3 planeNormal = Vector3Negate(Vector3CrossProduct(hipToKneeCurrent, kneeToAnkleCurrent));
+    const Vector3 primaryPlaneNormal = Vector3Negate(Vector3CrossProduct(hipToKneeCurrent, kneeToAnkleCurrent));
+    const float primaryStrength = Vector3Length(primaryPlaneNormal);
 
-    // Fallback 1: If Thigh and Shin are parallel (straight leg in anim),
-    // try using the Hip->Target and Hip->Knee relation.
-    if (Vector3LengthSqr(planeNormal) < 0.0001f) {
-        planeNormal = Vector3CrossProduct(hipToTarget, hipToKneeCurrent);
-    }
+    // Fallback 1: Use ankle-to-toe vector as hinge axis guide
+    // This represents the foot's forward direction - anatomically meaningful
+    const Vector3 ankleToToe = Vector3Normalize(ankleToToeCurrent); // Shin direction approximates ankle-toe for now
+    Vector3 fallback1PlaneNormal = Vector3CrossProduct(hipToTarget, ankleToToe);
+    const float fallback1Strength = Vector3Length(fallback1PlaneNormal);
 
-    // Fallback 2: If everything is collinear (Straight leg pointing exactly at target),
-    // pick an arbitrary axis perpendicular to the target vector.
-    if (Vector3LengthSqr(planeNormal) < 0.0001f) {
+    //// Fallback 2: If target and foot-forward are aligned, use perpendicular to hip->knee
+    Vector3 fallback2PlaneNormal = Vector3CrossProduct(hipToTarget, hipToKneeCurrent);
+    const float fallback2Strength = Vector3Length(fallback2PlaneNormal);
+
+    // Fallback 3: If everything is collinear (very rare), pick arbitrary perpendicular
+    Vector3 fallback3PlaneNormal = Vector3{ 0, 0, 0 };
+    if (fallback2Strength < 0.0001f) {
         const Vector3 absDir = { std::abs(hipToTarget.x), std::abs(hipToTarget.y), std::abs(hipToTarget.z) };
         const Vector3 helper = (absDir.x < absDir.y) ? Vector3{ 1,0,0 } : Vector3{ 0,1,0 };
-        planeNormal = Vector3CrossProduct(hipToTarget, helper);
+        fallback3PlaneNormal = Vector3CrossProduct(hipToTarget, helper);
+    }
+
+    // Smooth blending between primary and fallbacks
+    const float blendThreshold = 0.1f; // Start blending when strength < this
+    Vector3 planeNormal;
+
+    if (primaryStrength > blendThreshold) {
+        // Primary is strong, use it (normalized)
+        planeNormal = Vector3Scale(primaryPlaneNormal, 1.0f / primaryStrength);
+    }
+    else if (primaryStrength > 0.0001f && fallback1Strength > 0.0001f) {
+        // Blend between primary and fallback1
+        const float t = primaryStrength / blendThreshold; // 0 to 1 as primary gets stronger
+        const Vector3 normPrimary = Vector3Scale(primaryPlaneNormal, 1.0f / primaryStrength);
+        const Vector3 normFallback1 = Vector3Scale(fallback1PlaneNormal, 1.0f / fallback1Strength);
+        planeNormal = Vector3Normalize(Vector3Lerp(normFallback1, normPrimary, t));
+    }
+    else if (fallback1Strength > blendThreshold) {
+        // Use fallback1
+        planeNormal = Vector3Scale(fallback1PlaneNormal, 1.0f / fallback1Strength);
+    }
+    else if (fallback1Strength > 0.0001f && fallback2Strength > 0.0001f) {
+        // Blend between fallback1 and fallback2
+        const float t = fallback1Strength / blendThreshold;
+        const Vector3 normFallback1 = Vector3Scale(fallback1PlaneNormal, 1.0f / fallback1Strength);
+        const Vector3 normFallback2 = Vector3Scale(fallback2PlaneNormal, 1.0f / fallback2Strength);
+        planeNormal = Vector3Normalize(Vector3Lerp(normFallback2, normFallback1, t));
+    }
+    else if (fallback2Strength > 0.0001f) {
+        // Use fallback2
+        planeNormal = Vector3Scale(fallback2PlaneNormal, 1.0f / fallback2Strength);
+    }
+    else {
+        // Last resort: use arbitrary perpendicular
+        assert(false); // if this happens, something is very wrong
+        planeNormal = Vector3Normalize(fallback3PlaneNormal);
     }
     planeNormal = Vector3Normalize(planeNormal);
 
@@ -254,22 +297,26 @@ void SolveLegIK(LegChain& chain, const Vector3 targetToePosWorld)
     // Current Knee Position (Relative to Hip, rotated into Hip Space)
     //const Vector3 currentKneeLocal = RotateVec(chain.lowleg.localPos, chain.upleg.localRot);
 
-    // NEW: Current Shin Vector (Relative to Knee, rotated into Hip Space)
+    // Current Shin Vector (Relative to Knee, rotated into Hip Space)
     // We need the vector from Knee to Ankle, represented in Hip Space.
     // Rotation chain: UplegRot * LowlegRot
     const Quaternion currentShinRotHipSpace = QuaternionMultiply(chain.upleg.localRot, chain.lowleg.localRot);
     const Vector3 currentShinVectorHipSpace = RotateVec(chain.foot.localPos, currentShinRotHipSpace);
 
+    // Ankle-to-Toe Vector (in Hip Space)
+    // Rotation chain: UplegRot * LowlegRot * FootRot
+    const Quaternion currentFootRotHipSpace = QuaternionMultiply(currentShinRotHipSpace, chain.foot.localRot);
+    const Vector3 ankleToToeVectorHipSpace = RotateVec(chain.toe.localPos, currentFootRotHipSpace);
+
     // 6. SOLVE KNEE POSITION
     const Vector3 idealKneeLocal = CalculateIdealKneePos(
         targetAnkleLocal,
         currentKneeLocal,
-        currentShinVectorHipSpace, // Pass the Shin Vector here
+        currentShinVectorHipSpace,      // Shin vector (knee to ankle)
+        ankleToToeVectorHipSpace,       // Foot forward vector (ankle to toe)
         chain.upleg.length,
         chain.lowleg.length
-    );
-
-    // 7. APPLY ROTATIONS
+    );    // 7. APPLY ROTATIONS
 
     // A. UPLEG (Thigh)
     // Rotate the Thigh vector (Hip->Knee) to align with IdealKneePos

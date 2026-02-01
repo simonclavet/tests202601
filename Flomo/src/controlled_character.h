@@ -141,10 +141,15 @@ struct ControlledCharacter {
 
     // Virtual toe positions - move with blended velocity, used for IK targets
     Vector3 virtualToePos[SIDES_COUNT];
+    Vector3 intermediateVirtualToePos[SIDES_COUNT];  // velocity + viscous return (no speed clamp)
+
     bool virtualToeInitialized = false;
+
     // Virtual toe locking system
     float virtualToeUnlockTimer[SIDES_COUNT] = { -1.0f, -1.0f };  // -1 = locked, >=0 = unlocked
-
+    float virtualToeUnlockClampRadius[SIDES_COUNT] = { 0.0f, 0.0f };  // current clamp radius for debug viz
+    float virtualToeUnlockStartDistance[SIDES_COUNT] = { 0.0f, 0.0f };  // distance at unlock moment (for smooth shrink)   
+    
     PlayerControlInput playerInput;
 
 
@@ -520,45 +525,45 @@ static void ControlledCharacterUpdate(
         }
     }
 
-    // Compute FK for each active cursor (for debug visualization)
-    // We do this with root zeroed (same treatment as final blended pose)
-    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
-    {
-        BlendCursor& cur = cc->cursors[ci];
-        if (!cur.active) continue;
+    //// Compute FK for each active cursor (for debug visualization)
+    //// We do this with root zeroed (same treatment as final blended pose)
+    //for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+    //{
+    //    BlendCursor& cur = cc->cursors[ci];
+    //    if (!cur.active) continue;
 
-        // Copy local pose to global (we'll compute FK in-place)
-        // Convert from Rot6d to Quaternion for FK computation
-        for (int j = 0; j < jc; ++j)
-        {
-            cur.globalPositions[j] = cur.localPositions[j];
-            Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
-        }
+    //    // Copy local pose to global (we'll compute FK in-place)
+    //    // Convert from Rot6d to Quaternion for FK computation
+    //    for (int j = 0; j < jc; ++j)
+    //    {
+    //        cur.globalPositions[j] = cur.localPositions[j];
+    //        Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
+    //    }
 
-        // Zero out root XZ translation
-        // Note: Y rotation was already stripped from localRotations6d[0] earlier
-        cur.globalPositions[0].x = 0.0f;
-        cur.globalPositions[0].z = 0.0f;
+    //    // Zero out root XZ translation
+    //    // Note: Y rotation was already stripped from localRotations6d[0] earlier
+    //    cur.globalPositions[0].x = 0.0f;
+    //    cur.globalPositions[0].z = 0.0f;
 
-        // Forward kinematics
-        for (int j = 1; j < jc; ++j)
-        {
-            const int p = cc->xformData.parents[j];
-            cur.globalPositions[j] = Vector3Add(
-                Vector3RotateByQuaternion(cur.globalPositions[j], cur.globalRotations[p]),
-                cur.globalPositions[p]);
-            cur.globalRotations[j] = QuaternionMultiply(cur.globalRotations[p], cur.globalRotations[j]);
-        }
+    //    // Forward kinematics
+    //    for (int j = 1; j < jc; ++j)
+    //    {
+    //        const int p = cc->xformData.parents[j];
+    //        cur.globalPositions[j] = Vector3Add(
+    //            Vector3RotateByQuaternion(cur.globalPositions[j], cur.globalRotations[p]),
+    //            cur.globalPositions[p]);
+    //        cur.globalRotations[j] = QuaternionMultiply(cur.globalRotations[p], cur.globalRotations[j]);
+    //    }
 
-        // Transform to world space
-        for (int j = 0; j < jc; ++j)
-        {
-            cur.globalPositions[j] = Vector3Add(
-                Vector3RotateByQuaternion(cur.globalPositions[j], cc->worldRotation),
-                cc->worldPosition);
-            cur.globalRotations[j] = QuaternionMultiply(cc->worldRotation, cur.globalRotations[j]);
-        }
-    }
+    //    // Transform to world space
+    //    for (int j = 0; j < jc; ++j)
+    //    {
+    //        cur.globalPositions[j] = Vector3Add(
+    //            Vector3RotateByQuaternion(cur.globalPositions[j], cc->worldRotation),
+    //            cc->worldPosition);
+    //        cur.globalRotations[j] = QuaternionMultiply(cc->worldRotation, cur.globalRotations[j]);
+    //    }
+    //}
 
     assert(totalRootWeight > 1e-6f);
 
@@ -778,6 +783,47 @@ static void ControlledCharacterUpdate(
         cc->xformData.globalRotations[i] = QuaternionMultiply(cc->worldRotation, cc->xformData.globalRotations[i]);
     }
 
+    //// Compute FK for each active cursor (for debug visualization)
+    //// We do this with root zeroed (same treatment as final blended pose)
+    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+    {
+        BlendCursor& cur = cc->cursors[ci];
+        if (!cur.active) continue;
+
+        // Copy local pose to global (we'll compute FK in-place)
+        // Convert from Rot6d to Quaternion for FK computation
+        for (int j = 0; j < jc; ++j)
+        {
+            cur.globalPositions[j] = cur.localPositions[j];
+            Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
+        }
+
+        // Zero out root XZ translation
+        // Note: Y rotation was already stripped from localRotations6d[0] earlier
+        cur.globalPositions[0].x = 0.0f;
+        cur.globalPositions[0].z = 0.0f;
+
+        // Forward kinematics
+        for (int j = 1; j < jc; ++j)
+        {
+            const int p = cc->xformData.parents[j];
+            cur.globalPositions[j] = Vector3Add(
+                Vector3RotateByQuaternion(cur.globalPositions[j], cur.globalRotations[p]),
+                cur.globalPositions[p]);
+            cur.globalRotations[j] = QuaternionMultiply(cur.globalRotations[p], cur.globalRotations[j]);
+        }
+
+        // Transform to world space
+        for (int j = 0; j < jc; ++j)
+        {
+            cur.globalPositions[j] = Vector3Add(
+                Vector3RotateByQuaternion(cur.globalPositions[j], cc->worldRotation),
+                cc->worldPosition);
+            cur.globalRotations[j] = QuaternionMultiply(cc->worldRotation, cur.globalRotations[j]);
+        }
+    }
+
+
     // Compute actual toe velocity from FK result
     for (int side : sides)
     {
@@ -799,7 +845,8 @@ static void ControlledCharacterUpdate(
     cc->toeTrackingInitialized = true;
 
     // Update virtual toe positions
-    // Move towards blended cursor XZ target at speed limited by blended cursor toe speed
+    // Intermediate: cursor velocity + viscous return (NO speed clamp) - represents natural motion
+    // Final: intermediate + speed clamp + unlock clamp - constrained for IK
     for (int side : sides)
     {
         const int toeIdx = db->toeIndices[side];
@@ -813,11 +860,10 @@ static void ControlledCharacterUpdate(
             continue;
         }
 
-        // Blend toe position and speed from cursors using normalized weights
+        // Blend toe position from cursors using normalized weights
         float blendedToeX = 0.0f;
         float blendedToeY = 0.0f;
         float blendedToeZ = 0.0f;
-        float blendedSpeed = 0.0f;
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
             const BlendCursor& cur = cc->cursors[ci];
@@ -831,106 +877,132 @@ static void ControlledCharacterUpdate(
                 blendedToeY += cur.globalPositions[toeIdx].y * w;
                 blendedToeZ += cur.globalPositions[toeIdx].z * w;
             }
-
-            // blend speed magnitude (XZ only)
-            const float velX = cur.globalToeVelocity[side].x;
-            const float velZ = cur.globalToeVelocity[side].z;
-            const float speedXZ = sqrtf(velX * velX + velZ * velZ);
-            blendedSpeed += speedXZ * w;
         }
-
-        static constexpr float UNLOCK_DISTANCE = 0.2f;        // distance threshold to unlock
-        static constexpr float UNLOCK_DURATION = 0.3f;        // time to gradually re-lock (seconds)
-
+        const Vector3 blendedToePos = Vector3{ blendedToeX, blendedToeY, blendedToeZ };
 
         if (!cc->virtualToeInitialized)
         {
-            cc->virtualToePos[side] = Vector3{ blendedToeX, blendedToeY, blendedToeZ };
+            cc->intermediateVirtualToePos[side] = blendedToePos;
+            cc->virtualToePos[side] = blendedToePos;
             TraceLog(LOG_INFO, "Virtual toe: initialized %s toe at (%.2f, %.2f, %.2f)",
                 StringFromSide(side), cc->virtualToePos[side].x, cc->virtualToePos[side].y, cc->virtualToePos[side].z);
         }
         else
         {
-            // Y always follows cursor-blended height directly
-            cc->virtualToePos[side].y = blendedToeY;
-
-            // XZ: move towards blended target, speed limit scales with blended cursor speed
-            // At low speeds (<=0.5 m/s): 1.2x multiplier
-            // At high speeds (>=2.0 m/s): faster (cubic interpolation in between)
-            const float dx = blendedToeX - cc->virtualToePos[side].x;
-            const float dz = blendedToeZ - cc->virtualToePos[side].z;
-            const float distXZ = sqrtf(dx * dx + dz * dz);
-
-
-            // Check if we should unlock (distance exceeds threshold and not already unlocked)
-            if (distXZ > UNLOCK_DISTANCE && cc->virtualToeUnlockTimer[side] < 0.0f)
+            if (dt > 1e-6f)
             {
-                cc->virtualToeUnlockTimer[side] = UNLOCK_DURATION;
-                TraceLog(LOG_INFO, "Virtual toe %s unlocked: distance %.3f > %.3f",
-                    StringFromSide(side), distXZ, UNLOCK_DISTANCE);
-            }
+                // Update intermediate virtual toe (no speed clamp)
+                // Step 1: Primary motion from blended cursor velocity (XYZ)
+                const Vector3 blendedToeVel = cc->toeBlendedVelocity[side];
+                const Vector3 velocityDisplacement = Vector3Scale(blendedToeVel, dt);
 
-            // Update unlock timer (countdown to re-lock)
-            if (cc->virtualToeUnlockTimer[side] >= 0.0f)
-            {
-                cc->virtualToeUnlockTimer[side] -= dt;
-                if (cc->virtualToeUnlockTimer[side] < 0.0f)
+                // Step 2: Viscous return force toward FK blended position
+                const Vector3 intermediatePlusVel = Vector3Add(cc->intermediateVirtualToePos[side], velocityDisplacement);
+                const Vector3 toTarget = Vector3Subtract(blendedToePos, intermediatePlusVel);
+
+                const float returnHalflife = 0.1f;
+                const float returnAlpha = 1.0f - powf(0.5f, dt / returnHalflife);
+                const Vector3 returnDisplacement = Vector3Scale(toTarget, returnAlpha);
+
+                // Step 3: Combine (NO speed clamp for intermediate)
+                const Vector3 intermediateDisplacement = Vector3Add(velocityDisplacement, returnDisplacement);
+                cc->intermediateVirtualToePos[side] = Vector3Add(cc->intermediateVirtualToePos[side], intermediateDisplacement);
+
+                // Update final virtual toe with speed clamp
+                // Start from current final position and apply same forces
+                const Vector3 finalPlusVel = Vector3Add(cc->virtualToePos[side], velocityDisplacement);
+                const Vector3 toTargetFinal = Vector3Subtract(blendedToePos, finalPlusVel);
+                const Vector3 returnDisplacementFinal = Vector3Scale(toTargetFinal, returnAlpha);
+                Vector3 finalDisplacement = Vector3Add(velocityDisplacement, returnDisplacementFinal);
+
+                // Step 4: Speed clamp (XZ only) for final virtual toe
+                const float distXZ = Vector3Length2D(finalDisplacement);
+
+                if (distXZ > 1e-6f)
                 {
-                    cc->virtualToeUnlockTimer[side] = -1.0f;  // back to locked
+                    const float blendedSpeedXZ = Vector3Length2D(blendedToeVel);
+
+                    const float lowSpeed = 0.5f;
+                    const float highSpeed = 2.0f;
+                    const float lowMult = 1.2f;
+                    const float highMult = 1.7f;
+                    const float howFast = ClampedInvLerp(lowSpeed, highSpeed, blendedSpeedXZ);
+                    const float speedMultiplier = SmoothLerp(lowMult, highMult, howFast);
+                    const float maxSpeed = blendedSpeedXZ * speedMultiplier;
+                    const float maxDistXZ = maxSpeed * dt;
+
+                    if (distXZ > maxDistXZ)
+                    {
+                        const float scale = maxDistXZ / distXZ;
+                        finalDisplacement.x *= scale;
+                        finalDisplacement.z *= scale;
+                    }
                 }
-            }
 
-            if (distXZ > 1e-6f && dt > 1e-6f)
-            {
-                const float lowSpeed = 0.5f;
-                const float highSpeed = 2.0f;
-                const float lowMult = 1.2f;
-                const float highMult = 1.5f;
-                const float t = Clamp((blendedSpeed - lowSpeed) / (highSpeed - lowSpeed), 0.0f, 1.0f);
-                const float speedMultiplier = lowMult + (highMult - lowMult) * Smoothstep(t);
-                const float maxSpeed = blendedSpeed * speedMultiplier;
-                const float maxDist = maxSpeed * dt;
+                cc->virtualToePos[side] = Vector3Add(cc->virtualToePos[side], finalDisplacement);
 
-                if (distXZ <= maxDist)
+                // Check unlock condition: distance between final and intermediate (XZ only)
+                const Vector3 unlockDelta = Vector3Subtract(cc->intermediateVirtualToePos[side], cc->virtualToePos[side]);
+                const float distXZUnlock = Vector3Length2D(unlockDelta);
+
+                // Trigger unlock when final can't keep up with intermediate
+                // BUT only if the other foot is not currently unlocked
+                const int otherSide = OtherSideInt(side);
+                const bool otherFootUnlocked = (cc->virtualToeUnlockTimer[otherSide] >= 0.0f);
+
+                if (config.enableTimedUnlocking &&
+                    distXZUnlock > config.unlockDistance &&
+                    cc->virtualToeUnlockTimer[side] < 0.0f &&
+                    !otherFootUnlocked)
                 {
-                    // can reach target this frame
-                    cc->virtualToePos[side].x = blendedToeX;
-                    cc->virtualToePos[side].z = blendedToeZ;
+                    cc->virtualToeUnlockTimer[side] = config.unlockDuration;
+                    cc->virtualToeUnlockStartDistance[side] = distXZUnlock;  // REMEMBER actual distance at unlock
+                    TraceLog(LOG_INFO, "Virtual toe %s unlocked: final-intermediate dist %.3f > %.3f (start dist %.3f)",
+                        StringFromSide(side), distXZUnlock, config.unlockDistance, distXZUnlock);
+                }                
+                
+                // Update unlock timer
+                if (cc->virtualToeUnlockTimer[side] >= 0.0f)
+                {
+                    cc->virtualToeUnlockTimer[side] -= dt;
+                    if (cc->virtualToeUnlockTimer[side] < 0.0f)
+                    {
+                        cc->virtualToeUnlockTimer[side] = -1.0f;
+                    }
+                }
+
+                // If unlocked, pull final toward intermediate (shrinking sphere constraint)
+                if (config.enableTimedUnlocking && cc->virtualToeUnlockTimer[side] >= 0.0f)
+                {
+                    const float unlockProgress = cc->virtualToeUnlockTimer[side] / config.unlockDuration;
+                    const float smoothUnlockProgress = SmoothStep(unlockProgress);
+                    // Shrink from actual unlock distance to 0, not from unlockDistance
+                    const float maxClampDist = cc->virtualToeUnlockStartDistance[side] * smoothUnlockProgress;
+
+                    // Store for debug visualization
+                    cc->virtualToeUnlockClampRadius[side] = maxClampDist;
+
+                    const Vector3 clampDelta = Vector3Subtract(cc->intermediateVirtualToePos[side], cc->virtualToePos[side]);
+                    const float distXZClamp = Vector3Length2D(clampDelta);
+
+                    if (distXZClamp > maxClampDist)
+                    {
+                        const float clampScale = maxClampDist / distXZClamp;
+                        cc->virtualToePos[side].x = cc->intermediateVirtualToePos[side].x - clampDelta.x * clampScale;
+                        cc->virtualToePos[side].z = cc->intermediateVirtualToePos[side].z - clampDelta.z * clampScale;
+                    }
                 }
                 else
                 {
-                    // move towards target at max speed
-                    const float scale = maxDist / distXZ;
-                    cc->virtualToePos[side].x += dx * scale;
-                    cc->virtualToePos[side].z += dz * scale;
+                    cc->virtualToeUnlockClampRadius[side] = 0.0f;
                 }
             }
         }
-
-
-        // If unlocked, apply final clamp towards FK blended position
-        // Clamp distance decreases linearly from UNLOCK_DISTANCE to 0 over UNLOCK_DURATION
-        if (cc->virtualToeUnlockTimer[side] >= 0.0f)
-        {
-            float unlockProgress = cc->virtualToeUnlockTimer[side] / UNLOCK_DURATION;
-            unlockProgress = Smoothstep(unlockProgress);  
-            const float maxClampDist = (UNLOCK_DISTANCE * 1.05f) * unlockProgress;
-
-            const float dxFinal = blendedToeX - cc->virtualToePos[side].x;
-            const float dzFinal = blendedToeZ - cc->virtualToePos[side].z;
-            const float distFinal = sqrtf(dxFinal * dxFinal + dzFinal * dzFinal);
-
-            if (distFinal > maxClampDist)
-            {
-                const float clampScale = maxClampDist / distFinal;
-                cc->virtualToePos[side].x = blendedToeX - dxFinal * clampScale;
-                cc->virtualToePos[side].z = blendedToeZ - dzFinal * clampScale;
-            }
-        }
     }
-    cc->virtualToeInitialized = true;
 
-    // Save pre-IK state for debugging visualization
+    cc->virtualToeInitialized = true;    // Save pre-IK state for debugging visualization
+    
+    
     if (cc->debugSaveBeforeIK)
     {
         // Copy current FK result before IK modifies it

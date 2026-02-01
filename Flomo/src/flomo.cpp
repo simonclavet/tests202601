@@ -220,6 +220,7 @@ static void ShaderUniformsInit(ShaderUniforms* uniforms, Shader shader)
     TraceLog(LOG_INFO, "capsulePosition: %d", uniforms->capsulePosition);
 }
 
+
 //--------------------------------------
 // Scrubber
 //--------------------------------------
@@ -307,6 +308,56 @@ static inline void ScrubberSettingsClamp(ScrubberSettings* settings, CharacterDa
 
     settings->playTime = Clamp(settings->playTime, settings->timeMin, settings->timeMax);
 }
+
+
+// Main application state - passed to update/render functions
+struct ApplicationState {
+    int argc;
+    char** argv;
+
+    // Window
+    int screenWidth;
+    int screenHeight;
+
+    // Camera
+    CameraSystem camera;
+
+    // Rendering resources
+    Shader shader;
+    ShaderUniforms uniforms;
+    Mesh groundPlaneMesh;
+    Model groundPlaneModel;
+    Model capsuleModel;
+
+    // Animation data
+    CharacterData characterData;
+    CapsuleData capsuleData;
+    AnimDatabase animDatabase;
+    ControlledCharacter controlledCharacter;
+
+    // UI state
+    ScrubberSettings scrubberSettings;
+    AppConfig config;
+    //GuiWindowFileDialogState fileDialogState;
+
+    char errMsg[512];
+
+    // Geno character rendering (experimental skinned mesh)
+    bool genoRenderMode;
+    Model genoModel;
+    ModelAnimation genoAnimation;
+    Shader genoBasicShader;
+    bool genoModelLoaded;
+    vector<BVHGenoMapping> genoMappings;
+
+    // Debug timescale system
+    // numpad-: halve debugTimescale
+    // numpad+: double debugTimescale (max 1.0), also unpause
+    // numpad*: toggle pause, hold while paused to advance at half speed
+    float debugTimescale = 1.0f;
+    bool debugPaused = false;
+};
+
 
 //----------------------------------------------------------------------------------
 // Drawing
@@ -711,10 +762,11 @@ static inline void ImGuiScrubberSettings(
     ImGui::End();
 }
 
-static inline void ImGuiAnimSettings(AppConfig* config)
+static inline void ImGuiAnimSettings(ApplicationState* app)
 {
+    AppConfig* config = &app->config;
     ImGui::SetNextWindowPos(ImVec2(250, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(200, 240), ImGuiCond_FirstUseEver);  // increased height
+    ImGui::SetNextWindowSize(ImVec2(280, 300), ImGuiCond_FirstUseEver);  // increased width and height
     if (ImGui::Begin("Anim Settings")) {
         ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.0f, 2.0f, "%.2f s");
         ImGui::SliderFloat("Switch Interval", &config->switchInterval, 0.1f, 5.0f, "%.2f s");
@@ -748,6 +800,88 @@ static inline void ImGuiAnimSettings(AppConfig* config)
                 }
             }
         }
+
+        // Motion Matching Features
+        if (ImGui::CollapsingHeader("Motion Matching Features"))
+        {
+            AnimDatabase& db = app->animDatabase;
+            MotionMatchingFeaturesConfig& mmConfig = config->mmConfigEditor;
+            bool configChanged = false;
+
+            ImGui::Text("Feature Weights:");
+            ImGui::Separator();
+
+            // Feature weights as input fields
+            for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
+            {
+                const FeatureType type = static_cast<FeatureType>(i);
+                const char* name = FeatureTypeName(type);
+                float weight = mmConfig.features[i].weight;
+
+                ImGui::PushID(i);
+                ImGui::Text("%s:", name);
+                ImGui::SameLine(180);  // Align input fields
+                ImGui::SetNextItemWidth(80);
+                if (ImGui::InputFloat("##weight", &weight, 0.0f, 0.0f, "%.3f"))
+                {
+                    // Clamp to >= 0
+                    mmConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
+                    configChanged = true;
+                }
+                ImGui::PopID();
+            }
+
+            ImGui::Separator();
+
+            // Future trajectory times configuration
+            ImGui::Text("Future Trajectory Times (s):");
+            const size_t timeCount = mmConfig.futureTrajPointTimes.size();
+
+            for (size_t i = 0; i < timeCount; ++i)
+            {
+                ImGui::PushID((int)i + 1000);
+
+                ImGui::Text("Time %d:", (int)i + 1);
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(80);
+
+                float timeVal = mmConfig.futureTrajPointTimes[i];
+                if (ImGui::InputFloat("##time", &timeVal, 0.0f, 0.0f, "%.3f"))
+                {
+                    // Clamp to >= 0.001
+                    timeVal = (timeVal < 0.001f) ? 0.001f : timeVal;
+
+                    // Enforce increasing order: clamp to be >= previous time
+                    if (i > 0)
+                    {
+                        const float prevTime = mmConfig.futureTrajPointTimes[i - 1];
+                        timeVal = (timeVal < prevTime) ? prevTime : timeVal;
+                    }
+
+                    // Enforce increasing order: clamp next times to be >= this time
+                    mmConfig.futureTrajPointTimes[i] = timeVal;
+                    for (size_t j = i + 1; j < timeCount; ++j)
+                    {
+                        if (mmConfig.futureTrajPointTimes[j] < timeVal)
+                        {
+                            mmConfig.futureTrajPointTimes[j] = timeVal;
+                        }
+                    }
+
+                    configChanged = true;
+                }
+
+                ImGui::PopID();
+            }
+
+            if (configChanged)
+            {
+                // Rebuild animation database with new feature config
+                db.featuresConfig = mmConfig;
+                AnimDatabaseRebuild(&db, &app->characterData);
+                TraceLog(LOG_INFO, "Motion matching features updated");
+            }
+        }
     }
     ImGui::End();
 }
@@ -771,54 +905,6 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter)
 //----------------------------------------------------------------------------------
 // Application
 //----------------------------------------------------------------------------------
-
-// Main application state - passed to update/render functions
-struct ApplicationState {
-    int argc;
-    char** argv;
-
-    // Window
-    int screenWidth;
-    int screenHeight;
-
-    // Camera
-    CameraSystem camera;
-
-    // Rendering resources
-    Shader shader;
-    ShaderUniforms uniforms;
-    Mesh groundPlaneMesh;
-    Model groundPlaneModel;
-    Model capsuleModel;
-
-    // Animation data
-    CharacterData characterData;
-    CapsuleData capsuleData;
-    AnimDatabase animDatabase;
-    ControlledCharacter controlledCharacter;
-
-    // UI state
-    ScrubberSettings scrubberSettings;
-    AppConfig config;
-    //GuiWindowFileDialogState fileDialogState;
-
-    char errMsg[512];
-
-    // Geno character rendering (experimental skinned mesh)
-    bool genoRenderMode;
-    Model genoModel;
-    ModelAnimation genoAnimation;
-    Shader genoBasicShader;
-    bool genoModelLoaded;
-    vector<BVHGenoMapping> genoMappings;
-
-    // Debug timescale system
-    // numpad-: halve debugTimescale
-    // numpad+: double debugTimescale (max 1.0), also unpause
-    // numpad*: toggle pause, hold while paused to advance at half speed
-    float debugTimescale = 1.0f;
-    bool debugPaused = false;
-};
 
 // Update function - what is called to "tick" the application.
 static void ApplicationUpdate(void* voidApplicationState)
@@ -1759,7 +1845,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Foot IK debug (virtual toe positions, FK foot positions before IK, full FK skeleton before IK)
-    if (app->controlledCharacter.active && 
+    if (app->controlledCharacter.active &&
         app->config.drawFootIK &&
         app->config.enableFootIK &&
         app->animDatabase.valid)
@@ -1796,15 +1882,56 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             if (toeIdx < 0 || toeIdx >= cc.xformData.jointCount) continue;
 
-            // Virtual toe position (magenta) - integrated from blended velocity, this is the IK target
+            // Get FK blended toe position (weighted from cursors)
+            Vector3 blendedFKToePos = Vector3Zero();
+            for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+            {
+                const BlendCursor& cur = cc.cursors[ci];
+                if (!cur.active) continue;
+                const float w = cur.normalizedWeight;
+                if (w <= 1e-6f) continue;
+
+                if (toeIdx < (int)cur.globalPositions.size())
+                {
+                    blendedFKToePos = Vector3Add(blendedFKToePos,
+                        Vector3Scale(cur.globalPositions[toeIdx], w));
+                }
+            }
+
+            // Draw timed unlock clamp radius sphere (if unlocked)
+            if (app->config.enableTimedUnlocking && cc.virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                const float clampRadius = cc.virtualToeUnlockClampRadius[side];
+                if (clampRadius > 0.001f)
+                {
+                    // Draw wireframe sphere centered at INTERMEDIATE virtual toe (not FK blend!)
+                    // Color changes based on unlock progress (red = just unlocked, fades to orange)
+                    const float unlockProgress = cc.virtualToeUnlockTimer[side] / app->config.unlockDuration;
+                    const unsigned char fadeAlpha = (unsigned char)(unlockProgress * 200.0f + 55.0f);
+                    const Color clampColor = Color{ 255, (unsigned char)(unlockProgress * 128.0f), 0, fadeAlpha };
+
+                    DrawSphereWires(cc.intermediateVirtualToePos[side], clampRadius, 8, 8, clampColor);
+                }
+            }
+
+            // Intermediate virtual toe (cyan) - unconstrained natural motion
+            DrawSphere(cc.intermediateVirtualToePos[side], 0.022f, LIME);
+
+            // Final virtual toe (magenta) - constrained, this is the IK target
             DrawSphere(cc.virtualToePos[side], 0.025f, MAGENTA);
+
+            // Draw line showing constraint between intermediate and final
+            if (app->config.enableTimedUnlocking && cc.virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                DrawLine3D(cc.intermediateVirtualToePos[side], cc.virtualToePos[side], Color{ 255, 128, 255, 180 });
+            }
 
             // FK toe position BEFORE IK (yellow) - where the toe was before correction
             if (cc.debugSaveBeforeIK && toeIdx < cc.xformBeforeIK.jointCount)
             {
                 DrawSphere(cc.xformBeforeIK.globalPositions[toeIdx], 0.020f, YELLOW);
 
-                // Draw line from pre-IK toe to virtual toe target to show the correction
+                // Draw line from pre-IK toe to final virtual toe target to show the correction
                 DrawLine3D(cc.xformBeforeIK.globalPositions[toeIdx], cc.virtualToePos[side], ORANGE);
             }
 
@@ -1814,7 +1941,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                 DrawSphere(cc.xformBeforeIK.globalPositions[footIdx], 0.020f, GREEN);
             }
 
-            // Current (post-IK) toe position (cyan) - to compare with target
+            // Current (post-IK) toe position (skyblue) - to compare with target
             DrawSphere(cc.xformData.globalPositions[toeIdx], 0.018f, SKYBLUE);
         }
     }
@@ -2097,7 +2224,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         ImGuiScrubberSettings(&app->scrubberSettings, &app->characterData, app->screenWidth, app->screenHeight);
 
         // Animation settings
-        ImGuiAnimSettings(&app->config);
+        ImGuiAnimSettings(app);
 
         ImGuiPlayerControl(&app->controlledCharacter);
 
@@ -2517,11 +2644,12 @@ int main(int argc, char** argv)
         {
             vector<const char*> autoFiles = 
             { 
-                "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
-                "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
-                "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
-                "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
-                //"data\\lafan\\bvh\\dance1_subject2.bvh"
+            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
+            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
+            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
+            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
+                "data\\lafan\\bvh\\dance1_subject2.bvh",
+                "data\\lafan\\bvh\\sprint1_subject4.bvh"
             };
             for (const char* file : autoFiles)
             {

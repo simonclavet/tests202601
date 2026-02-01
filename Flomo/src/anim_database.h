@@ -13,16 +13,6 @@
 #include "transform_data.h"
 #include "character_data.h"
 
-struct MotionMatchingFeaturesConfig
-{
-    bool useFeatureToePos = false;   // left+right toe positions (X,Z) => 4 dims
-    bool useFeatureToeVel = true;    // left+right toe velocities (X,Z) => 4 dims
-    bool useFeatureToeDiff = true;   // left-right difference (X,Z) => 2 dims
-    bool useFeatureFutureVelDir = true;  // future root velocity direction (XZ) at sample points => 2 * points
-    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };  // time offsets (seconds) for future trajectory samples
-
-};
-
 //----------------------------------------------------------------------------------
 // Animation Database
 //----------------------------------------------------------------------------------
@@ -485,14 +475,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     // Log resolved feature indices
     TraceLog(LOG_INFO, "AnimDatabase: hip=%d", db->hipJointIndex);
-    
+
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
 
     db->featureDim = 0;
-    if (cfg.useFeatureToePos) db->featureDim += 4;
-    if (cfg.useFeatureToeVel) db->featureDim += 4;
-    if (cfg.useFeatureToeDiff) db->featureDim += 2;
-    if (cfg.useFeatureFutureVelDir) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::ToePos)) db->featureDim += 4;
+    if (cfg.IsFeatureEnabled(FeatureType::ToeVel)) db->featureDim += 4;
+    if (cfg.IsFeatureEnabled(FeatureType::ToeDiff)) db->featureDim += 2;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVelDir)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
 
     db->features.clear();
     db->featureNames.clear();
@@ -555,7 +545,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
 
         // POSITION: toePos->Left(X, Z), Right(X, Z)
-        if (db->featuresConfig.useFeatureToePos)
+        if (cfg.IsFeatureEnabled(FeatureType::ToePos))
         {
             featRow[currentFeature++] = localLeftPos.x;
             featRow[currentFeature++] = localLeftPos.z;
@@ -572,7 +562,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // VELOCITY: toeVel -> compute world finite-difference then rotate into hip frame
-        if (db->featuresConfig.useFeatureToeVel)
+        if (cfg.IsFeatureEnabled(FeatureType::ToeVel))
         {
             Vector3 localLeftVel = Vector3Zero();
             Vector3 localRightVel = Vector3Zero();
@@ -595,7 +585,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     localRightVel = Vector3RotateByQuaternion(velRightWorld, invHipYaw);
                 }
             }
-            
+
 
             featRow[currentFeature++] = localLeftVel.x;
             featRow[currentFeature++] = localLeftVel.z;
@@ -612,7 +602,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // DIFFERENCE: toeDifference = Left - Right (in hip horizontal frame) => (dx, dz)
-        if (db->featuresConfig.useFeatureToeDiff)
+        if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
         {
             const float diffX = localLeftPos.x - localRightPos.x;
             const float diffZ = localLeftPos.z - localRightPos.z;
@@ -627,7 +617,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // FUTURE TRAJECTORY: future root velocity direction (XZ) at sample points
-        if (cfg.useFeatureFutureVelDir)
+        if (cfg.IsFeatureEnabled(FeatureType::FutureVelDir))
         {
             const float frameTime = db->animFrameTime[clipIdx];
 
@@ -674,7 +664,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     db->featureNames.push_back(string(nameBufZ));
                 }
             }
-           
+
         }
 
         assert(currentFeature == db->featureDim);

@@ -34,19 +34,28 @@
     "drawFPS": true,
     "drawUI": true,
     "drawFeatures": true,
-    "drawBlendCursors": true,
+    "drawBlendCursors": false,
     "drawVelocities": false,
     "drawAccelerations": false,
     "drawRootVelocities": false,
     "drawToeVelocities": false,
-    "drawFootIK": true,
-    "defaultBlendTime": 0.2600,
-    "switchInterval": 0.9200,
+    "drawFootIK": false,
+    "defaultBlendTime": 0.2800,
+    "switchInterval": 0.5300,
     "useVelBlending": true,
-    "blendPosReturnTime": 0.0600,
+    "blendPosReturnTime": 0.0700,
     "enableFootIK": true,
     "enableTimedUnlocking": true,
-    "unlockDistance": 0.2000,
-    "unlockDuration": 0.3300,
+    "unlockDistance": 0.1800,
+    "unlockDuration": 0.3400,
     "drawPlayerInput": false
+  "motionMatchingConfig": {
+  "featureWeights": {
+    "Toe Position": 1,
+    "Toe Velocity": 1,
+    "Toe Difference": 1,
+    "Future Velocity": 1
+  },
+  "futureTrajPointTimes": [0.2, 0.4, 0.8]
+},
 }
