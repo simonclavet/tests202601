@@ -13,6 +13,16 @@
 #include "transform_data.h"
 #include "character_data.h"
 
+struct MotionMatchingFeaturesConfig
+{
+    bool useFeatureToePos = false;   // left+right toe positions (X,Z) => 4 dims
+    bool useFeatureToeVel = true;    // left+right toe velocities (X,Z) => 4 dims
+    bool useFeatureToeDiff = true;   // left-right difference (X,Z) => 2 dims
+    bool useFeatureFutureVelDir = true;  // future root velocity direction (XZ) at sample points => 2 * points
+    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };  // time offsets (seconds) for future trajectory samples
+
+};
+
 //----------------------------------------------------------------------------------
 // Animation Database
 //----------------------------------------------------------------------------------
@@ -20,6 +30,9 @@
 // A unified view of all loaded animations, suitable for sampling by ControlledCharacter.
 struct AnimDatabase
 {
+    // Motion matching feature configuration
+    MotionMatchingFeaturesConfig featuresConfig;
+
     // References to all loaded animations
     int animCount = -1;
 
@@ -472,18 +485,15 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     // Log resolved feature indices
     TraceLog(LOG_INFO, "AnimDatabase: hip=%d", db->hipJointIndex);
+    
+    const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
 
-    static constexpr bool FEATURE_TOE_POS = false;       // left+right toe positions (X,Z) => 4 dims
-    static constexpr bool FEATURE_TOE_VEL = true;        // left+right toe velocities (X,Z) => 4 dims
-    static constexpr bool FEATURE_TOE_DIFF = true;       // left-right difference (X,Z) => 2 dims
+    db->featureDim = 0;
+    if (cfg.useFeatureToePos) db->featureDim += 4;
+    if (cfg.useFeatureToeVel) db->featureDim += 4;
+    if (cfg.useFeatureToeDiff) db->featureDim += 2;
+    if (cfg.useFeatureFutureVelDir) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
 
-    static constexpr int FEATURE_TOE_POS_DIM = FEATURE_TOE_POS ? 4 : 0;
-    static constexpr int FEATURE_TOE_VEL_DIM = FEATURE_TOE_VEL ? 4 : 0;
-    static constexpr int FEATURE_TOE_DIFF_DIM = FEATURE_TOE_DIFF ? 2 : 0;
-
-    static constexpr int FEATURE_DIM = FEATURE_TOE_POS_DIM + FEATURE_TOE_VEL_DIM + FEATURE_TOE_DIFF_DIM;
-
-    db->featureDim = FEATURE_DIM;
     db->features.clear();
     db->featureNames.clear();
 
@@ -494,6 +504,13 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     for (int f = 0; f < db->motionFrameCount; ++f)
     {
         const bool isFirstFrame = f == 0;
+        const int clipIdx = FindClipForMotionFrame(db, f);
+        assert(clipIdx != -1);
+
+        const int clipStart = db->clipStartFrame[clipIdx];
+        const int clipEnd = db->clipEndFrame[clipIdx];
+        const float dt = db->animFrameTime[clipIdx];
+        assert(dt > 1e-8f);
 
         span<const Vector3> posRow = db->globalJointPositions.row_view(f);
         span<const Quaternion> rotRow = db->globalJointRotations.row_view(f);
@@ -531,14 +548,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         int currentFeature = 0;
 
         // Precompute local toe positions (hip horizontal frame) - used by pos and diff
-        Vector3 hipToLeft = Vector3Subtract(leftPos, hipPos);
-        Vector3 localLeftPos = Vector3RotateByQuaternion(hipToLeft, invHipYaw);
+        const Vector3 hipToLeft = Vector3Subtract(leftPos, hipPos);
+        const Vector3 localLeftPos = Vector3RotateByQuaternion(hipToLeft, invHipYaw);
 
-        Vector3 hipToRight = Vector3Subtract(rightPos, hipPos);
-        Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
+        const Vector3 hipToRight = Vector3Subtract(rightPos, hipPos);
+        const Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
 
         // POSITION: toePos->Left(X, Z), Right(X, Z)
-        if constexpr (FEATURE_TOE_POS)
+        if (db->featuresConfig.useFeatureToePos)
         {
             featRow[currentFeature++] = localLeftPos.x;
             featRow[currentFeature++] = localLeftPos.z;
@@ -555,36 +572,30 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // VELOCITY: toeVel -> compute world finite-difference then rotate into hip frame
-        if constexpr (FEATURE_TOE_VEL)
+        if (db->featuresConfig.useFeatureToeVel)
         {
             Vector3 localLeftVel = Vector3Zero();
             Vector3 localRightVel = Vector3Zero();
 
-            const int clipIdx = FindClipForMotionFrame(db, f);
-            if (clipIdx != -1)
+            if (f > clipStart && dt > 0.0f)
             {
-                const int clipStart = db->clipStartFrame[clipIdx];
-                const float dt = db->animFrameTime[clipIdx] > 1e-8f ? db->animFrameTime[clipIdx] : 0.0f;
+                span<const Vector3> posPrevRow = db->globalJointPositions.row_view(f - 1);
 
-                if (f > clipStart && dt > 0.0f)
+                if (leftIdx >= 0)
                 {
-                    span<const Vector3> posPrevRow = db->globalJointPositions.row_view(f - 1);
+                    const Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
+                    const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
+                    localLeftVel = Vector3RotateByQuaternion(velLeftWorld, invHipYaw);
+                }
 
-                    if (leftIdx >= 0)
-                    {
-                        Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
-                        const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
-                        localLeftVel = Vector3RotateByQuaternion(velLeftWorld, invHipYaw);
-                    }
-
-                    if (rightIdx >= 0)
-                    {
-                        Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
-                        const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
-                        localRightVel = Vector3RotateByQuaternion(velRightWorld, invHipYaw);
-                    }
+                if (rightIdx >= 0)
+                {
+                    const Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
+                    const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
+                    localRightVel = Vector3RotateByQuaternion(velRightWorld, invHipYaw);
                 }
             }
+            
 
             featRow[currentFeature++] = localLeftVel.x;
             featRow[currentFeature++] = localLeftVel.z;
@@ -601,7 +612,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // DIFFERENCE: toeDifference = Left - Right (in hip horizontal frame) => (dx, dz)
-        if constexpr (FEATURE_TOE_DIFF)
+        if (db->featuresConfig.useFeatureToeDiff)
         {
             const float diffX = localLeftPos.x - localRightPos.x;
             const float diffZ = localLeftPos.z - localRightPos.z;
@@ -613,6 +624,57 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 db->featureNames.push_back(string("ToeDiffX"));
                 db->featureNames.push_back(string("ToeDiffZ"));
             }
+        }
+
+        // FUTURE TRAJECTORY: future root velocity direction (XZ) at sample points
+        if (cfg.useFeatureFutureVelDir)
+        {
+            const float frameTime = db->animFrameTime[clipIdx];
+
+            // Current root position and rotation
+            const int rootIdx = 0;
+            const Vector3 currRootPos = posRow[rootIdx];
+            const Quaternion currRootRot = rotRow[rootIdx];
+
+            // Extract current root yaw for transforming future velocities to current character space
+            const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
+            const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
+
+            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+            {
+                const float futureTime = cfg.futureTrajPointTimes[p];
+                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
+                const int futureFrame = f + futureFrameOffset;
+
+                Vector3 futureVelLocal = Vector3Zero();
+
+                // Check if future frame is within the same clip
+                if (futureFrame >= clipStart && futureFrame < clipEnd)
+                {
+                    // Sample future root velocity from precomputed velocities
+                    span<const Vector3> futureVelRow = db->globalJointVelocities.row_view(futureFrame);
+                    const Vector3 futureVelWorld = futureVelRow[rootIdx];
+
+                    // Transform to current character space (remove current yaw rotation)
+                    futureVelLocal = Vector3RotateByQuaternion(futureVelWorld, invCurrRootYaw);
+                }
+                // else: future frame outside clip, leave as zero
+
+                // Store only XZ components (horizontal velocity)
+                featRow[currentFeature++] = futureVelLocal.x;
+                featRow[currentFeature++] = futureVelLocal.z;
+
+                if (isFirstFrame)
+                {
+                    char nameBufX[64];
+                    char nameBufZ[64];
+                    snprintf(nameBufX, sizeof(nameBufX), "FutureVelX_%.2fs", futureTime);
+                    snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelZ_%.2fs", futureTime);
+                    db->featureNames.push_back(string(nameBufX));
+                    db->featureNames.push_back(string(nameBufZ));
+                }
+            }
+           
         }
 
         assert(currentFeature == db->featureDim);
@@ -743,8 +805,6 @@ static inline void SampleGlobalToeVelocity(
     float animTime,
     /*out*/ Vector3 outToeVelocity[SIDES_COUNT])
 {
-    using std::span;
-
     const int clipStart = db->clipStartFrame[animIndex];
 
     // sample pose at animTime
@@ -752,8 +812,8 @@ static inline void SampleGlobalToeVelocity(
     float alpha;
     GetInterFrameAlpha(db, animIndex, animTime, f0, f1, alpha);
 
-    span<const Vector3> velRow0 = db->globalJointVelocities.row_view(clipStart + f0);
-    span<const Vector3> velRow1 = db->globalJointVelocities.row_view(clipStart + f1);
+    std::span<const Vector3> velRow0 = db->globalJointVelocities.row_view(clipStart + f0);
+    std::span<const Vector3> velRow1 = db->globalJointVelocities.row_view(clipStart + f1);
 
     for (int side : sides)
     {

@@ -24,6 +24,13 @@ static inline float Saturate(float x)
     return Clamp(x, 0.0f, 1.0f);
 }
 
+// smoothstep: smooth interpolation with zero derivative at endpoints
+// t should be in [0, 1], returns value in [0, 1]
+static inline float Smoothstep(float t)
+{
+    return t * t * (3.0f - 2.0f * t);
+}
+
 static inline float Square(float x)
 {
     return x * x;

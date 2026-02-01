@@ -542,6 +542,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Root Velocities", &config->drawRootVelocities);
         ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
         ImGui::Checkbox("Draw Foot IK", &config->drawFootIK);
+        ImGui::Checkbox("Draw Player Input", &config->drawPlayerInput);
 
     }
     ImGui::End();
@@ -713,7 +714,7 @@ static inline void ImGuiScrubberSettings(
 static inline void ImGuiAnimSettings(AppConfig* config)
 {
     ImGui::SetNextWindowPos(ImVec2(250, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(200, 180), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(200, 240), ImGuiCond_FirstUseEver);  // increased height
     if (ImGui::Begin("Anim Settings")) {
         ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.0f, 2.0f, "%.2f s");
         ImGui::SliderFloat("Switch Interval", &config->switchInterval, 0.1f, 5.0f, "%.2f s");
@@ -722,8 +723,6 @@ static inline void ImGuiAnimSettings(AppConfig* config)
         if (config->useVelBlending) {
             ImGui::SliderFloat("Return Blend Time", &config->blendPosReturnTime, 0.01f, 1.0f, "%.2f s");
         }
-        ImGui::SliderFloat("Hips Blend Time", &config->hipsRotationBlendTime, 0.01f, 1.0f, "%.2f s");
-        ImGui::Separator();
 
         ImGui::Separator();
         ImGui::Checkbox("Enable Foot IK", &config->enableFootIK);
@@ -731,12 +730,40 @@ static inline void ImGuiAnimSettings(AppConfig* config)
             ImGui::SetTooltip("Enable IK to pull feet towards virtual toe positions");
         }
 
-        ImGui::SliderFloat("Foot IK Ratio", &config->footIKRatio, 0.0f, 1.0f, "%.2f");
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("0.0 = flat foot (walking)\n1.0 = pointed foot (swimming)");
+        if (config->enableFootIK) {
+            ImGui::Checkbox("Timed Unlocking", &config->enableTimedUnlocking);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Allow virtual toes to break free when drifting too far");
+            }
+
+            if (config->enableTimedUnlocking) {
+                ImGui::SliderFloat("Unlock Distance", &config->unlockDistance, 0.01f, 1.0f, "%.2f m");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Distance threshold to trigger unlock");
+                }
+
+                ImGui::SliderFloat("Unlock Duration", &config->unlockDuration, 0.001f, 2.0f, "%.2f s");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Time to gradually re-lock after unlock");
+                }
+            }
         }
+    }
+    ImGui::End();
+}
+
+static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter)
+{
+    if (!controlledCharacter->active) return;
+
+    ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(200, 100), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Player Control")) {
+        PlayerControlInput& input = controlledCharacter->playerInput;
+        ImGui::SliderFloat("Max Speed", &input.maxSpeed, 0.1f, 10.0f, "%.2f m/s");
+
+        const float velMag = Vector3Length(input.desiredVelocity);
+        ImGui::Text("Input: %.2f m/s", velMag);
     }
     ImGui::End();
 }
@@ -1053,7 +1080,6 @@ static void ApplicationUpdate(void* voidApplicationState)
         // sync velocity blending settings from config
         app->controlledCharacter.useVelBlending = app->config.useVelBlending;
         app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
-        app->controlledCharacter.hipsRotationBlendTime = app->config.hipsRotationBlendTime;
 
         ControlledCharacterUpdate(
             &app->controlledCharacter,
@@ -1176,6 +1202,58 @@ static void ApplicationUpdate(void* voidApplicationState)
             isPanning,
             dt);
     }
+
+    // Update Player Control Input (WASD relative to camera)
+    if (app->controlledCharacter.active && !imguiWantsKeyboard)
+    {
+        PlayerControlInput& input = app->controlledCharacter.playerInput;
+
+        // Get input direction (camera-relative)
+        Vector2 inputDir = Vector2Zero();
+
+        // Check for gamepad input (left stick)
+        if (IsGamepadAvailable(0))
+        {
+            const float leftX = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
+            const float leftY = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
+
+            // Apply deadzone (small values near zero are ignored)
+            const float deadzone = 0.15f;
+            if (fabsf(leftX) > deadzone || fabsf(leftY) > deadzone)
+            {
+                inputDir.x = leftX;
+                inputDir.y = -leftY;  // invert Y for typical forward/back convention
+            }
+        }
+
+        if (IsKeyDown(KEY_W)) inputDir.y += 1.0f;
+        if (IsKeyDown(KEY_S)) inputDir.y -= 1.0f;
+        if (IsKeyDown(KEY_D)) inputDir.x += 1.0f;
+        if (IsKeyDown(KEY_A)) inputDir.x -= 1.0f;
+
+        // Clamp magnitude to 1 (prevent diagonal speed boost)
+        const float mag = Vector2Length(inputDir);
+        if (mag > 1.0f) {
+            inputDir = Vector2Scale(inputDir, 1.0f / mag);
+        }
+
+        // Get camera's actual forward and right vectors from cam3d
+        const Vector3 camForward = Vector3Normalize(Vector3Subtract(app->camera.cam3d.target, app->camera.cam3d.position));
+        const Vector3 camRight = Vector3Normalize(Vector3CrossProduct(camForward, Vector3{ 0.0f, 1.0f, 0.0f }));
+
+        // Project camera vectors onto XZ plane (ignore Y component for ground movement)
+        const Vector3 forward = Vector3Normalize(Vector3{ camForward.x, 0.0f, camForward.z });
+        const Vector3 right = Vector3Normalize(Vector3{ camRight.x, 0.0f, camRight.z });
+
+        // Combine input with camera orientation
+        const Vector3 worldDir = Vector3Add(
+            Vector3Scale(right, inputDir.x),
+            Vector3Scale(forward, inputDir.y));
+
+        input.desiredVelocity = Vector3Scale(worldDir, input.maxSpeed);
+    
+    }
+
 
     // Create Capsules
 
@@ -1781,6 +1859,42 @@ static void ApplicationUpdate(void* voidApplicationState)
         {
             DrawTransforms(&app->characterData.xformData[i]);
         }
+
+        // Draw controlled character transforms
+        if (app->controlledCharacter.active)
+        {
+            DrawTransforms(&app->controlledCharacter.xformData);
+        }
+    }
+
+    // Draw Player Input Arrow
+    if (app->controlledCharacter.active && app->config.drawPlayerInput)
+    {
+        const PlayerControlInput& input = app->controlledCharacter.playerInput;
+        const float velMag = Vector3Length(input.desiredVelocity);
+
+        if (velMag > 0.01f)
+        {
+            const Vector3 startPos = Vector3{
+                app->controlledCharacter.worldPosition.x,
+                0.05f,
+                app->controlledCharacter.worldPosition.z
+            };
+            const Vector3 endPos = Vector3Add(startPos, input.desiredVelocity);
+
+            // Draw arrow shaft
+            DrawLine3D(startPos, endPos, PURPLE);
+
+            // Draw arrowhead
+            const Vector3 dir = Vector3Normalize(input.desiredVelocity);
+            const Vector3 right = Vector3{ -dir.z, 0.0f, dir.x };
+            const float arrowSize = 0.15f;
+            const Vector3 arrowTip1 = Vector3Add(endPos, Vector3Scale(Vector3Subtract(Vector3Scale(dir, -1.0f), right), arrowSize));
+            const Vector3 arrowTip2 = Vector3Add(endPos, Vector3Scale(Vector3Add(Vector3Scale(dir, -1.0f), right), arrowSize));
+            DrawLine3D(endPos, arrowTip1, PURPLE);
+            DrawLine3D(endPos, arrowTip2, PURPLE);
+            DrawSphere(endPos, 0.03f, PURPLE);
+        }
     }
 
     // Re-Enable Depth Test
@@ -1984,6 +2098,8 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         // Animation settings
         ImGuiAnimSettings(&app->config);
+
+        ImGuiPlayerControl(&app->controlledCharacter);
 
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
@@ -2237,7 +2353,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
-    TestCudaAndLibtorch();
+    //TestCudaAndLibtorch();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;
@@ -2405,6 +2521,7 @@ int main(int argc, char** argv)
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
+                //"data\\lafan\\bvh\\dance1_subject2.bvh"
             };
             for (const char* file : autoFiles)
             {

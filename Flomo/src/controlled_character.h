@@ -15,6 +15,17 @@
 
 using std::vector;
 
+
+//----------------------------------------------------------------------------------
+// Player Control Input
+//----------------------------------------------------------------------------------
+
+struct PlayerControlInput {
+    Vector3 desiredVelocity = Vector3Zero();  // Desired velocity in world space (XZ plane)
+    float maxSpeed = 2.0f;                     // Maximum movement speed (m/s)
+};
+
+
 //----------------------------------------------------------------------------------
 // Blend Cursor - individual animation playback cursor with weight
 //----------------------------------------------------------------------------------
@@ -117,11 +128,6 @@ struct ControlledCharacter {
     bool velBlendInitialized = false;
     bool useVelBlending = false;               // toggle for enabling velocity-based blending
 
-    // Separate hips rotation smoothing (no vel blending, just lerp with different blend time)
-    Rot6d hipsSmoothedRot6d = Rot6dIdentity();
-    float hipsRotationBlendTime = 0.3f;         // typically longer than blendPosReturnTime
-    bool hipsInitialized = false;
-
     // Smoothed root motion state
     Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
     float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
@@ -136,6 +142,12 @@ struct ControlledCharacter {
     // Virtual toe positions - move with blended velocity, used for IK targets
     Vector3 virtualToePos[SIDES_COUNT];
     bool virtualToeInitialized = false;
+    // Virtual toe locking system
+    float virtualToeUnlockTimer[SIDES_COUNT] = { -1.0f, -1.0f };  // -1 = locked, >=0 = unlocked
+
+    PlayerControlInput playerInput;
+
+
 };
 
 // Initialize the controlled character when first animation is loaded
@@ -200,10 +212,6 @@ static void ControlledCharacterInit(
     cc->velBlendedRotations6d.resize(cc->xformData.jointCount);
     cc->velBlendInitialized = false;
     cc->useVelBlending = false;
-
-    // Hips rotation smoothing state
-    cc->hipsSmoothedRot6d = Rot6dIdentity();
-    cc->hipsInitialized = false;
 
     // Smoothed root motion state
     cc->smoothedRootVelocity = Vector3Zero();
@@ -691,27 +699,9 @@ static void ControlledCharacterUpdate(
             }
         }
 
-        // Hips (joint 0) uses separate smoothing with its own blend time (no velocity integration)
-        {
-            if (!cc->hipsInitialized)
-            {
-                cc->hipsSmoothedRot6d = blendedRot6d[0];
-                cc->hipsInitialized = true;
-            }
-
-            const float hipsBlendTime = cc->hipsRotationBlendTime;
-            if (hipsBlendTime > 1e-6f)
-            {
-                const float alpha = 1.0f - powf(0.5f, dt / hipsBlendTime);
-                Rot6dLerp(cc->hipsSmoothedRot6d, blendedRot6d[0], alpha, cc->hipsSmoothedRot6d);
-            }
-            else
-            {
-                cc->hipsSmoothedRot6d = blendedRot6d[0];
-            }
-
-            Rot6dToQuaternion(cc->hipsSmoothedRot6d, cc->xformData.localRotations[0]);
-        }
+        // Hips (joint 0) - no additional smoothing, no velblending
+        // Just use the blended rotation directly, cursor weight blending is enough
+        Rot6dToQuaternion(blendedRot6d[0], cc->xformData.localRotations[0]);
 
         // Other joints (1+): velocity-based blending if enabled
         if (cc->useVelBlending)
@@ -808,7 +798,8 @@ static void ControlledCharacterUpdate(
     }
     cc->toeTrackingInitialized = true;
 
-    // Update virtual toe positions - integrate blended velocity
+    // Update virtual toe positions
+    // Move towards blended cursor XZ target at speed limited by blended cursor toe speed
     for (int side : sides)
     {
         const int toeIdx = db->toeIndices[side];
@@ -822,11 +813,11 @@ static void ControlledCharacterUpdate(
             continue;
         }
 
-        const Vector3 fkToePos = cc->xformData.globalPositions[toeIdx];
-
-        // Blend toe heights from cursors (before local-space blending distorts height)
-        float blendedToeHeight = 0.0f;
-        float totalWeight = 0.0f;
+        // Blend toe position and speed from cursors using normalized weights
+        float blendedToeX = 0.0f;
+        float blendedToeY = 0.0f;
+        float blendedToeZ = 0.0f;
+        float blendedSpeed = 0.0f;
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
             const BlendCursor& cur = cc->cursors[ci];
@@ -834,50 +825,107 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
-            // Use the global position from this cursor's FK (already in world space)
             if (toeIdx < (int)cur.globalPositions.size())
             {
-                blendedToeHeight += cur.globalPositions[toeIdx].y * w;
-                totalWeight += w;
+                blendedToeX += cur.globalPositions[toeIdx].x * w;
+                blendedToeY += cur.globalPositions[toeIdx].y * w;
+                blendedToeZ += cur.globalPositions[toeIdx].z * w;
             }
+
+            // blend speed magnitude (XZ only)
+            const float velX = cur.globalToeVelocity[side].x;
+            const float velZ = cur.globalToeVelocity[side].z;
+            const float speedXZ = sqrtf(velX * velX + velZ * velZ);
+            blendedSpeed += speedXZ * w;
         }
 
-        // Normalize if we got valid weights (should always be the case if cursors are active)
-        if (totalWeight > 1e-6f)
-        {
-            blendedToeHeight /= totalWeight;
-        }
-        else
-        {
-            // Fallback to FK height if no cursors active (shouldn't happen)
-            blendedToeHeight = fkToePos.y;
-        }
+        static constexpr float UNLOCK_DISTANCE = 0.2f;        // distance threshold to unlock
+        static constexpr float UNLOCK_DURATION = 0.3f;        // time to gradually re-lock (seconds)
+
 
         if (!cc->virtualToeInitialized)
         {
-            // Initialize from FK toe position
-            cc->virtualToePos[side] = fkToePos;
-            cc->virtualToePos[side].y = blendedToeHeight; // Use cursor-blended height even on init
+            cc->virtualToePos[side] = Vector3{ blendedToeX, blendedToeY, blendedToeZ };
             TraceLog(LOG_INFO, "Virtual toe: initialized %s toe at (%.2f, %.2f, %.2f)",
                 StringFromSide(side), cc->virtualToePos[side].x, cc->virtualToePos[side].y, cc->virtualToePos[side].z);
         }
         else
         {
-            // Integrate blended velocity for XZ position only
-            Vector3 velocityDelta = Vector3Scale(cc->toeBlendedVelocity[side], dt);
-            cc->virtualToePos[side].x += velocityDelta.x;
-            cc->virtualToePos[side].z += velocityDelta.z;
+            // Y always follows cursor-blended height directly
+            cc->virtualToePos[side].y = blendedToeY;
 
-            // Y-height comes from cursor-blended global positions (not FK result after local blending)
-            // This prevents ground penetration when blending animations with feet on opposite sides
-            cc->virtualToePos[side].y = blendedToeHeight;
+            // XZ: move towards blended target, speed limit scales with blended cursor speed
+            // At low speeds (<=0.5 m/s): 1.2x multiplier
+            // At high speeds (>=2.0 m/s): faster (cubic interpolation in between)
+            const float dx = blendedToeX - cc->virtualToePos[side].x;
+            const float dz = blendedToeZ - cc->virtualToePos[side].z;
+            const float distXZ = sqrtf(dx * dx + dz * dz);
 
-            // Viscous return toward FK position (XZ only, Y is always from cursor blend)
-            const float returnBlendTime = 0.1f;
-            const float returnAlpha = 1.0f - expf(-dt / returnBlendTime);
-            cc->virtualToePos[side].x = Lerp(cc->virtualToePos[side].x, fkToePos.x, returnAlpha);
-            cc->virtualToePos[side].z = Lerp(cc->virtualToePos[side].z, fkToePos.z, returnAlpha);
-            // Y is already set to blendedToeHeight above, no lerp needed
+
+            // Check if we should unlock (distance exceeds threshold and not already unlocked)
+            if (distXZ > UNLOCK_DISTANCE && cc->virtualToeUnlockTimer[side] < 0.0f)
+            {
+                cc->virtualToeUnlockTimer[side] = UNLOCK_DURATION;
+                TraceLog(LOG_INFO, "Virtual toe %s unlocked: distance %.3f > %.3f",
+                    StringFromSide(side), distXZ, UNLOCK_DISTANCE);
+            }
+
+            // Update unlock timer (countdown to re-lock)
+            if (cc->virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                cc->virtualToeUnlockTimer[side] -= dt;
+                if (cc->virtualToeUnlockTimer[side] < 0.0f)
+                {
+                    cc->virtualToeUnlockTimer[side] = -1.0f;  // back to locked
+                }
+            }
+
+            if (distXZ > 1e-6f && dt > 1e-6f)
+            {
+                const float lowSpeed = 0.5f;
+                const float highSpeed = 2.0f;
+                const float lowMult = 1.2f;
+                const float highMult = 1.5f;
+                const float t = Clamp((blendedSpeed - lowSpeed) / (highSpeed - lowSpeed), 0.0f, 1.0f);
+                const float speedMultiplier = lowMult + (highMult - lowMult) * Smoothstep(t);
+                const float maxSpeed = blendedSpeed * speedMultiplier;
+                const float maxDist = maxSpeed * dt;
+
+                if (distXZ <= maxDist)
+                {
+                    // can reach target this frame
+                    cc->virtualToePos[side].x = blendedToeX;
+                    cc->virtualToePos[side].z = blendedToeZ;
+                }
+                else
+                {
+                    // move towards target at max speed
+                    const float scale = maxDist / distXZ;
+                    cc->virtualToePos[side].x += dx * scale;
+                    cc->virtualToePos[side].z += dz * scale;
+                }
+            }
+        }
+
+
+        // If unlocked, apply final clamp towards FK blended position
+        // Clamp distance decreases linearly from UNLOCK_DISTANCE to 0 over UNLOCK_DURATION
+        if (cc->virtualToeUnlockTimer[side] >= 0.0f)
+        {
+            float unlockProgress = cc->virtualToeUnlockTimer[side] / UNLOCK_DURATION;
+            unlockProgress = Smoothstep(unlockProgress);  
+            const float maxClampDist = (UNLOCK_DISTANCE * 1.05f) * unlockProgress;
+
+            const float dxFinal = blendedToeX - cc->virtualToePos[side].x;
+            const float dzFinal = blendedToeZ - cc->virtualToePos[side].z;
+            const float distFinal = sqrtf(dxFinal * dxFinal + dzFinal * dzFinal);
+
+            if (distFinal > maxClampDist)
+            {
+                const float clampScale = maxClampDist / distFinal;
+                cc->virtualToePos[side].x = blendedToeX - dxFinal * clampScale;
+                cc->virtualToePos[side].z = blendedToeZ - dzFinal * clampScale;
+            }
         }
     }
     cc->virtualToeInitialized = true;
@@ -911,13 +959,7 @@ static void ControlledCharacterUpdate(
 
             if (!legIdx.IsValid()) continue;
 
-            // Solve IK with flat foot (0.0) for walking
-            // virtualToePos is already in world space, and hip global transform is world space
-
-            Vector3 hackToePos = cc->virtualToePos[side];
-            //hackToePos.y -= 0.5f;
-
-            SolveLegIKInPlace(&cc->xformData, legIdx, hackToePos, config.footIKRatio);
+            SolveLegIKInPlace(&cc->xformData, legIdx, cc->virtualToePos[side]);
         }
     }
 }

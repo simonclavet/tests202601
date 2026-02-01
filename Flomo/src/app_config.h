@@ -70,12 +70,15 @@ struct AppConfig {
     // Velocity-based blending
     bool useVelBlending = false;    // enable velocity-based rotation blending
     float blendPosReturnTime = 0.1f; // time to bring the velocity advanced pose to the blended position
-    float hipsRotationBlendTime = 0.2f;   // separate blendtime for hips (no vel blending, just lerp)
 
     // Foot IK
     bool enableFootIK = true;  // enable/disable foot IK towards virtual toe positions
-    float footIKRatio = 0.0f;  // 0.0 = flat foot (walking), 1.0 = pointed foot (swimming/falling)
-
+    bool enableTimedUnlocking = true;  // enable/disable timed unlock mechanism for virtual toes
+    float unlockDistance = 0.2f;  // distance threshold to unlock virtual toe (meters)
+    float unlockDuration = 0.3f;  // time to gradually re-lock virtual toe (seconds)
+    
+    
+    bool drawPlayerInput = false;
 
     // Validity
     bool valid = false;
@@ -184,10 +187,13 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
 
     config.useVelBlending = ResolveBoolConfig(buffer, "useVelBlending", config.useVelBlending, argc, argv);
     config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
-    config.hipsRotationBlendTime = ResolveFloatConfig(buffer, "hipsRotationBlendTime", config.hipsRotationBlendTime, argc, argv);
+    
     config.enableFootIK = ResolveBoolConfig(buffer, "enableFootIK", config.enableFootIK, argc, argv);
-    config.footIKRatio = ResolveFloatConfig(buffer, "footIKRatio", config.footIKRatio, argc, argv);
-    //if (buffer) free(buffer);
+    
+    config.enableTimedUnlocking = ResolveBoolConfig(buffer, "enableTimedUnlocking", config.enableTimedUnlocking, argc, argv);
+    config.unlockDistance = ResolveFloatConfig(buffer, "unlockDistance", config.unlockDistance, argc, argv);
+    config.unlockDuration = ResolveFloatConfig(buffer, "unlockDuration", config.unlockDuration, argc, argv);
+    config.drawPlayerInput = ResolveBoolConfig(buffer, "drawPlayerInput", false, argc, argv);
 
     // Validate window values
     if (config.windowX >= 0 && config.windowY >= 0 &&
@@ -261,8 +267,12 @@ static inline void SaveAppConfig(const AppConfig& cfg)
 
     fprintf(file, "    \"useVelBlending\": %s,\n", cfg.useVelBlending ? "true" : "false");
     fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", cfg.blendPosReturnTime);
-    fprintf(file, "    \"hipsRotationBlendTime\": %.4f,\n", cfg.hipsRotationBlendTime);
-    fprintf(file, "    \"footIKRatio\": %.4f\n", cfg.footIKRatio);
+    fprintf(file, "    \"enableFootIK\": %s,\n", cfg.enableFootIK ? "true" : "false");
+    
+    fprintf(file, "    \"enableTimedUnlocking\": %s,\n", cfg.enableTimedUnlocking ? "true" : "false");
+    fprintf(file, "    \"unlockDistance\": %.4f,\n", cfg.unlockDistance);
+    fprintf(file, "    \"unlockDuration\": %.4f,\n", cfg.unlockDuration);
+    fprintf(file, "    \"drawPlayerInput\": %s\n", cfg.drawPlayerInput ? "true" : "false");
 
     fprintf(file, "}\n");
 
