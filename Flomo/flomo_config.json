@@ -39,16 +39,19 @@
     "drawAccelerations": false,
     "drawRootVelocities": false,
     "drawToeVelocities": false,
-    "drawFootIK": false,
-    "defaultBlendTime": 0.2800,
-    "switchInterval": 0.5300,
-    "useVelBlending": true,
+    "drawFootIK": true,
+    "animationMode": 0,
+    "defaultBlendTime": 0.2500,
+    "switchInterval": 0.8800,
+    "mmSearchPeriod": 0.1000,
+    "poseDragLookaheadTime": 0.2000,
+    "cursorBlendMode": 2,
     "blendPosReturnTime": 0.0700,
     "enableFootIK": true,
     "enableTimedUnlocking": true,
     "unlockDistance": 0.1800,
     "unlockDuration": 0.3400,
-    "drawPlayerInput": false
+    "drawPlayerInput": true
   "motionMatchingConfig": {
   "featureWeights": {
     "Toe Position": 1,

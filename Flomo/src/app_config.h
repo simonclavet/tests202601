@@ -9,13 +9,51 @@
 
 
 
+// Animation playback mode for controlled character
+enum class AnimationMode : int
+{
+    RandomSwitch = 0,   // randomly switch between animations
+    MotionMatching,     // use motion matching to find best animation
+    COUNT
+};
+
+static inline const char* AnimationModeName(AnimationMode mode)
+{
+    switch (mode)
+    {
+    case AnimationMode::RandomSwitch: return "Random Switch";
+    case AnimationMode::MotionMatching: return "Motion Matching";
+    default: return "Unknown";
+    }
+}
+
+// Cursor blend mode - how cursor rotations are blended
+enum class CursorBlendMode : int
+{
+    Basic = 0,           // direct weighted average of cursor rotations
+    VelBlending,         // velocity-driven blending with lerp to target
+    LookaheadDragging,   // lerp towards extrapolated future pose
+    COUNT
+};
+
+static inline const char* CursorBlendModeName(CursorBlendMode mode)
+{
+    switch (mode)
+    {
+    case CursorBlendMode::Basic: return "Basic";
+    case CursorBlendMode::VelBlending: return "Vel Blending";
+    case CursorBlendMode::LookaheadDragging: return "Lookahead Dragging";
+    default: return "Unknown";
+    }
+}
+
 // Motion Matching Feature Types
 enum class FeatureType : int
 {
     ToePos = 0,          // left+right toe positions (X,Z) => 4 dims
     ToeVel,              // left+right toe velocities (X,Z) => 4 dims
     ToeDiff,             // left-right difference (X,Z) => 2 dims
-    FutureVelDir,        // future root velocity direction (XZ) at sample points => 2 * points
+    FutureVel,        // future root velocity (XZ) at sample points => 2 * points
 
     COUNT                // Must be last - used for array sizing
 };
@@ -28,7 +66,7 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::ToePos: return "Toe Position";
     case FeatureType::ToeVel: return "Toe Velocity";
     case FeatureType::ToeDiff: return "Toe Difference";
-    case FeatureType::FutureVelDir: return "Future Velocity";
+    case FeatureType::FutureVel: return "Future Velocity";
     default: return "Unknown";
     }
 }
@@ -176,12 +214,15 @@ struct AppConfig {
     bool drawFootIK = false;         // Draw foot IK debug (virtual toe positions, etc.)
 
     // Animation settings
+    AnimationMode animationMode = AnimationMode::RandomSwitch;  // animation playback mode
     float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
     float switchInterval = 3.0f;    // time between random animation switches
+    float mmSearchPeriod = 0.1f;    // time between motion matching searches
+    float poseDragLookaheadTime = 0.1f;  // lookahead time for pose dragging (seconds)
 
-    // Velocity-based blending
-    bool useVelBlending = false;    // enable velocity-based rotation blending
-    float blendPosReturnTime = 0.1f; // time to bring the velocity advanced pose to the blended position
+    // Cursor blend mode settings
+    CursorBlendMode cursorBlendMode = CursorBlendMode::Basic;
+    float blendPosReturnTime = 0.1f; // time for velblending to lerp towards target
 
     // Foot IK
     bool enableFootIK = true;  // enable/disable foot IK towards virtual toe positions
@@ -311,12 +352,15 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawToeVelocities = ResolveBoolConfig(buffer, "drawToeVelocities", config.drawToeVelocities, argc, argv);
     config.drawFootIK = ResolveBoolConfig(buffer, "drawFootIK", config.drawFootIK, argc, argv);
 
+    config.animationMode = static_cast<AnimationMode>(ResolveIntConfig(buffer, "animationMode", static_cast<int>(config.animationMode), argc, argv));
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
+    config.mmSearchPeriod = ResolveFloatConfig(buffer, "mmSearchPeriod", config.mmSearchPeriod, argc, argv);
+    config.poseDragLookaheadTime = ResolveFloatConfig(buffer, "poseDragLookaheadTime", config.poseDragLookaheadTime, argc, argv);
 
-    config.useVelBlending = ResolveBoolConfig(buffer, "useVelBlending", config.useVelBlending, argc, argv);
+    config.cursorBlendMode = static_cast<CursorBlendMode>(ResolveIntConfig(buffer, "cursorBlendMode", static_cast<int>(config.cursorBlendMode), argc, argv));
     config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
-    
+
     config.enableFootIK = ResolveBoolConfig(buffer, "enableFootIK", config.enableFootIK, argc, argv);
     
     config.enableTimedUnlocking = ResolveBoolConfig(buffer, "enableTimedUnlocking", config.enableTimedUnlocking, argc, argv);
@@ -430,10 +474,13 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     fprintf(file, "    \"drawToeVelocities\": %s,\n", cfg.drawToeVelocities ? "true" : "false");
     fprintf(file, "    \"drawFootIK\": %s,\n", cfg.drawFootIK ? "true" : "false");
 
+    fprintf(file, "    \"animationMode\": %d,\n", static_cast<int>(cfg.animationMode));
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
     fprintf(file, "    \"switchInterval\": %.4f,\n", cfg.switchInterval);
+    fprintf(file, "    \"mmSearchPeriod\": %.4f,\n", cfg.mmSearchPeriod);
+    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", cfg.poseDragLookaheadTime);
 
-    fprintf(file, "    \"useVelBlending\": %s,\n", cfg.useVelBlending ? "true" : "false");
+    fprintf(file, "    \"cursorBlendMode\": %d,\n", static_cast<int>(cfg.cursorBlendMode));
     fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", cfg.blendPosReturnTime);
     fprintf(file, "    \"enableFootIK\": %s,\n", cfg.enableFootIK ? "true" : "false");
     

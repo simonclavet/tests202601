@@ -12,6 +12,7 @@
 #include "bvh_parser.h"
 #include "transform_data.h"
 #include "character_data.h"
+#include "app_config.h"
 
 //----------------------------------------------------------------------------------
 // Animation Database
@@ -22,6 +23,9 @@ struct AnimDatabase
 {
     // Motion matching feature configuration
     MotionMatchingFeaturesConfig featuresConfig;
+
+    // Pose drag lookahead time (seconds) - used for precomputing lookahead poses
+    float poseDragLookaheadTime = 0.1f;
 
     // References to all loaded animations
     int animCount = -1;
@@ -59,6 +63,9 @@ struct AnimDatabase
     Array2D<Rot6d> localJointRotations6d;           // local rotations as Rot6d [motionFrameCount x jointCount]
     Array2D<Vector3> localJointAngularVelocities;   // local angular velocities [motionFrameCount x jointCount]
 
+    // lookahead pose for inertial dragging: pose[f] + 3*(pose[f] - pose[f-1])
+    Array2D<Rot6d> lookaheadLocalRotations6d;       // [motionFrameCount x jointCount]
+
     // Segmentation of the compacted motion DB into clips:
     // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
     std::vector<int> clipStartFrame;
@@ -73,6 +80,11 @@ struct AnimDatabase
     int lowlegIndices[SIDES_COUNT] = { -1, -1 };  // shin/calf
     int uplegIndices[SIDES_COUNT] = { -1, -1 };   // thigh
     std::vector<std::string> featureNames;
+    std::vector<FeatureType> featureTypes;      // which FeatureType each feature dimension belongs to
+
+    std::vector<float> featuresMean;            // mean of each feature dimension [featureDim]
+    std::vector<float> featuresStd;             // standard deviation of each feature dimension [featureDim]
+    Array2D<float> normalizedFeatures;          // normalized features [motionFrameCount x featureDim]
 };
 
 static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
@@ -103,11 +115,30 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointPositions.clear();
     db->localJointRotations6d.clear();
     db->localJointAngularVelocities.clear();
+    db->lookaheadLocalRotations6d.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
     db->features.clear();
     db->featureDim = 0;
     db->featureNames.clear();
+    db->featureTypes.clear();
+    db->featuresMean.clear();
+    db->featuresStd.clear();
+    db->normalizedFeatures.clear();
+}
+
+// Compute feature normalization statistics and normalized features
+static void AnimDatabaseComputeFeatureNormalization(AnimDatabase* db)
+{
+    using std::span;
+
+    if (db->featureDim <= 0 || db->motionFrameCount <= 0)
+    {
+        TraceLog(LOG_WARNING, "AnimDatabase: Cannot normalize features (featureDim=%d, motionFrameCount=%d)",
+            db->featureDim, db->motionFrameCount);
+        return;
+    }
+
 }
 
 // Updated AnimDatabaseRebuild: require all animations to match canonical skeleton.
@@ -131,6 +162,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->localJointPositions.clear();
     db->localJointRotations6d.clear();
     db->localJointAngularVelocities.clear();
+    db->lookaheadLocalRotations6d.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
     db->valid = false; // pessimistic until proven valid
@@ -205,6 +237,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->localJointPositions.resize(db->motionFrameCount, db->jointCount);
     db->localJointRotations6d.resize(db->motionFrameCount, db->jointCount);
     db->localJointAngularVelocities.resize(db->motionFrameCount, db->jointCount);
+    db->lookaheadLocalRotations6d.resize(db->motionFrameCount, db->jointCount);
 
     // sample each compatible clip frame and fill the flat arrays
     TransformData tmpXform;
@@ -358,6 +391,53 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
     }
 
+    // Compute lookahead poses: pose[f] + n * (pose[f] - pose[f-1]) = (1+n)*pose[f] - n*pose[f-1]
+    // where n = lookaheadTime / frameTime (extrapolates lookaheadTime seconds ahead)
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float n = db->poseDragLookaheadTime / frameTime;
+        const float currWeight = 1.0f + n;
+        const float prevWeight = n;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isFirstFrame = (f == clipStart);
+
+            span<Rot6d> lookaheadRow = db->lookaheadLocalRotations6d.row_view(f);
+            span<const Rot6d> currRow = db->localJointRotations6d.row_view(f);
+
+            if (isFirstFrame || clipEnd - clipStart <= 1)
+            {
+                // no previous frame to extrapolate from, just copy current
+                for (int j = 0; j < db->jointCount; ++j)
+                {
+                    lookaheadRow[j] = currRow[j];
+                }
+            }
+            else
+            {
+                span<const Rot6d> prevRow = db->localJointRotations6d.row_view(f - 1);
+
+                for (int j = 0; j < db->jointCount; ++j)
+                {
+                    // lookahead = (1+n)*curr - n*prev
+                    Rot6d result;
+                    result.ax = currWeight * currRow[j].ax - prevWeight * prevRow[j].ax;
+                    result.ay = currWeight * currRow[j].ay - prevWeight * prevRow[j].ay;
+                    result.az = currWeight * currRow[j].az - prevWeight * prevRow[j].az;
+                    result.bx = currWeight * currRow[j].bx - prevWeight * prevRow[j].bx;
+                    result.by = currWeight * currRow[j].by - prevWeight * prevRow[j].by;
+                    result.bz = currWeight * currRow[j].bz - prevWeight * prevRow[j].bz;
+                    Rot6dNormalize(result);
+                    lookaheadRow[j] = result;
+                }
+            }
+        }
+    }
+
     TraceLog(LOG_INFO, "AnimDatabase: built motion DB with %d frames and %d joints",
         db->motionFrameCount, db->jointCount);
 
@@ -482,13 +562,19 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     if (cfg.IsFeatureEnabled(FeatureType::ToePos)) db->featureDim += 4;
     if (cfg.IsFeatureEnabled(FeatureType::ToeVel)) db->featureDim += 4;
     if (cfg.IsFeatureEnabled(FeatureType::ToeDiff)) db->featureDim += 2;
-    if (cfg.IsFeatureEnabled(FeatureType::FutureVelDir)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVel)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
 
     db->features.clear();
     db->featureNames.clear();
 
     db->features.resize(db->motionFrameCount, db->featureDim);
     db->features.fill(0.0f);
+
+    if (db->featureDim == 0)
+    {
+        TraceLog(LOG_WARNING, "AnimDatabase: no features enabled in configuration");
+        return;
+    }
 
     // Populate features from jointPositions and jointRotations
     for (int f = 0; f < db->motionFrameCount; ++f)
@@ -558,6 +644,10 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 db->featureNames.push_back(string("LeftToePosZ"));
                 db->featureNames.push_back(string("RightToePosX"));
                 db->featureNames.push_back(string("RightToePosZ"));
+                db->featureTypes.push_back(FeatureType::ToePos);
+                db->featureTypes.push_back(FeatureType::ToePos);
+                db->featureTypes.push_back(FeatureType::ToePos);
+                db->featureTypes.push_back(FeatureType::ToePos);
             }
         }
 
@@ -598,6 +688,10 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 db->featureNames.push_back(string("LeftToeVelZ"));
                 db->featureNames.push_back(string("RightToeVelX"));
                 db->featureNames.push_back(string("RightToeVelZ"));
+                db->featureTypes.push_back(FeatureType::ToeVel);
+                db->featureTypes.push_back(FeatureType::ToeVel);
+                db->featureTypes.push_back(FeatureType::ToeVel);
+                db->featureTypes.push_back(FeatureType::ToeVel);
             }
         }
 
@@ -613,11 +707,13 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {
                 db->featureNames.push_back(string("ToeDiffX"));
                 db->featureNames.push_back(string("ToeDiffZ"));
+                db->featureTypes.push_back(FeatureType::ToeDiff);
+                db->featureTypes.push_back(FeatureType::ToeDiff);
             }
-        }
+        }        
 
         // FUTURE TRAJECTORY: future root velocity direction (XZ) at sample points
-        if (cfg.IsFeatureEnabled(FeatureType::FutureVelDir))
+        if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
         {
             const float frameTime = db->animFrameTime[clipIdx];
 
@@ -662,15 +758,81 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelZ_%.2fs", futureTime);
                     db->featureNames.push_back(string(nameBufX));
                     db->featureNames.push_back(string(nameBufZ));
+                    db->featureTypes.push_back(FeatureType::FutureVel);
+                    db->featureTypes.push_back(FeatureType::FutureVel);
                 }
             }
 
+        
         }
 
         assert(currentFeature == db->featureDim);
     }
 
-    TraceLog(LOG_INFO, "AnimDatabase: built %d 4D features (left-toe pos+vel in hips frame)", db->motionFrameCount);
+
+    // Allocate mean and std vectors
+    db->featuresMean.resize(db->featureDim, 0.0f);
+    db->featuresStd.resize(db->featureDim, 0.0f);
+
+    // Compute mean for each feature dimension
+    for (int d = 0; d < db->featureDim; ++d)
+    {
+        double sum = 0.0;
+        for (int f = 0; f < db->motionFrameCount; ++f)
+        {
+            sum += db->features.at(f, d);
+        }
+        db->featuresMean[d] = (float)(sum / db->motionFrameCount);
+    }
+
+    // Compute standard deviation for each feature dimension
+    for (int d = 0; d < db->featureDim; ++d)
+    {
+        double sumSquaredDiff = 0.0;
+        for (int f = 0; f < db->motionFrameCount; ++f)
+        {
+            const double diff = db->features.at(f, d) - db->featuresMean[d];
+            sumSquaredDiff += diff * diff;
+        }
+        const double variance = sumSquaredDiff / db->motionFrameCount;
+        db->featuresStd[d] = (float)std::sqrt(variance);
+
+        // Avoid division by zero - use 1.0 if std is too small
+        if (db->featuresStd[d] < 1e-8f)
+        {
+            db->featuresStd[d] = 1.0f;
+        }
+    }
+
+    // Compute normalized features: (x - mean) / std
+    db->normalizedFeatures.resize(db->motionFrameCount, db->featureDim);
+    for (int f = 0; f < db->motionFrameCount; ++f)
+    {
+        span<const float> featRow = db->features.row_view(f);
+        span<float> normRow = db->normalizedFeatures.row_view(f);
+
+        for (int d = 0; d < db->featureDim; ++d)
+        {
+            normRow[d] = (featRow[d] - db->featuresMean[d]) / db->featuresStd[d];
+        }
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: computed feature normalization (mean/std for %d dimensions)", db->featureDim);
+
+    // Apply feature type weights to normalized features
+    for (int f = 0; f < db->motionFrameCount; ++f)
+    {
+        span<float> normRow = db->normalizedFeatures.row_view(f);
+
+        for (int d = 0; d < db->featureDim; ++d)
+        {
+            const FeatureType featureType = db->featureTypes[d];
+            const float weight = cfg.GetFeatureWeight(featureType);
+            normRow[d] *= weight;
+        }
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: applied feature type weights to normalized features");
 }
 
 // Convert global frame index to (animIndex, localFrame)
@@ -735,6 +897,7 @@ static inline void GetInterFrameAlpha(
 
 // sample interpolated local pose from AnimDatabase at time animTime, using Rot6d for rotations
 // optionally also samples angular velocities if outAngularVelocities is not null
+// optionally also samples lookahead rotations if outLookaheadRotations6d is not null
 // velocityTimeOffset: offset added to animTime when sampling velocities (use -dt/2 for midpoint sampling)
 static inline void SampleCursorPoseLerp6d(
     const AnimDatabase* db,
@@ -744,6 +907,7 @@ static inline void SampleCursorPoseLerp6d(
     std::vector<Vector3>& outPositions,
     std::vector<Rot6d>& outRotations6d,
     std::vector<Vector3>* outAngularVelocities,
+    std::vector<Rot6d>* outLookaheadRotations6d,
     Vector3* outRootPos,
     Rot6d* outRootRot6d)
 {
@@ -780,6 +944,17 @@ static inline void SampleCursorPoseLerp6d(
         for (int j = 0; j < jointCount; ++j)
         {
             (*outAngularVelocities)[j] = Vector3Lerp(velRow0[j], velRow1[j], vAlpha);
+        }
+    }
+
+    // sample lookahead rotations (extrapolated poses for lookahead dragging)
+    if (outLookaheadRotations6d)
+    {
+        span<const Rot6d> laRow0 = db->lookaheadLocalRotations6d.row_view(clipStart + f0);
+        span<const Rot6d> laRow1 = db->lookaheadLocalRotations6d.row_view(clipStart + f1);
+        for (int j = 0; j < jointCount; ++j)
+        {
+            Rot6dLerp(laRow0[j], laRow1[j], alpha, (*outLookaheadRotations6d)[j]);
         }
     }
 

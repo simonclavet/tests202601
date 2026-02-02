@@ -549,21 +549,30 @@ void Rot6dLerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
     const float nby = start.by * invT + end.by * t;
     const float nbz = start.bz * invT + end.bz * t;
 
+    // Normalize a-column
     const float invLenA = FastInvSqrt(nax * nax + nay * nay + naz * naz);
-    out.ax = nax * invLenA;
-    out.ay = nay * invLenA;
-    out.az = naz * invLenA;
+    const float ax = nax * invLenA;
+    const float ay = nay * invLenA;
+    const float az = naz * invLenA;
 
-    const float dot = out.ax * nbx + out.ay * nby + out.az * nbz;
-    const float rbx = nbx - dot * out.ax;
-    const float rby = nby - dot * out.ay;
-    const float rbz = nbz - dot * out.az;
+    // Gram-Schmidt: remove a-component from b
+    const float dot = ax * nbx + ay * nby + az * nbz;
+    const float rbx = nbx - dot * ax;
+    const float rby = nby - dot * ay;
+    const float rbz = nbz - dot * az;
 
+    // Normalize b-column
     const float invLenB = FastInvSqrt(rbx * rbx + rby * rby + rbz * rbz);
+
+    // Write all results at once (safe for aliasing)
+    out.ax = ax;
+    out.ay = ay;
+    out.az = az;
     out.bx = rbx * invLenB;
     out.by = rby * invLenB;
     out.bz = rbz * invLenB;
 }
+
 void Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
 {
     Quaternion qStart, qEnd;

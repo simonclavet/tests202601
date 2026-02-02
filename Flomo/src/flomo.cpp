@@ -770,10 +770,41 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
     if (ImGui::Begin("Anim Settings")) {
         ImGui::SliderFloat("Blend Time", &config->defaultBlendTime, 0.0f, 2.0f, "%.2f s");
         ImGui::SliderFloat("Switch Interval", &config->switchInterval, 0.1f, 5.0f, "%.2f s");
+        ImGui::SliderFloat("MM Search Period", &config->mmSearchPeriod, 0.01f, 1.0f, "%.2f s");
         ImGui::Separator();
-        ImGui::Checkbox("Vel Blending", &config->useVelBlending);
-        if (config->useVelBlending) {
+        // Cursor blend mode dropdown
+        if (ImGui::BeginCombo("Blend Mode", CursorBlendModeName(config->cursorBlendMode)))
+        {
+            for (int i = 0; i < static_cast<int>(CursorBlendMode::COUNT); ++i)
+            {
+                const bool isSelected = (static_cast<int>(config->cursorBlendMode) == i);
+                if (ImGui::Selectable(CursorBlendModeName(static_cast<CursorBlendMode>(i)), isSelected))
+                {
+                    config->cursorBlendMode = static_cast<CursorBlendMode>(i);
+                }
+                if (isSelected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (config->cursorBlendMode == CursorBlendMode::VelBlending)
+        {
             ImGui::SliderFloat("Return Blend Time", &config->blendPosReturnTime, 0.01f, 1.0f, "%.2f s");
+        }
+        else if (config->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+        {
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputFloat("Lookahead Time", &config->poseDragLookaheadTime, 0.0f, 0.0f, "%.3f"))
+            {
+                // Clamp to reasonable range
+                if (config->poseDragLookaheadTime < 0.03f) config->poseDragLookaheadTime = 0.03f;
+                if (config->poseDragLookaheadTime > 0.2f) config->poseDragLookaheadTime = 0.2f;
+                // Rebuild database with new lookahead time
+                app->animDatabase.poseDragLookaheadTime = config->poseDragLookaheadTime;
+                AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
+            }
         }
 
         ImGui::Separator();
@@ -876,28 +907,57 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
 
             if (configChanged)
             {
-                // Rebuild animation database with new feature config
+                // Rebuild animation database with new config
                 db.featuresConfig = mmConfig;
+                db.poseDragLookaheadTime = config->poseDragLookaheadTime;
                 AnimDatabaseRebuild(&db, &app->characterData);
-                TraceLog(LOG_INFO, "Motion matching features updated");
+                TraceLog(LOG_INFO, "Motion matching config updated");
             }
         }
     }
     ImGui::End();
 }
 
-static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter)
+static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, AppConfig* config)
 {
     if (!controlledCharacter->active) return;
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(200, 100), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Player Control")) {
+    ImGui::SetNextWindowSize(ImVec2(220, 130), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Player Control"))
+    {
+        // Animation mode dropdown (stored in config for persistence)
+        int currentMode = static_cast<int>(config->animationMode);
+        if (ImGui::BeginCombo("Mode", AnimationModeName(config->animationMode)))
+        {
+            for (int i = 0; i < static_cast<int>(AnimationMode::COUNT); ++i)
+            {
+                const bool isSelected = (currentMode == i);
+                if (ImGui::Selectable(AnimationModeName(static_cast<AnimationMode>(i)), isSelected))
+                {
+                    config->animationMode = static_cast<AnimationMode>(i);
+                }
+                if (isSelected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
         PlayerControlInput& input = controlledCharacter->playerInput;
         ImGui::SliderFloat("Max Speed", &input.maxSpeed, 0.1f, 10.0f, "%.2f m/s");
 
         const float velMag = Vector3Length(input.desiredVelocity);
         ImGui::Text("Input: %.2f m/s", velMag);
+
+        // Show MM info when in motion matching mode
+        if (config->animationMode == AnimationMode::MotionMatching)
+        {
+            ImGui::Separator();
+            ImGui::Text("Best Frame: %d", controlledCharacter->mmBestFrame);
+            ImGui::Text("Best Cost: %.4f", controlledCharacter->mmBestCost);
+        }
     }
     ImGui::End();
 }
@@ -1163,8 +1223,9 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     if (app->controlledCharacter.active && effectiveDt > 0.0f)
     {
-        // sync velocity blending settings from config
-        app->controlledCharacter.useVelBlending = app->config.useVelBlending;
+        // sync settings from config
+        app->controlledCharacter.animMode = app->config.animationMode;
+        app->controlledCharacter.cursorBlendMode = app->config.cursorBlendMode;
         app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
 
         ControlledCharacterUpdate(
@@ -1174,6 +1235,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             effectiveDt,
             app->scrubberSettings.sampleMode,
             app->config);
+
     }
 
     // Update Camera
@@ -1832,8 +1894,8 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             const Vector3 toePos = cc.xformData.globalPositions[toeIdx];
 
-            // Actual velocity (yellow) - computed from FK result
-            const Vector3 actualEnd = Vector3Add(toePos, Vector3Scale(cc.toeActualVelocity[side], velScale));
+            // Post-IK velocity (yellow) - computed from final pose
+            const Vector3 actualEnd = Vector3Add(toePos, Vector3Scale(cc.toeVelocity[side], velScale));
             DrawLine3D(toePos, actualEnd, YELLOW);
             DrawSphere(actualEnd, 0.015f, YELLOW);
 
@@ -2226,7 +2288,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Animation settings
         ImGuiAnimSettings(app);
 
-        ImGuiPlayerControl(&app->controlledCharacter);
+        ImGuiPlayerControl(&app->controlledCharacter, &app->config);
 
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
@@ -2235,76 +2297,73 @@ static void ApplicationUpdate(void* voidApplicationState)
     if (app->config.drawFeatures && app->animDatabase.motionFrameCount > 0)
     {
         ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, 260), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 200), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Features"))
         {
-            // Plotting
-            const int count = app->animDatabase.motionFrameCount;
-            int plotCount = count;
-            if (plotCount > 1024) plotCount = 1024;
-
-            vector<float> featX(plotCount);
-            vector<float> featZ(plotCount);
-
-            const int startIdx = count - plotCount;
-            int pi = 0;
-            for (int f = startIdx; f < count; ++f)
-            {
-                span<const float> featRow = app->animDatabase.features.row_view(f);
-                featX[pi] = featRow[0];
-                featZ[pi] = featRow[1];
-                ++pi;
-            }
-
-            ImGui::Text("%s / %s",
-                (app->animDatabase.featureNames.size() > 0) ? app->animDatabase.featureNames[0].c_str() : "Feat0",
-                (app->animDatabase.featureNames.size() > 1) ? app->animDatabase.featureNames[1].c_str() : "Feat1");
-            ImGui::PlotLines("##featX", featX.data(), plotCount, 0, NULL, FLT_MAX, FLT_MAX, ImVec2(0, 80));
-            ImGui::PlotLines("##featZ", featZ.data(), plotCount, 0, NULL, FLT_MAX, FLT_MAX, ImVec2(0, 80));
-
-            // NEW: show current feature values for the currently selected/active character
+            // Show features based on what camera is tracking
             ImGui::Separator();
 
-            const int activeChar = app->characterData.active;
-            if (activeChar >= 0 && activeChar < app->animDatabase.animCount &&
-                activeChar < (int)app->animDatabase.clipStartFrame.size() &&
-                app->animDatabase.clipStartFrame[activeChar] < app->animDatabase.clipEndFrame[activeChar])
+            const bool trackingControlled = app->camera.orbit.trackControlledCharacter &&
+                                            app->controlledCharacter.active;
+
+            if (trackingControlled && !app->controlledCharacter.mmQuery.empty())
             {
-                const float playTime = app->scrubberSettings.playTime;
-                const float frameTime = app->animDatabase.animFrameTime[activeChar];
-                const int clipFrameCount = app->animDatabase.animFrameCount[activeChar];
+                // MM Query from controlled character
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "MM Query (Controlled Character)");
 
-                int localFrame = 0;
-                if (frameTime > 0.0f)
-                {
-                    localFrame = ClampInt((int)(playTime / frameTime + 0.5f), 0, clipFrameCount - 1);
-                }
+                const int fd = app->animDatabase.featureDim;
+                const std::vector<float>& query = app->controlledCharacter.mmQuery;
 
-                const int motionIndex = app->animDatabase.clipStartFrame[activeChar] + localFrame;
-                if (motionIndex >= 0 && motionIndex < app->animDatabase.motionFrameCount)
+                for (int fi = 0; fi < fd && fi < (int)query.size(); ++fi)
                 {
-                    ImGui::Text("Active: %s", app->characterData.names[activeChar].c_str());
-                    ImGui::SameLine();
-                    ImGui::Text("LocalFrame: %d  MotionIndex: %d", localFrame, motionIndex);
-
-                    // Display each named feature value
-                    const int fd = app->animDatabase.featureDim;
-                    span<const float> featRow = app->animDatabase.features.row_view(motionIndex);
-                    for (int fi = 0; fi < fd; ++fi)
-                    {
-                        const char* fname = (fi < (int)app->animDatabase.featureNames.size()) ?
-                            app->animDatabase.featureNames[fi].c_str() : "Feature";
-                        ImGui::Text("%s: % .6f", fname, featRow[fi]);
-                    }
-                }
-                else
-                {
-                    ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Active clip has no motion-DB frames (not compatible with canonical skeleton).");
+                    const char* fname = (fi < (int)app->animDatabase.featureNames.size()) ?
+                        app->animDatabase.featureNames[fi].c_str() : "Feature";
+                    ImGui::Text("%s: % .6f", fname, query[fi]);
                 }
             }
             else
             {
-                ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Active character not present in motion DB.");
+                // Database features from simple animated character
+                const int activeChar = app->characterData.active;
+                if (activeChar >= 0 && activeChar < app->animDatabase.animCount &&
+                    activeChar < (int)app->animDatabase.clipStartFrame.size() &&
+                    app->animDatabase.clipStartFrame[activeChar] < app->animDatabase.clipEndFrame[activeChar])
+                {
+                    const float playTime = app->scrubberSettings.playTime;
+                    const float frameTime = app->animDatabase.animFrameTime[activeChar];
+                    const int clipFrameCount = app->animDatabase.animFrameCount[activeChar];
+
+                    int localFrame = 0;
+                    if (frameTime > 0.0f)
+                    {
+                        localFrame = ClampInt((int)(playTime / frameTime + 0.5f), 0, clipFrameCount - 1);
+                    }
+
+                    const int motionIndex = app->animDatabase.clipStartFrame[activeChar] + localFrame;
+                    if (motionIndex >= 0 && motionIndex < app->animDatabase.motionFrameCount)
+                    {
+                        ImGui::Text("Active: %s", app->characterData.names[activeChar].c_str());
+                        ImGui::SameLine();
+                        ImGui::Text("LocalFrame: %d  MotionIndex: %d", localFrame, motionIndex);
+
+                        const int fd = app->animDatabase.featureDim;
+                        span<const float> featRow = app->animDatabase.features.row_view(motionIndex);
+                        for (int fi = 0; fi < fd; ++fi)
+                        {
+                            const char* fname = (fi < (int)app->animDatabase.featureNames.size()) ?
+                                app->animDatabase.featureNames[fi].c_str() : "Feature";
+                            ImGui::Text("%s: % .6f", fname, featRow[fi]);
+                        }
+                    }
+                    else
+                    {
+                        ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Active clip has no motion-DB frames.");
+                    }
+                }
+                else
+                {
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Active character not present in motion DB.");
+                }
             }
         }
         ImGui::End();
@@ -2408,6 +2467,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
         ImGui::End();
     }
+    PROFILE_END(Gui);
 
 #if defined(ENABLE_PROFILE) && defined(_WIN32)
     // Display Profile Records
@@ -2644,12 +2704,12 @@ int main(int argc, char** argv)
         {
             vector<const char*> autoFiles = 
             { 
-            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
-            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
-            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
-            //    "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
-                "data\\lafan\\bvh\\dance1_subject2.bvh",
-                "data\\lafan\\bvh\\sprint1_subject4.bvh"
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
+                //"data\\lafan\\bvh\\dance1_subject2.bvh",
+                //"data\\lafan\\bvh\\sprint1_subject4.bvh"
             };
             for (const char* file : autoFiles)
             {
