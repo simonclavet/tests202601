@@ -133,28 +133,6 @@ static inline const char* BVHParserCharName(char c)
 // BVH File Data
 //----------------------------------------------------------------------------------
 
-// Types of "channels" that are possible in the BVH format
-enum
-{
-    CHANNEL_X_POSITION = 0,
-    CHANNEL_Y_POSITION = 1,
-    CHANNEL_Z_POSITION = 2,
-    CHANNEL_X_ROTATION = 3,
-    CHANNEL_Y_ROTATION = 4,
-    CHANNEL_Z_ROTATION = 5,
-    CHANNELS_MAX = 6,
-};
-
-// Data associated with a single "joint" in the BVH format
-struct BVHJointData
-{
-    int parent;
-    std::string name;              // changed to std::string
-    Vector3 offset;
-    int channelCount;
-    char channels[CHANNELS_MAX];
-    bool endSite;
-};
 
 static inline void BVHJointDataInit(BVHJointData* data)
 {
@@ -175,19 +153,6 @@ static inline void BVHJointDataFree(BVHJointData* /*data*/)
     // no-op: std::string will clean up automatically
 }
 
-// Data structure matching what is present in the BVH file format
-struct BVHData
-{
-    // Hierarchy Data
-    int jointCount;
-    std::vector<BVHJointData> joints;   
-
-    // Motion Data
-    int frameCount;
-    int channelCount;
-    float frameTime;
-    std::vector<float> motionData;      
-};
 
 static inline void BVHDataInit(BVHData* bvh)
 {

@@ -573,6 +573,18 @@ void Rot6dLerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
     out.bz = rbz * invLenB;
 }
 
+// Rot6d scaled addition: inout = a*x + inout (like BLAS axpy)
+// Useful for weighted accumulation of rotations
+static inline void Rot6dScaledAdd(float a, const Rot6d& x, Rot6d& inout)
+{
+    inout.ax += a * x.ax;
+    inout.ay += a * x.ay;
+    inout.az += a * x.az;
+    inout.bx += a * x.bx;
+    inout.by += a * x.by;
+    inout.bz += a * x.bz;
+}
+
 void Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
 {
     Quaternion qStart, qEnd;

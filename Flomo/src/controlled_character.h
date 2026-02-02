@@ -14,158 +14,9 @@
 #include "app_config.h"
 #include "motion_matching.h"
 
-using std::vector;
 
 
 
-//----------------------------------------------------------------------------------
-// Blend Cursor - individual animation playback cursor with weight
-//----------------------------------------------------------------------------------
-
-struct BlendCursor {
-    int animIndex = -1;                         // which animation/clip
-    float animTime = 0.0f;                      // playback time in that clip
-    DoubleSpringDamperState weightSpring = {};  // spring state for weight blending (x = current weight)
-    float normalizedWeight = 0.0f;              // weight / totalWeight (sums to 1 across active cursors)
-    float targetWeight = 0.0f;                  // desired weight
-    float blendTime = 0.3f;                     // halflife for double spring damper
-    bool active = false;                        // is cursor in use
-
-    // Local-space pose stored per cursor for blending (size = jointCount)
-    vector<Vector3> localPositions;
-    vector<Rot6d> localRotations6d;
-    vector<Vector3> localAngularVelocities;
-    vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
-
-    // Global-space pose for debug visualization (computed via FK after sampling)
-    vector<Vector3> globalPositions;
-    vector<Quaternion> globalRotations;
-
-    // Previous local root state used to compute per-cursor root deltas.
-    // Stored in the same local-space that we sample into above.
-    Vector3 prevLocalRootPos;
-    Rot6d prevLocalRootRot6d = Rot6dIdentity();
-
-    // Debug: last computed deltas (for visualization)
-    Vector3 lastDeltaWorld;      // XZ world-space position delta this frame
-    float lastDeltaYaw;          // Yaw delta this frame (radians)
-
-    // Root motion velocity tracking (for acceleration-based blending)
-    Vector3 rootVelocity = Vector3Zero();    // current root velocity (world space)
-    float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
-    Vector3 prevRootVelocity = Vector3Zero(); // previous frame's velocity
-    float prevRootYawRate = 0.0f;            // previous frame's yaw rate
-
-    // Global toe velocities for foot IK (sampled from db->globalJointVelocities)
-    Vector3 globalToeVelocity[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
-};
-
-//----------------------------------------------------------------------------------
-// Controlled Character - Root Motion Playback
-//----------------------------------------------------------------------------------
-
-// A character that plays animation with root motion extracted and applied to world transform.
-// Every N seconds it jumps to a random time in the loaded animations while maintaining
-// its world position and facing direction.
-struct ControlledCharacter {
-    // World placement (accumulated from root motion)
-    Vector3 worldPosition;
-    Quaternion worldRotation;  // Character's facing direction (Y-axis rotation only)
-
-    // Animation mode
-    AnimationMode animMode = AnimationMode::RandomSwitch;
-
-    // Animation state
-    int animIndex;             // Which loaded animation to play from
-    float animTime;            // Current playback time in that animation
-
-    // For computing root motion deltas between frames
-    Vector3 prevRootPosition;
-    Quaternion prevRootRotation;
-
-    // Random switch timer (used by RandomSwitch mode)
-    float switchTimer;
-
-    // Motion matching state
-    int mmBestFrame = -1;           // best matching frame from last search
-    float mmBestCost = 0.0f;        // cost of best match
-    float mmSearchTimer = 0.0f;     // time since last search
-
-    // Pose output (local space with root zeroed, then transformed to world)
-    TransformData xformData;
-    TransformData xformTmp0;
-    TransformData xformTmp1;
-    TransformData xformTmp2;
-    TransformData xformTmp3;
-
-    // Pre-IK FK state for debugging (saved before IK is applied)
-    TransformData xformBeforeIK;
-    bool debugSaveBeforeIK;  // toggle to enable saving pre-IK state
-
-    // Visual properties
-    Color color;
-    float opacity;
-    float radius;
-    float scale;
-
-    // Reference to skeleton (first loaded BVH)
-    const BVHData* skeleton;
-    bool active;
-
-
-    // -----------------------
-    // Blending cursor pool
-    // -----------------------
-    static constexpr int MAX_BLEND_CURSORS = 10;
-    BlendCursor cursors[MAX_BLEND_CURSORS];
-
-    // Debug: last blended root motion delta (for visualization)
-    Vector3 lastBlendedDeltaWorld;
-    float lastBlendedDeltaYaw;
-
-    // Cursor blend mode and state
-    CursorBlendMode cursorBlendMode = CursorBlendMode::Basic;
-    float blendPosReturnTime = 0.1f;       // time for velblending to lerp towards target
-
-    // VelBlending state
-    vector<Rot6d> velBlendedRotations6d;       // [jointCount] - smoothed rotations
-    bool velBlendInitialized = false;
-
-    // LookaheadDragging state
-    vector<Rot6d> lookaheadDragPose6d;         // running pose state for lookahead dragging
-    bool lookaheadDragInitialized = false;
-
-    // Smoothed root motion state
-    Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
-    float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
-    bool rootMotionInitialized = false;
-
-    // Toe velocity tracking
-    Vector3 prevToeGlobalPosPreIK[SIDES_COUNT];   // previous frame positions (before IK)
-    Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
-    Vector3 toeBlendedVelocity[SIDES_COUNT];      // blended from cursor global toe velocities
-    bool toeTrackingPreIKInitialized = false;
-
-    Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)
-    Vector3 toeVelocity[SIDES_COUNT];             // velocity from final pose (after IK)
-    bool toeTrackingInitialized = false;
-
-    // Virtual toe positions - move with blended velocity, used for IK targets
-    Vector3 virtualToePos[SIDES_COUNT];
-    Vector3 intermediateVirtualToePos[SIDES_COUNT];  // velocity + viscous return (no speed clamp)
-
-    bool virtualToeInitialized = false;
-
-    // Virtual toe locking system
-    float virtualToeUnlockTimer[SIDES_COUNT] = { -1.0f, -1.0f };  // -1 = locked, >=0 = unlocked
-    float virtualToeUnlockClampRadius[SIDES_COUNT] = { 0.0f, 0.0f };  // current clamp radius for debug viz
-    float virtualToeUnlockStartDistance[SIDES_COUNT] = { 0.0f, 0.0f };  // distance at unlock moment (for smooth shrink)   
-    
-    PlayerControlInput playerInput;
-
-    // Motion matching query (runtime features computed from current state)
-    std::vector<float> mmQuery;
-};
 
 // Initialize the controlled character when first animation is loaded
 static void ControlledCharacterInit(
@@ -244,28 +95,6 @@ static void ControlledCharacterInit(
     cc->radius = 0.04f;
 }
 
-static void ControlledCharacterFree(ControlledCharacter* cc)
-{
-    TransformDataFree(&cc->xformData);
-    TransformDataFree(&cc->xformTmp0);
-    TransformDataFree(&cc->xformTmp1);
-    TransformDataFree(&cc->xformTmp2);
-    TransformDataFree(&cc->xformTmp3);
-    TransformDataFree(&cc->xformBeforeIK);  // Add this line
-
-    // Clear cursor storage vectors
-    for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
-        cc->cursors[i].localPositions.clear();
-        cc->cursors[i].localRotations6d.clear();
-        cc->cursors[i].localAngularVelocities.clear();
-        cc->cursors[i].lookaheadRotations6d.clear();
-        cc->cursors[i].active = false;
-    }
-
-    cc->velBlendedRotations6d.clear();
-    cc->lookaheadDragPose6d.clear();
-    cc->active = false;
-}
 
 
 // Helper: find an available cursor (inactive) or the one with smallest weight
@@ -345,116 +174,6 @@ static void SpawnBlendCursor(
 }
 
 
-// Compute the motion matching query from the current character state
-// This produces a feature vector in the same format as db->features rows
-// Should be called after ControlledCharacterUpdate (needs valid pose including IK)
-static void ComputeMotionMatchingQuery(
-    ControlledCharacter* cc,
-    const AnimDatabase* db)
-{
-    if (!cc->active || db == nullptr || !db->valid) return;
-
-    const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
-
-    // resize query if needed
-    if ((int)cc->mmQuery.size() != db->featureDim)
-    {
-        cc->mmQuery.resize(db->featureDim, 0.0f);
-    }
-
-    // get hip position and yaw from the final pose (after IK, in world space)
-    const int hipIdx = db->hipJointIndex;
-    if (hipIdx < 0 || hipIdx >= cc->xformData.jointCount) return;
-
-    const Vector3 hipPos = cc->xformData.globalPositions[hipIdx];
-    const Quaternion hipRot = cc->xformData.globalRotations[hipIdx];
-
-    // extract hip yaw and compute inverse for transforming to hip-local frame
-    const Quaternion hipYaw = QuaternionYComponent(hipRot);
-    const Quaternion invHipYaw = QuaternionInvert(hipYaw);
-
-    // get toe positions from final pose
-    const int leftToeIdx = db->toeIndices[SIDE_LEFT];
-    const int rightToeIdx = db->toeIndices[SIDE_RIGHT];
-
-    Vector3 leftToePos = Vector3Zero();
-    Vector3 rightToePos = Vector3Zero();
-
-    if (leftToeIdx >= 0 && leftToeIdx < cc->xformData.jointCount)
-    {
-        leftToePos = cc->xformData.globalPositions[leftToeIdx];
-    }
-    if (rightToeIdx >= 0 && rightToeIdx < cc->xformData.jointCount)
-    {
-        rightToePos = cc->xformData.globalPositions[rightToeIdx];
-    }
-
-    // compute toe positions in hip-local frame (same as database feature extraction)
-    const Vector3 hipToLeft = Vector3Subtract(leftToePos, hipPos);
-    const Vector3 localLeftPos = Vector3RotateByQuaternion(hipToLeft, invHipYaw);
-
-    const Vector3 hipToRight = Vector3Subtract(rightToePos, hipPos);
-    const Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
-
-    // compute toe velocities in hip-local frame (using post-IK velocity)
-    Vector3 localLeftVel = Vector3Zero();
-    Vector3 localRightVel = Vector3Zero();
-
-    if (cc->toeTrackingInitialized)
-    {
-        localLeftVel = Vector3RotateByQuaternion(cc->toeVelocity[SIDE_LEFT], invHipYaw);
-        localRightVel = Vector3RotateByQuaternion(cc->toeVelocity[SIDE_RIGHT], invHipYaw);
-    }
-
-    // fill the query vector in the same order as database features
-    int fi = 0;
-
-    // ToePos: left(X,Z), right(X,Z)
-    if (cfg.IsFeatureEnabled(FeatureType::ToePos))
-    {
-        cc->mmQuery[fi++] = localLeftPos.x;
-        cc->mmQuery[fi++] = localLeftPos.z;
-        cc->mmQuery[fi++] = localRightPos.x;
-        cc->mmQuery[fi++] = localRightPos.z;
-    }
-
-    // ToeVel: left(X,Z), right(X,Z)
-    if (cfg.IsFeatureEnabled(FeatureType::ToeVel))
-    {
-        cc->mmQuery[fi++] = localLeftVel.x;
-        cc->mmQuery[fi++] = localLeftVel.z;
-        cc->mmQuery[fi++] = localRightVel.x;
-        cc->mmQuery[fi++] = localRightVel.z;
-    }
-
-    // ToeDiff: (left - right) in hip frame
-    if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
-    {
-        cc->mmQuery[fi++] = localLeftPos.x - localRightPos.x;
-        cc->mmQuery[fi++] = localLeftPos.z - localRightPos.z;
-    }
-
-    // FutureVel: desired velocity at future sample times
-    // this is the key difference from database: we use player's desired velocity
-    // instead of the animation's actual future trajectory
-    if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
-    {
-        // transform desired velocity to character's heading frame
-        const Vector3 desiredVel = cc->playerInput.desiredVelocity;
-        const Vector3 localDesiredVel = Vector3RotateByQuaternion(desiredVel, invHipYaw);
-
-        // for now, assume player holds direction constant at all future sample times
-        // (could do trajectory prediction later)
-        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-        {
-            cc->mmQuery[fi++] = localDesiredVel.x;
-            cc->mmQuery[fi++] = localDesiredVel.z;
-        }
-    }
-
-    assert(fi == db->featureDim);
-}
-
 
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
 // - uses db->localJointPositions / localJointRotations6d for sampling (no per-frame global->local conversion)
@@ -464,7 +183,7 @@ static void ControlledCharacterUpdate(
     const CharacterData* characterData,
     const AnimDatabase* db,
     float dt,
-    int sampleMode,
+    double worldTime,
     const AppConfig& config)
 {
     if (!cc->active || characterData->count == 0) return;
@@ -530,9 +249,12 @@ static void ControlledCharacterUpdate(
         cc->mmSearchTimer -= dt;
         if (cc->mmSearchTimer <= 0.0f)
         {
-            // Compute query from current pose BEFORE searching
+            // Compute query from current pose before searching
             // This uses the pose from the end of the previous frame
-            ComputeMotionMatchingQuery(cc, db);
+            ComputeMotionFeatures(
+                db,
+                cc,
+                cc->mmQuery);
 
             cc->mmSearchTimer = config.mmSearchPeriod;
 
@@ -803,10 +525,10 @@ static void ControlledCharacterUpdate(
 
     // --- Rot6d blending using normalized weights (no double-cover issues, simple weighted average then normalize) ---
     {
-        vector<Vector3> posAccum(jc, Vector3Zero());
-        vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
-        vector<Rot6d> lookaheadRot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
-        vector<Vector3> angVelAccum(jc, Vector3Zero());
+        std::vector<Vector3> posAccum(jc, Vector3Zero());
+        std::vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        std::vector<Rot6d> lookaheadRot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        std::vector<Vector3> angVelAccum(jc, Vector3Zero());
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
@@ -822,35 +544,21 @@ static void ControlledCharacterUpdate(
                 posAccum[j] = Vector3Add(posAccum[j], Vector3Scale(cur.localPositions[j], w));
                 angVelAccum[j] = Vector3Add(angVelAccum[j], Vector3Scale(cur.localAngularVelocities[j], w));
 
-                // weighted accumulation of Rot6d (just add scaled components)
-                const Rot6d& r = cur.localRotations6d[j];
-                rot6dAccum[j].ax += r.ax * w;
-                rot6dAccum[j].ay += r.ay * w;
-                rot6dAccum[j].az += r.az * w;
-                rot6dAccum[j].bx += r.bx * w;
-                rot6dAccum[j].by += r.by * w;
-                rot6dAccum[j].bz += r.bz * w;
-
-                // also accumulate lookahead rotations for lookahead dragging
-                const Rot6d& la = cur.lookaheadRotations6d[j];
-                lookaheadRot6dAccum[j].ax += la.ax * w;
-                lookaheadRot6dAccum[j].ay += la.ay * w;
-                lookaheadRot6dAccum[j].az += la.az * w;
-                lookaheadRot6dAccum[j].bx += la.bx * w;
-                lookaheadRot6dAccum[j].by += la.by * w;
-                lookaheadRot6dAccum[j].bz += la.bz * w;
+                // weighted accumulation of Rot6d using helper
+                Rot6dScaledAdd(w, cur.localRotations6d[j], rot6dAccum[j]);
+                Rot6dScaledAdd(w, cur.lookaheadRotations6d[j], lookaheadRot6dAccum[j]);
             }
         }
 
-        // positions use normalized weights directly (no division needed)
+        // positions use normalized weights
         for (int j = 0; j < jc; ++j)
         {
             cc->xformData.localPositions[j] = posAccum[j];
         }
 
         // normalize blended Rot6d to get target rotations
-        vector<Rot6d> blendedRot6d(jc);
-        vector<Rot6d> blendedLookaheadRot6d(jc);
+        std::vector<Rot6d> blendedRot6d(jc);
+        std::vector<Rot6d> blendedLookaheadRot6d(jc);
         for (int j = 0; j < jc; ++j)
         {
             // normalize current rotations
@@ -880,9 +588,6 @@ static void ControlledCharacterUpdate(
             }
         }
 
-        // Hips (joint 0) - no additional smoothing, no velblending or lookahead dragging
-        // Just use the blended rotation directly, cursor weight blending is enough
-        Rot6dToQuaternion(blendedRot6d[0], cc->xformData.localRotations[0]);
 
         // Other joints (1+): choose blend mode
         switch (cc->cursorBlendMode)
@@ -890,9 +595,48 @@ static void ControlledCharacterUpdate(
         case CursorBlendMode::LookaheadDragging:
         {
             // Lookahead dragging: lerp running pose towards extrapolated future
-            // with alpha = dt / lookaheadTime so animation tracks perfectly when not transitioning
+           // with alpha = dt / lookaheadTime so animation tracks perfectly when not transitioning
+
+           // Special handling for hip (joint 0): we need yaw-stripped versions for blending
+           // because each cursor's hip rotation is in different animation space
+            Rot6d blendedLookaheadHipNoYaw = Rot6dIdentity();
+            blendedLookaheadHipNoYaw.ax = 0.0f;  // zero it out (identity has ax=1)
+
+            // Re-accumulate lookahead rotations for hip with yaw stripped
+            for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+            {
+                const BlendCursor& cur = cc->cursors[ci];
+                if (!cur.active) continue;
+                const float w = cur.normalizedWeight;
+                if (w <= 1e-6f) continue;
+
+                // For hip: strip yaw from lookahead before accumulating
+                Rot6d laHipNoYaw = cur.lookaheadRotations6d[0];
+                Rot6dRemoveYComponent(laHipNoYaw, laHipNoYaw);
+
+                Rot6dScaledAdd(w, laHipNoYaw, blendedLookaheadHipNoYaw);
+            }
+
+
+            // Normalize the blended hip lookahead (yaw-stripped)
+            const float lenLA = sqrtf(blendedLookaheadHipNoYaw.ax * blendedLookaheadHipNoYaw.ax +
+                blendedLookaheadHipNoYaw.ay * blendedLookaheadHipNoYaw.ay +
+                blendedLookaheadHipNoYaw.az * blendedLookaheadHipNoYaw.az);
+            if (lenLA > 1e-6f)
+            {
+                Rot6dNormalize(blendedLookaheadHipNoYaw);
+            }
+            else
+            {
+                blendedLookaheadHipNoYaw = Rot6dIdentity();
+            }
+
             if (!cc->lookaheadDragInitialized)
             {
+                // Initialize hip with yaw-stripped version
+                cc->lookaheadDragPose6d[0] = blendedRot6d[0];  // current blended (already yaw-stripped)
+
+                // Initialize other joints normally
                 for (int j = 1; j < jc; ++j)
                 {
                     cc->lookaheadDragPose6d[j] = blendedRot6d[j];
@@ -904,6 +648,11 @@ static void ControlledCharacterUpdate(
             if (lookaheadTime > 1e-6f)
             {
                 const float alpha = dt / lookaheadTime;
+
+                // Hip: lerp towards yaw-stripped lookahead target
+                Rot6dLerp(cc->lookaheadDragPose6d[0], blendedLookaheadHipNoYaw, alpha, cc->lookaheadDragPose6d[0]);
+
+                // Other joints: use normal lookahead targets
                 for (int j = 1; j < jc; ++j)
                 {
                     Rot6dLerp(cc->lookaheadDragPose6d[j], blendedLookaheadRot6d[j], alpha, cc->lookaheadDragPose6d[j]);
@@ -911,14 +660,15 @@ static void ControlledCharacterUpdate(
             }
             else
             {
+                cc->lookaheadDragPose6d[0] = blendedRot6d[0];  // yaw-stripped current
                 for (int j = 1; j < jc; ++j)
                 {
                     cc->lookaheadDragPose6d[j] = blendedRot6d[j];
                 }
             }
 
-            // convert to quaternion for FK
-            for (int j = 1; j < jc; ++j)
+            // Convert to quaternions (hip already yaw-stripped, so convert directly)
+            for (int j = 0; j < jc; ++j)
             {
                 Rot6dToQuaternion(cc->lookaheadDragPose6d[j], cc->xformData.localRotations[j]);
             }
@@ -926,6 +676,10 @@ static void ControlledCharacterUpdate(
         }
         case CursorBlendMode::VelBlending:
         {
+            // Hips (joint 0) - no additional smoothing, no velblending or lookahead dragging
+            // Just use the blended rotation directly, cursor weight blending is enough
+            Rot6dToQuaternion(blendedRot6d[0], cc->xformData.localRotations[0]);
+
             // initialize on first frame
             if (!cc->velBlendInitialized)
             {
@@ -971,7 +725,7 @@ static void ControlledCharacterUpdate(
         default:
         {
             // standard blending: directly use blended rotations (skip hips, already done above)
-            for (int j = 1; j < jc; ++j)
+            for (int j = 0; j < jc; ++j)
             {
                 Rot6dToQuaternion(blendedRot6d[j], cc->xformData.localRotations[j]);
             }
@@ -1219,8 +973,37 @@ static void ControlledCharacterUpdate(
         }
     }
 
-    cc->virtualToeInitialized = true;    // Save pre-IK state for debugging visualization
+    cc->virtualToeInitialized = true;   
     
+
+
+    // Update position history every HISTORY_SAMPLE_INTERVAL seconds
+    // This maintains a ring buffer of recent positions for motion matching past position feature
+    {
+        static constexpr float HISTORY_SAMPLE_INTERVAL = 0.01f;  // 10ms between samples
+        static constexpr float HISTORY_MAX_DURATION = 0.5f;      // keep 500ms of history
+
+        // Check if we should sample (interval elapsed AND dt not too small to avoid duplicates on paused frames)
+        if (dt > 1e-6f && (worldTime - cc->lastHistorySampleTime) >= HISTORY_SAMPLE_INTERVAL)
+        {
+            // Add new history point at the back
+            HistoryPoint newPoint;
+            newPoint.position = cc->worldPosition;
+            newPoint.timestamp = worldTime;
+            cc->positionHistory.push_back(newPoint);
+
+            cc->lastHistorySampleTime = worldTime;
+
+            // Remove old history points from the front (keep only HISTORY_MAX_DURATION seconds)
+            const double cutoffTime = worldTime - HISTORY_MAX_DURATION;
+            while (!cc->positionHistory.empty() && cc->positionHistory.front().timestamp < cutoffTime)
+            {
+                cc->positionHistory.erase(cc->positionHistory.begin());
+            }
+        }
+    }
+
+    // Save pre-IK state for debugging visualization
     
     if (cc->debugSaveBeforeIK)
     {

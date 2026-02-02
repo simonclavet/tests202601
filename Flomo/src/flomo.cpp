@@ -39,6 +39,7 @@
 #include "profiler.h"
 
 
+#include "definitions.h"
 #include "camera.h"
 #include "bvh_parser.h"
 #include "fbx_loader.h"
@@ -53,7 +54,6 @@
 #include "anim_database.h"
 #include "leg_ik.h"
 #include "controlled_character.h"
-
 
 // Dear ImGui with raylib backend
 #include "imgui.h"
@@ -356,6 +356,8 @@ struct ApplicationState {
     // numpad*: toggle pause, hold while paused to advance at half speed
     float debugTimescale = 1.0f;
     bool debugPaused = false;
+    double worldTime = 0.0;  // accumulated time with timescale applied
+
 };
 
 
@@ -594,6 +596,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
         ImGui::Checkbox("Draw Foot IK", &config->drawFootIK);
         ImGui::Checkbox("Draw Player Input", &config->drawPlayerInput);
+        ImGui::Checkbox("Draw Past History", &config->drawPastHistory);
 
     }
     ImGui::End();
@@ -833,87 +836,101 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         }
 
         // Motion Matching Features
-        if (ImGui::CollapsingHeader("Motion Matching Features"))
+        AnimDatabase& db = app->animDatabase;
+        MotionMatchingFeaturesConfig& mmConfig = config->mmConfigEditor;
+        bool configChanged = false;
+
+        ImGui::Text("Feature Weights:");
+        ImGui::Separator();
+
+        // Feature weights as input fields
+        for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
         {
-            AnimDatabase& db = app->animDatabase;
-            MotionMatchingFeaturesConfig& mmConfig = config->mmConfigEditor;
-            bool configChanged = false;
+            const FeatureType type = static_cast<FeatureType>(i);
+            const char* name = FeatureTypeName(type);
+            float weight = mmConfig.features[i].weight;
 
-            ImGui::Text("Feature Weights:");
-            ImGui::Separator();
-
-            // Feature weights as input fields
-            for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
+            ImGui::PushID(i);
+            ImGui::Text("%s:", name);
+            ImGui::SameLine(180);  // Align input fields
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputFloat("##weight", &weight, 0.0f, 0.0f, "%.3f"))
             {
-                const FeatureType type = static_cast<FeatureType>(i);
-                const char* name = FeatureTypeName(type);
-                float weight = mmConfig.features[i].weight;
-
-                ImGui::PushID(i);
-                ImGui::Text("%s:", name);
-                ImGui::SameLine(180);  // Align input fields
-                ImGui::SetNextItemWidth(80);
-                if (ImGui::InputFloat("##weight", &weight, 0.0f, 0.0f, "%.3f"))
-                {
-                    // Clamp to >= 0
-                    mmConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
-                    configChanged = true;
-                }
-                ImGui::PopID();
+                // Clamp to >= 0
+                mmConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
+                configChanged = true;
             }
-
-            ImGui::Separator();
-
-            // Future trajectory times configuration
-            ImGui::Text("Future Trajectory Times (s):");
-            const size_t timeCount = mmConfig.futureTrajPointTimes.size();
-
-            for (size_t i = 0; i < timeCount; ++i)
-            {
-                ImGui::PushID((int)i + 1000);
-
-                ImGui::Text("Time %d:", (int)i + 1);
-                ImGui::SameLine(100);
-                ImGui::SetNextItemWidth(80);
-
-                float timeVal = mmConfig.futureTrajPointTimes[i];
-                if (ImGui::InputFloat("##time", &timeVal, 0.0f, 0.0f, "%.3f"))
-                {
-                    // Clamp to >= 0.001
-                    timeVal = (timeVal < 0.001f) ? 0.001f : timeVal;
-
-                    // Enforce increasing order: clamp to be >= previous time
-                    if (i > 0)
-                    {
-                        const float prevTime = mmConfig.futureTrajPointTimes[i - 1];
-                        timeVal = (timeVal < prevTime) ? prevTime : timeVal;
-                    }
-
-                    // Enforce increasing order: clamp next times to be >= this time
-                    mmConfig.futureTrajPointTimes[i] = timeVal;
-                    for (size_t j = i + 1; j < timeCount; ++j)
-                    {
-                        if (mmConfig.futureTrajPointTimes[j] < timeVal)
-                        {
-                            mmConfig.futureTrajPointTimes[j] = timeVal;
-                        }
-                    }
-
-                    configChanged = true;
-                }
-
-                ImGui::PopID();
-            }
-
-            if (configChanged)
-            {
-                // Rebuild animation database with new config
-                db.featuresConfig = mmConfig;
-                db.poseDragLookaheadTime = config->poseDragLookaheadTime;
-                AnimDatabaseRebuild(&db, &app->characterData);
-                TraceLog(LOG_INFO, "Motion matching config updated");
-            }
+            ImGui::PopID();
         }
+
+        ImGui::Separator();
+
+        ImGui::Separator();
+
+        // Future trajectory times configuration
+        ImGui::Text("Future Trajectory Times (s):");
+        const size_t timeCount = mmConfig.futureTrajPointTimes.size();
+
+        for (size_t i = 0; i < timeCount; ++i)
+        {
+            ImGui::PushID((int)i + 1000);
+
+            ImGui::Text("Time %d:", (int)i + 1);
+            ImGui::SameLine(100);
+            ImGui::SetNextItemWidth(80);
+
+            float timeVal = mmConfig.futureTrajPointTimes[i];
+            if (ImGui::InputFloat("##time", &timeVal, 0.0f, 0.0f, "%.3f"))
+            {
+                // Clamp to >= 0.001
+                timeVal = (timeVal < 0.001f) ? 0.001f : timeVal;
+
+                // Enforce increasing order: clamp to be >= previous time
+                if (i > 0)
+                {
+                    const float prevTime = mmConfig.futureTrajPointTimes[i - 1];
+                    timeVal = (timeVal < prevTime) ? prevTime : timeVal;
+                }
+
+                // Enforce increasing order: clamp next times to be >= this time
+                mmConfig.futureTrajPointTimes[i] = timeVal;
+                for (size_t j = i + 1; j < timeCount; ++j)
+                {
+                    if (mmConfig.futureTrajPointTimes[j] < timeVal)
+                    {
+                        mmConfig.futureTrajPointTimes[j] = timeVal;
+                    }
+                }
+
+                configChanged = true;
+            }
+
+            ImGui::PopID();
+        }
+
+        ImGui::Separator();
+
+        // Past time offset configuration
+        ImGui::Text("Past Time Offset (s):");
+        ImGui::SameLine(180);
+        ImGui::SetNextItemWidth(80);
+        float pastTime = mmConfig.pastTimeOffset;
+        if (ImGui::InputFloat("##pasttime", &pastTime, 0.0f, 0.0f, "%.3f"))
+        {
+            // Clamp to >= 0.001
+            mmConfig.pastTimeOffset = (pastTime < 0.001f) ? 0.001f : pastTime;
+            configChanged = true;
+        }
+
+        if (configChanged)
+        {
+            // Rebuild animation database with new config
+            db.featuresConfig = mmConfig;
+            db.poseDragLookaheadTime = config->poseDragLookaheadTime;
+            AnimDatabaseRebuild(&db, &app->characterData);
+            TraceLog(LOG_INFO, "Motion matching config updated");
+        }
+        
     }
     ImGui::End();
 }
@@ -971,12 +988,13 @@ static void ApplicationUpdate(void* voidApplicationState)
 {
     ApplicationState* app = (ApplicationState*)voidApplicationState;
 
-
     // Update window dimensions if resized
     if (IsWindowResized()) {
         app->screenWidth = GetScreenWidth();
         app->screenHeight = GetScreenHeight();
     }
+
+    BeginDrawing();
 
     // Process Dragged and Dropped Files
 
@@ -1044,10 +1062,9 @@ static void ApplicationUpdate(void* voidApplicationState)
     // Handle clear request (with full state access)
     if (app->characterData.clearRequested)
     {
-        app->characterData.clearRequested = false;
+        app->characterData = {};
 
         // Free and reset character data
-        CharacterDataFree(&app->characterData);
         CharacterDataInit(&app->characterData, app->argc, app->argv);
 
         // Reset AnimDatabase
@@ -1056,7 +1073,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Disable and free controlled character
         if (app->controlledCharacter.active)
         {
-            ControlledCharacterFree(&app->controlledCharacter);
+            //ControlledCharacterFree(&app->controlledCharacter);
             app->controlledCharacter.active = false;
         }
 
@@ -1079,9 +1096,14 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     PROFILE_BEGIN(Update);
 
+    const bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
+    const bool imguiWantsKeyboard = ImGui::GetIO().WantCaptureKeyboard;
+
+
     // Compute effective dt based on debug timescale
     const float rawDt = GetFrameTime();
     float effectiveDt = 0.0f;
+    if (!imguiWantsKeyboard)
     {
         // Check numpad input for debug timescale (need to check here before ImGui captures input)
         const bool numpadMinusPressed = IsKeyPressed(KEY_KP_SUBTRACT);
@@ -1092,7 +1114,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         if (numpadMinusPressed)
         {
-            app->debugTimescale *= 0.5f;
+            app->debugTimescale *= 0.7f;
             TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
         }
         if (numpadPlusPressed)
@@ -1106,13 +1128,13 @@ static void ApplicationUpdate(void* voidApplicationState)
             else if (shiftHeld)
             {
                 // Shift+numpad+: double timescale without clamping (allows >1x speed)
-                app->debugTimescale *= 2.0f;
+                app->debugTimescale *= 1.0f / 0.7f;
                 TraceLog(LOG_INFO, "Debug timescale: %.4f (fast forward)", app->debugTimescale);
             }
             else
             {
                 // Double timescale up to max 1.0
-                app->debugTimescale = Clamp(app->debugTimescale * 2.0f, 0.0f, 1.0f);
+                app->debugTimescale = Clamp(app->debugTimescale * 1.0f / 0.7f, 0.0f, 1.0f);
                 TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
             }
         }
@@ -1140,6 +1162,9 @@ static void ApplicationUpdate(void* voidApplicationState)
             effectiveDt = rawDt * app->debugTimescale;
         }
     }
+
+    // Accumulate world time (with timescale applied)
+    app->worldTime += effectiveDt;
 
     // Tick time forward
 
@@ -1233,7 +1258,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             &app->characterData,
             &app->animDatabase,
             effectiveDt,
-            app->scrubberSettings.sampleMode,
+            app->worldTime,
             app->config);
 
     }
@@ -1241,8 +1266,6 @@ static void ApplicationUpdate(void* voidApplicationState)
     // Update Camera
     const Vector2 mouseDelta = GetMouseDelta();
     const float mouseWheel = GetMouseWheelMove();
-    const bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
-    const bool imguiWantsKeyboard = ImGui::GetIO().WantCaptureKeyboard;
 
     // Get bone target for orbit camera (used for mode switching too)
     Vector3 boneTarget = Vector3{ 0.0f, 1.0f, 0.0f };
@@ -1279,35 +1302,35 @@ static void ApplicationUpdate(void* voidApplicationState)
     // numpad-: halve debugTimescale
     // numpad+: double debugTimescale (max 1.0), also unpause if paused
     // numpad*: pause, hold while paused to advance at half speed
-    if (!imguiWantsKeyboard)
-    {
-        if (IsKeyPressed(KEY_KP_SUBTRACT))
-        {
-            app->debugTimescale *= 0.5f;
-            TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
-        }
-        if (IsKeyPressed(KEY_KP_ADD))
-        {
-            if (app->debugPaused)
-            {
-                // Just unpause, don't change timescale
-                app->debugPaused = false;
-                TraceLog(LOG_INFO, "Unpaused at timescale: %.4f", app->debugTimescale);
-            }
-            else
-            {
-                // Double timescale up to max 1.0
-                app->debugTimescale = Clamp(app->debugTimescale * 2.0f, 0.0f, 1.0f);
-                TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
-            }
-        }
-        if (IsKeyPressed(KEY_KP_MULTIPLY))
-        {
-            // Toggle pause
-            app->debugPaused = true;
-            TraceLog(LOG_INFO, "Paused (hold * to advance at half speed)");
-        }
-    }
+    //if (!imguiWantsKeyboard)
+    //{
+    //    if (IsKeyPressed(KEY_KP_SUBTRACT))
+    //    {
+    //        app->debugTimescale *= 0.5f;
+    //        TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
+    //    }
+    //    if (IsKeyPressed(KEY_KP_ADD))
+    //    {
+    //        if (app->debugPaused)
+    //        {
+    //            // Just unpause, don't change timescale
+    //            app->debugPaused = false;
+    //            TraceLog(LOG_INFO, "Unpaused at timescale: %.4f", app->debugTimescale);
+    //        }
+    //        else
+    //        {
+    //            // Double timescale up to max 1.0
+    //            app->debugTimescale = Clamp(app->debugTimescale * 2.0f, 0.0f, 1.0f);
+    //            TraceLog(LOG_INFO, "Debug timescale: %.4f", app->debugTimescale);
+    //        }
+    //    }
+    //    if (IsKeyPressed(KEY_KP_MULTIPLY))
+    //    {
+    //        // Toggle pause
+    //        app->debugPaused = true;
+    //        TraceLog(LOG_INFO, "Paused (hold * to advance at half speed)");
+    //    }
+    //}
 
     if (app->camera.mode == FlomoCameraMode::Orbit)
     {
@@ -1440,7 +1463,6 @@ static void ApplicationUpdate(void* voidApplicationState)
         GetCameraViewMatrix(&app->camera.cam3d),
         frustum);
 
-    BeginDrawing();
 
     PROFILE_BEGIN(Rendering);
 
@@ -2086,6 +2108,66 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
     }
 
+    // Draw Past Position History
+    if (app->controlledCharacter.active && app->config.drawPastHistory)
+    {
+        const ControlledCharacter& cc = app->controlledCharacter;
+
+        if (cc.positionHistory.size() > 1)
+        {
+            // Find which history point is being used for motion matching (closest to pastTimeOffset)
+            int mmUsedIdx = -1;
+            if (!cc.positionHistory.empty())
+            {
+                const double currentTime = cc.positionHistory.empty() ? 0.0f : cc.positionHistory.back().timestamp;
+                const float targetPastTime = (float)(currentTime - app->animDatabase.featuresConfig.pastTimeOffset);
+
+                float bestTimeDiff = FLT_MAX;
+                for (int i = 0; i < (int)cc.positionHistory.size(); ++i)
+                {
+                    const float timeDiff = (float)abs(cc.positionHistory[i].timestamp - targetPastTime);
+                    if (timeDiff < bestTimeDiff)
+                    {
+                        bestTimeDiff = timeDiff;
+                        mmUsedIdx = i;
+                    }
+                }
+            }
+
+            // Draw line segments connecting history points
+            for (size_t i = 1; i < cc.positionHistory.size(); ++i)
+            {
+                const Vector3 p0 = cc.positionHistory[i - 1].position;
+                const Vector3 p1 = cc.positionHistory[i].position;
+
+                // Color fades from dark (old) to bright (recent)
+                const float t = (float)i / (float)cc.positionHistory.size();
+                const unsigned char alpha = (unsigned char)(t * 255.0f);
+                const Color lineColor = Color{ 255, 255, 0, alpha };
+
+                DrawLine3D(p0, p1, lineColor);
+            }
+
+            // Draw small spheres at each history point
+            for (size_t i = 0; i < cc.positionHistory.size(); ++i)
+            {
+                const float t = (float)i / (float)cc.positionHistory.size();
+                const unsigned char alpha = (unsigned char)(t * 200.0f + 55.0f);
+                const Color sphereColor = Color{ 255, 255, 0, alpha };
+
+                // Draw larger red sphere for the motion matching sample point
+                if ((int)i == mmUsedIdx)
+                {
+                    DrawSphere(cc.positionHistory[i].position, 0.04f, RED);
+                }
+                else
+                {
+                    DrawSphere(cc.positionHistory[i].position, 0.015f, sphereColor);
+                }
+            }
+        }
+    }
+
     // Re-Enable Depth Test
 
     rlDrawRenderBatchActive();
@@ -2702,14 +2784,31 @@ int main(int argc, char** argv)
 
         // Auto-load a default scene on startup
         {
-            vector<const char*> autoFiles = 
-            { 
+            //vector<const char*> autoFiles = 
+            //{ 
+            //    "data\\lafan1_bvh\\dance1_subject2.bvh",
+            //    "data\\lafan1_bvh\\sprint1_subject4.bvh"
+            //};
+            vector<const char*> autoFiles =
+            {
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-002.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-003.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-004.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-005.fbx"
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-006.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-007.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-008.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-009.fbx"
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-010.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-011.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-012.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-013.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-014.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-015.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-016.fbx",
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-017.fbx"
-                //"data\\lafan\\bvh\\dance1_subject2.bvh",
-                //"data\\lafan\\bvh\\sprint1_subject4.bvh"
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-018.fbx",
+                "data\\timi\\xs_20251101_aleblanc_lantern_nav-019.fbx"
             };
             for (const char* file : autoFiles)
             {
@@ -2776,11 +2875,6 @@ int main(int argc, char** argv)
     // Unload and finish
 
     CapsuleDataFree(&app.capsuleData);
-    CharacterDataFree(&app.characterData);
-    if (app.controlledCharacter.active)
-    {
-        ControlledCharacterFree(&app.controlledCharacter);
-    }
 
     // Unload Geno resources
     if (app.genoModelLoaded)

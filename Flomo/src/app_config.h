@@ -1,111 +1,20 @@
 #pragma once
 
-#include <cstdio>
-#include <cstring>
-#include <cstdlib>
 #include "utils.h"
 #include "raylib.h"
-#include <fstream>
+#include "definitions.h"
 
 
 
-// Animation playback mode for controlled character
-enum class AnimationMode : int
+static const char* CONFIG_FILENAME = "flomo_config.json";
+
+// Get config file path (next to executable or in working directory)
+static inline const char* GetConfigPath()
 {
-    RandomSwitch = 0,   // randomly switch between animations
-    MotionMatching,     // use motion matching to find best animation
-    COUNT
-};
-
-static inline const char* AnimationModeName(AnimationMode mode)
-{
-    switch (mode)
-    {
-    case AnimationMode::RandomSwitch: return "Random Switch";
-    case AnimationMode::MotionMatching: return "Motion Matching";
-    default: return "Unknown";
-    }
+    static char path[512];
+    snprintf(path, sizeof(path), "%s", CONFIG_FILENAME);
+    return path;
 }
-
-// Cursor blend mode - how cursor rotations are blended
-enum class CursorBlendMode : int
-{
-    Basic = 0,           // direct weighted average of cursor rotations
-    VelBlending,         // velocity-driven blending with lerp to target
-    LookaheadDragging,   // lerp towards extrapolated future pose
-    COUNT
-};
-
-static inline const char* CursorBlendModeName(CursorBlendMode mode)
-{
-    switch (mode)
-    {
-    case CursorBlendMode::Basic: return "Basic";
-    case CursorBlendMode::VelBlending: return "Vel Blending";
-    case CursorBlendMode::LookaheadDragging: return "Lookahead Dragging";
-    default: return "Unknown";
-    }
-}
-
-// Motion Matching Feature Types
-enum class FeatureType : int
-{
-    ToePos = 0,          // left+right toe positions (X,Z) => 4 dims
-    ToeVel,              // left+right toe velocities (X,Z) => 4 dims
-    ToeDiff,             // left-right difference (X,Z) => 2 dims
-    FutureVel,        // future root velocity (XZ) at sample points => 2 * points
-
-    COUNT                // Must be last - used for array sizing
-};
-
-// Returns human-readable name for feature type
-static inline const char* FeatureTypeName(FeatureType type)
-{
-    switch (type)
-    {
-    case FeatureType::ToePos: return "Toe Position";
-    case FeatureType::ToeVel: return "Toe Velocity";
-    case FeatureType::ToeDiff: return "Toe Difference";
-    case FeatureType::FutureVel: return "Future Velocity";
-    default: return "Unknown";
-    }
-}
-
-// Descriptor for a single feature type
-struct FeatureTypeDescriptor
-{
-    float weight = 1.0f;  // Weight/importance of this feature in matching (0 = disabled)
-};
-
-struct MotionMatchingFeaturesConfig
-{
-    // Per-feature-type descriptors (indexed by FeatureType enum)
-    FeatureTypeDescriptor features[static_cast<int>(FeatureType::COUNT)];
-
-    // Future trajectory configuration (only used if FutureVelDir weight > 0)
-    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };  // time offsets (seconds)
-
-    // Helper: check if a feature is enabled (weight > 0)
-    bool IsFeatureEnabled(FeatureType type) const
-    {
-        const int idx = static_cast<int>(type);
-        return features[idx].weight > 0.0f;
-    }
-
-    // Helper: get weight for a feature type
-    float GetFeatureWeight(FeatureType type) const
-    {
-        const int idx = static_cast<int>(type);
-        return features[idx].weight;
-    }
-
-    // Helper: set weight for a feature type
-    void SetFeatureWeight(FeatureType type, float weight)
-    {
-        const int idx = static_cast<int>(type);
-        features[idx].weight = weight;
-    }
-};
 
 
 // Load motion matching config from JSON buffer
@@ -120,6 +29,9 @@ static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMa
         const char* name = FeatureTypeName(type);
         config.features[i].weight = ParseFloatValue(jsonBuffer, name, config.features[i].weight);
     }
+
+    // Parse pastTimeOffset
+    config.pastTimeOffset = ParseFloatValue(jsonBuffer, "pastTimeOffset", config.pastTimeOffset);
 
     // Parse future trajectory times array
     // Look for "futureTrajPointTimes": [0.2, 0.4, 0.8]
@@ -157,114 +69,36 @@ static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMa
 }
 
 
-// Simple app config that persists between runs
-struct AppConfig {
-    // Window
-    int windowX = 100;
-    int windowY = 100;
-    int windowWidth = 2200;
-    int windowHeight = 1500;
-
-    // Camera (Unreal mode state - most general representation)
-    float cameraPosX = 2.0f;
-    float cameraPosY = 1.5f;
-    float cameraPosZ = 5.0f;
-    float cameraYaw = 3.14159f;  // PI - facing towards -Z
-    float cameraPitch = 0.0f;
-    float cameraMoveSpeed = 5.0f;
-    int cameraMode = 1;  // 0 = Orbit, 1 = Unreal
-
-    // Render settings (persisted)
-    // Colors stored as separate ints so parsing/writing JSON remains simple here.
-    Color backgroundColor = { 255, 255, 255, 255 };
-    float sunLightConeAngle = 0.2f;
-    float sunLightStrength = 0.25f;
-    float sunAzimuth = 3.14159f / 4.0f;
-    float sunAltitude = 0.8f;
-    Color sunColor = { 253, 255, 232, 255 };
-
-    float skyLightStrength = 0.15f;
-    Color skyColor = { 174, 183, 190, 255 };
-
-    float groundLightStrength = 0.1f;
-    float ambientLightStrength = 1.0f;
-
-    float exposure = 0.9f;
-
-    // Toggles
-    bool drawOrigin = true;
-    bool drawGrid = false;
-    bool drawChecker = true;
-    bool drawCapsules = true;
-    bool drawWireframes = false;
-    bool drawSkeleton = true;
-    bool drawTransforms = false;
-    bool drawAO = true;
-    bool drawShadows = true;
-    bool drawEndSites = true;
-    bool drawFPS = false;
-    bool drawUI = true;
-
-    bool drawFeatures = false;
-    bool drawBlendCursors = true;  // Debug: show individual blend cursor skeletons
-    bool drawVelocities = false;   // Draw joint velocity vectors
-    bool drawAccelerations = false; // Draw joint acceleration vectors
-    bool drawRootVelocities = false; // Draw root motion velocity from each cursor
-    bool drawToeVelocities = false;  // Draw toe velocity vectors (actual vs blended)
-    bool drawFootIK = false;         // Draw foot IK debug (virtual toe positions, etc.)
-
-    // Animation settings
-    AnimationMode animationMode = AnimationMode::RandomSwitch;  // animation playback mode
-    float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
-    float switchInterval = 3.0f;    // time between random animation switches
-    float mmSearchPeriod = 0.1f;    // time between motion matching searches
-    float poseDragLookaheadTime = 0.1f;  // lookahead time for pose dragging (seconds)
-
-    // Cursor blend mode settings
-    CursorBlendMode cursorBlendMode = CursorBlendMode::Basic;
-    float blendPosReturnTime = 0.1f; // time for velblending to lerp towards target
-
-    // Foot IK
-    bool enableFootIK = true;  // enable/disable foot IK towards virtual toe positions
-    bool enableTimedUnlocking = true;  // enable/disable timed unlock mechanism for virtual toes
-    float unlockDistance = 0.2f;  // distance threshold to unlock virtual toe (meters)
-    float unlockDuration = 0.3f;  // time to gradually re-lock virtual toe (seconds)
-    
-    
-    bool drawPlayerInput = false;
-
-    // Motion Matching Configuration
-    MotionMatchingFeaturesConfig mmConfigEditor; // version for edition: use featureConfig in animdatabase for the one actually used
-
-
-    // Validity
-    bool valid = false;
-};
-
-
-// Initialize motion matching config with default values
-static inline void MotionMatchingConfigInit(MotionMatchingFeaturesConfig& config)
+// Save motion matching config to JSON string
+static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeaturesConfig& config)
 {
-    // Initialize all feature weights to 1.0
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"featureWeights\": {\n";
+
     for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
     {
-        config.features[i].weight = 1.0f;
+        const FeatureType type = static_cast<FeatureType>(i);
+        oss << "    \"" << FeatureTypeName(type) << "\": " << config.features[i].weight;
+        if (i < static_cast<int>(FeatureType::COUNT) - 1) oss << ",";
+        oss << "\n";
     }
 
-    // Default future trajectory sample times
-    config.futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };
+    oss << "  },\n";
+
+    oss << "  \"pastTimeOffset\": " << config.pastTimeOffset << ",\n";
+
+    oss << "  \"futureTrajPointTimes\": [";
+    for (size_t i = 0; i < config.futureTrajPointTimes.size(); ++i)
+    {
+        oss << config.futureTrajPointTimes[i];
+        if (i < config.futureTrajPointTimes.size() - 1) oss << ", ";
+    }
+    oss << "]\n";
+    oss << "}";
+
+    return oss.str();
 }
-
-static const char* CONFIG_FILENAME = "flomo_config.json";
-
-// Get config file path (next to executable or in working directory)
-static inline const char* GetConfigPath()
-{
-    static char path[512];
-    snprintf(path, sizeof(path), "%s", CONFIG_FILENAME);
-    return path;
-}
-
 
 // Load config from JSON file
 static inline AppConfig LoadAppConfig(int argc, char** argv)
@@ -351,6 +185,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawRootVelocities = ResolveBoolConfig(buffer, "drawRootVelocities", config.drawRootVelocities, argc, argv);
     config.drawToeVelocities = ResolveBoolConfig(buffer, "drawToeVelocities", config.drawToeVelocities, argc, argv);
     config.drawFootIK = ResolveBoolConfig(buffer, "drawFootIK", config.drawFootIK, argc, argv);
+    config.drawPastHistory = ResolveBoolConfig(buffer, "drawPastHistory", config.drawPastHistory, argc, argv);
 
     config.animationMode = static_cast<AnimationMode>(ResolveIntConfig(buffer, "animationMode", static_cast<int>(config.animationMode), argc, argv));
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
@@ -388,35 +223,8 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
 }
 
 
-// Save motion matching config to JSON string
-static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeaturesConfig& config)
-{
-    std::ostringstream oss;
-    oss << "{\n";
-    oss << "  \"featureWeights\": {\n";
 
-    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
-    {
-        const FeatureType type = static_cast<FeatureType>(i);
-        oss << "    \"" << FeatureTypeName(type) << "\": " << config.features[i].weight;
-        if (i < static_cast<int>(FeatureType::COUNT) - 1) oss << ",";
-        oss << "\n";
-    }
-
-    oss << "  },\n";
-    oss << "  \"futureTrajPointTimes\": [";
-    for (size_t i = 0; i < config.futureTrajPointTimes.size(); ++i)
-    {
-        oss << config.futureTrajPointTimes[i];
-        if (i < config.futureTrajPointTimes.size() - 1) oss << ", ";
-    }
-    oss << "]\n";
-    oss << "}";
-
-    return oss.str();
-}
-
-static inline void SaveAppConfig(const AppConfig& cfg)
+static inline void SaveAppConfig(const AppConfig& config)
 {
     FILE* file = fopen(GetConfigPath(), "w");
     if (!file) {
@@ -424,74 +232,75 @@ static inline void SaveAppConfig(const AppConfig& cfg)
     }
 
     fprintf(file, "{\n");
-    fprintf(file, "    \"windowX\": %d,\n", cfg.windowX);
-    fprintf(file, "    \"windowY\": %d,\n", cfg.windowY);
-    fprintf(file, "    \"windowWidth\": %d,\n", cfg.windowWidth);
-    fprintf(file, "    \"windowHeight\": %d,\n", cfg.windowHeight);
-    fprintf(file, "    \"cameraPosX\": %.4f,\n", cfg.cameraPosX);
-    fprintf(file, "    \"cameraPosY\": %.4f,\n", cfg.cameraPosY);
-    fprintf(file, "    \"cameraPosZ\": %.4f,\n", cfg.cameraPosZ);
-    fprintf(file, "    \"cameraYaw\": %.4f,\n", cfg.cameraYaw);
-    fprintf(file, "    \"cameraPitch\": %.4f,\n", cfg.cameraPitch);
-    fprintf(file, "    \"cameraMoveSpeed\": %.4f,\n", cfg.cameraMoveSpeed);
-    fprintf(file, "    \"cameraMode\": %d,\n", cfg.cameraMode);
+    fprintf(file, "    \"windowX\": %d,\n", config.windowX);
+    fprintf(file, "    \"windowY\": %d,\n", config.windowY);
+    fprintf(file, "    \"windowWidth\": %d,\n", config.windowWidth);
+    fprintf(file, "    \"windowHeight\": %d,\n", config.windowHeight);
+    fprintf(file, "    \"cameraPosX\": %.4f,\n", config.cameraPosX);
+    fprintf(file, "    \"cameraPosY\": %.4f,\n", config.cameraPosY);
+    fprintf(file, "    \"cameraPosZ\": %.4f,\n", config.cameraPosZ);
+    fprintf(file, "    \"cameraYaw\": %.4f,\n", config.cameraYaw);
+    fprintf(file, "    \"cameraPitch\": %.4f,\n", config.cameraPitch);
+    fprintf(file, "    \"cameraMoveSpeed\": %.4f,\n", config.cameraMoveSpeed);
+    fprintf(file, "    \"cameraMode\": %d,\n", config.cameraMode);
 
     // Render settings (colors as arrays)
-    fprintf(file, "    \"backgroundColor\": [ %d, %d, %d ],\n", cfg.backgroundColor.r, cfg.backgroundColor.g, cfg.backgroundColor.b);
+    fprintf(file, "    \"backgroundColor\": [ %d, %d, %d ],\n", config.backgroundColor.r, config.backgroundColor.g, config.backgroundColor.b);
 
-    fprintf(file, "    \"sunLightConeAngle\": %.6f,\n", cfg.sunLightConeAngle);
-    fprintf(file, "    \"sunLightStrength\": %.6f,\n", cfg.sunLightStrength);
-    fprintf(file, "    \"sunAzimuth\": %.6f,\n", cfg.sunAzimuth);
-    fprintf(file, "    \"sunAltitude\": %.6f,\n", cfg.sunAltitude);
-    fprintf(file, "    \"sunColor\": [ %d, %d, %d ],\n", cfg.sunColor.r, cfg.sunColor.g, cfg.sunColor.b);
+    fprintf(file, "    \"sunLightConeAngle\": %.6f,\n", config.sunLightConeAngle);
+    fprintf(file, "    \"sunLightStrength\": %.6f,\n", config.sunLightStrength);
+    fprintf(file, "    \"sunAzimuth\": %.6f,\n", config.sunAzimuth);
+    fprintf(file, "    \"sunAltitude\": %.6f,\n", config.sunAltitude);
+    fprintf(file, "    \"sunColor\": [ %d, %d, %d ],\n", config.sunColor.r, config.sunColor.g, config.sunColor.b);
 
-    fprintf(file, "    \"skyLightStrength\": %.6f,\n", cfg.skyLightStrength);
-    fprintf(file, "    \"skyColor\": [ %d, %d, %d ],\n", cfg.skyColor.r, cfg.skyColor.g, cfg.skyColor.b);
+    fprintf(file, "    \"skyLightStrength\": %.6f,\n", config.skyLightStrength);
+    fprintf(file, "    \"skyColor\": [ %d, %d, %d ],\n", config.skyColor.r, config.skyColor.g, config.skyColor.b);
 
-    fprintf(file, "    \"groundLightStrength\": %.6f,\n", cfg.groundLightStrength);
-    fprintf(file, "    \"ambientLightStrength\": %.6f,\n", cfg.ambientLightStrength);
+    fprintf(file, "    \"groundLightStrength\": %.6f,\n", config.groundLightStrength);
+    fprintf(file, "    \"ambientLightStrength\": %.6f,\n", config.ambientLightStrength);
 
-    fprintf(file, "    \"exposure\": %.6f,\n", cfg.exposure);
+    fprintf(file, "    \"exposure\": %.6f,\n", config.exposure);
 
-    fprintf(file, "    \"drawOrigin\": %s,\n", cfg.drawOrigin ? "true" : "false");
-    fprintf(file, "    \"drawGrid\": %s,\n", cfg.drawGrid ? "true" : "false");
-    fprintf(file, "    \"drawChecker\": %s,\n", cfg.drawChecker ? "true" : "false");
-    fprintf(file, "    \"drawCapsules\": %s,\n", cfg.drawCapsules ? "true" : "false");
-    fprintf(file, "    \"drawWireframes\": %s,\n", cfg.drawWireframes ? "true" : "false");
-    fprintf(file, "    \"drawSkeleton\": %s,\n", cfg.drawSkeleton ? "true" : "false");
-    fprintf(file, "    \"drawTransforms\": %s,\n", cfg.drawTransforms ? "true" : "false");
-    fprintf(file, "    \"drawAO\": %s,\n", cfg.drawAO ? "true" : "false");
-    fprintf(file, "    \"drawShadows\": %s,\n", cfg.drawShadows ? "true" : "false");
-    fprintf(file, "    \"drawEndSites\": %s,\n", cfg.drawEndSites ? "true" : "false");
-    fprintf(file, "    \"drawFPS\": %s,\n", cfg.drawFPS ? "true" : "false");
-    fprintf(file, "    \"drawUI\": %s,\n", cfg.drawUI ? "true" : "false");
+    fprintf(file, "    \"drawOrigin\": %s,\n", config.drawOrigin ? "true" : "false");
+    fprintf(file, "    \"drawGrid\": %s,\n", config.drawGrid ? "true" : "false");
+    fprintf(file, "    \"drawChecker\": %s,\n", config.drawChecker ? "true" : "false");
+    fprintf(file, "    \"drawCapsules\": %s,\n", config.drawCapsules ? "true" : "false");
+    fprintf(file, "    \"drawWireframes\": %s,\n", config.drawWireframes ? "true" : "false");
+    fprintf(file, "    \"drawSkeleton\": %s,\n", config.drawSkeleton ? "true" : "false");
+    fprintf(file, "    \"drawTransforms\": %s,\n", config.drawTransforms ? "true" : "false");
+    fprintf(file, "    \"drawAO\": %s,\n", config.drawAO ? "true" : "false");
+    fprintf(file, "    \"drawShadows\": %s,\n", config.drawShadows ? "true" : "false");
+    fprintf(file, "    \"drawEndSites\": %s,\n", config.drawEndSites ? "true" : "false");
+    fprintf(file, "    \"drawFPS\": %s,\n", config.drawFPS ? "true" : "false");
+    fprintf(file, "    \"drawUI\": %s,\n", config.drawUI ? "true" : "false");
 
-    fprintf(file, "    \"drawFeatures\": %s,\n", cfg.drawFeatures ? "true" : "false");
-    fprintf(file, "    \"drawBlendCursors\": %s,\n", cfg.drawBlendCursors ? "true" : "false");
-    fprintf(file, "    \"drawVelocities\": %s,\n", cfg.drawVelocities ? "true" : "false");
-    fprintf(file, "    \"drawAccelerations\": %s,\n", cfg.drawAccelerations ? "true" : "false");
-    fprintf(file, "    \"drawRootVelocities\": %s,\n", cfg.drawRootVelocities ? "true" : "false");
-    fprintf(file, "    \"drawToeVelocities\": %s,\n", cfg.drawToeVelocities ? "true" : "false");
-    fprintf(file, "    \"drawFootIK\": %s,\n", cfg.drawFootIK ? "true" : "false");
+    fprintf(file, "    \"drawFeatures\": %s,\n", config.drawFeatures ? "true" : "false");
+    fprintf(file, "    \"drawBlendCursors\": %s,\n", config.drawBlendCursors ? "true" : "false");
+    fprintf(file, "    \"drawVelocities\": %s,\n", config.drawVelocities ? "true" : "false");
+    fprintf(file, "    \"drawAccelerations\": %s,\n", config.drawAccelerations ? "true" : "false");
+    fprintf(file, "    \"drawRootVelocities\": %s,\n", config.drawRootVelocities ? "true" : "false");
+    fprintf(file, "    \"drawToeVelocities\": %s,\n", config.drawToeVelocities ? "true" : "false");
+    fprintf(file, "    \"drawFootIK\": %s,\n", config.drawFootIK ? "true" : "false");
+    fprintf(file, "  \"drawPastHistory\": %s,\n", config.drawPastHistory ? "true" : "false");
 
-    fprintf(file, "    \"animationMode\": %d,\n", static_cast<int>(cfg.animationMode));
-    fprintf(file, "    \"defaultBlendTime\": %.4f,\n", cfg.defaultBlendTime);
-    fprintf(file, "    \"switchInterval\": %.4f,\n", cfg.switchInterval);
-    fprintf(file, "    \"mmSearchPeriod\": %.4f,\n", cfg.mmSearchPeriod);
-    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", cfg.poseDragLookaheadTime);
+    fprintf(file, "    \"animationMode\": %d,\n", static_cast<int>(config.animationMode));
+    fprintf(file, "    \"defaultBlendTime\": %.4f,\n", config.defaultBlendTime);
+    fprintf(file, "    \"switchInterval\": %.4f,\n", config.switchInterval);
+    fprintf(file, "    \"mmSearchPeriod\": %.4f,\n", config.mmSearchPeriod);
+    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", config.poseDragLookaheadTime);
 
-    fprintf(file, "    \"cursorBlendMode\": %d,\n", static_cast<int>(cfg.cursorBlendMode));
-    fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", cfg.blendPosReturnTime);
-    fprintf(file, "    \"enableFootIK\": %s,\n", cfg.enableFootIK ? "true" : "false");
+    fprintf(file, "    \"cursorBlendMode\": %d,\n", static_cast<int>(config.cursorBlendMode));
+    fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", config.blendPosReturnTime);
+    fprintf(file, "    \"enableFootIK\": %s,\n", config.enableFootIK ? "true" : "false");
     
-    fprintf(file, "    \"enableTimedUnlocking\": %s,\n", cfg.enableTimedUnlocking ? "true" : "false");
-    fprintf(file, "    \"unlockDistance\": %.4f,\n", cfg.unlockDistance);
-    fprintf(file, "    \"unlockDuration\": %.4f,\n", cfg.unlockDuration);
-    fprintf(file, "    \"drawPlayerInput\": %s\n", cfg.drawPlayerInput ? "true" : "false");
+    fprintf(file, "    \"enableTimedUnlocking\": %s,\n", config.enableTimedUnlocking ? "true" : "false");
+    fprintf(file, "    \"unlockDistance\": %.4f,\n", config.unlockDistance);
+    fprintf(file, "    \"unlockDuration\": %.4f,\n", config.unlockDuration);
+    fprintf(file, "    \"drawPlayerInput\": %s\n", config.drawPlayerInput ? "true" : "false");
 
 
     // Save motion matching config
-    std::string mmConfigJson = MotionMatchingConfigToJson(cfg.mmConfigEditor);
+    std::string mmConfigJson = MotionMatchingConfigToJson(config.mmConfigEditor);
     fprintf(file, "  \"motionMatchingConfig\": %s,\n", mmConfigJson.c_str());
 
     fprintf(file, "}\n");

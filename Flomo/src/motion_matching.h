@@ -8,34 +8,26 @@
 #include "transform_data.h"
 #include "app_config.h"
 #include "utils.h"
+#include "definitions.h"
 
-
-//----------------------------------------------------------------------------------
-//----------------------------------------------------------------------------------
-// Player Control Input
-//----------------------------------------------------------------------------------
-
-struct PlayerControlInput {
-    Vector3 desiredVelocity = Vector3Zero();  // Desired velocity in world space (XZ plane)
-    float maxSpeed = 2.0f;                     // Maximum movement speed (m/s)
-};
 
 //----------------------------------------------------------------------------------
 // Motion Matching - Feature Extraction and Search
 //----------------------------------------------------------------------------------
-
 // Extract motion features from current character state
 // This produces a feature vector in the same format as AnimDatabase features
 // Used by motion matching to build query vector from runtime character state
 static void ComputeMotionFeatures(
     const AnimDatabase* db,
-    const TransformData* xform,
-    const Vector3* toeVelocity,        // [SIDES_COUNT] - post-IK toe velocities
-    const PlayerControlInput* input,
+    const ControlledCharacter* cc,
     std::vector<float>& outFeatures)
 {
     if (db == nullptr || !db->valid) return;
-    if (xform == nullptr || toeVelocity == nullptr || input == nullptr) return;
+    if (cc == nullptr) return;
+
+    const TransformData* xform = &cc->xformData;
+    const Vector3* toeVelocity = cc->toeVelocity;
+    const PlayerControlInput* input = &cc->playerInput;
 
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
 
@@ -125,6 +117,53 @@ static void ComputeMotionFeatures(
             outFeatures[fi++] = localDesiredVel.x;
             outFeatures[fi++] = localDesiredVel.z;
         }
+    }
+
+    // PastPosition: past hip position in current hip horizontal frame (XZ)
+    if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
+    {
+        Vector3 pastPosLocal = Vector3Zero();
+
+        if (!cc->positionHistory.empty())
+        {
+            const float currentTime = (float)GetTime();
+            const float targetPastTime = currentTime - cfg.pastTimeOffset;
+
+            // Find the history point closest to targetPastTime
+            // History is ordered from oldest (front) to newest (back)
+            int bestIdx = -1;
+            float bestTimeDiff = FLT_MAX;
+
+            for (int i = 0; i < (int)cc->positionHistory.size(); ++i)
+            {
+                const float timeDiff = (float)abs(cc->positionHistory[i].timestamp - (double)targetPastTime);
+                if (timeDiff < bestTimeDiff)
+                {
+                    bestTimeDiff = timeDiff;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx >= 0)
+            {
+                const Vector3 pastHipPos = cc->positionHistory[bestIdx].position;
+
+                // Use current world hip position (from character world transform)
+                // cc->worldPosition is the root, hipPos is already in world space
+                const Vector3 currentWorldHipPos = hipPos;
+
+                // Compute vector from current hip to past hip
+                const Vector3 hipToPastHip = Vector3Subtract(pastHipPos, currentWorldHipPos);
+
+                // Transform to current hip horizontal frame
+                pastPosLocal = Vector3RotateByQuaternion(hipToPastHip, invHipYaw);
+            }
+            // else: no history available yet, leave as zero
+        }
+
+        // Store only XZ components (horizontal position)
+        outFeatures[fi++] = pastPosLocal.x;
+        outFeatures[fi++] = pastPosLocal.z;
     }
 
     assert(fi == db->featureDim);

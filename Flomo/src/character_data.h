@@ -18,10 +18,10 @@
 struct CharacterData
 {
     // Total number of characters
-    int count;
+    int count = 0;
 
     // Character which is "active" or selected
-    int active;
+    int active = 0;
 
     // Character BVH Data
     std::vector<BVHData> bvhData;
@@ -58,10 +58,10 @@ struct CharacterData
     std::vector<std::string> jointNamesCombo;
 
     // If the color picker is active
-    bool colorPickerActive;
+    bool colorPickerActive = false;
 
     // Flag set by UI to request a clear (handled in main update with full state access)
-    bool clearRequested;
+    bool clearRequested = false;
 
     // Default values for new characters
     float defaultOpacity;
@@ -72,11 +72,6 @@ struct CharacterData
 // Initializes all the CharacterData to a safe state
 static inline void CharacterDataInit(CharacterData* data, int argc, char** argv)
 {
-    data->count = 0;
-    data->active = 0;
-    data->clearRequested = false;
-    data->colorPickerActive = false;
-
     // Store default values for new characters
     data->defaultOpacity = ArgFloat(argc, argv, "capsuleOpacity", 1.0f);
     data->defaultRadius = ArgFloat(argc, argv, "maxCapsuleRadius", 0.04f);
@@ -92,24 +87,6 @@ static inline void CharacterDataInit(CharacterData* data, int argc, char** argv)
     };
 
     data->colorPickerActive = ArgBool(argc, argv, "colorPickerActive", false);
-}
-
-static inline void CharacterDataFree(CharacterData* data)
-{
-    data->xformData.clear();
-    data->xformTmp0.clear();
-    data->xformTmp1.clear();
-    data->xformTmp2.clear();
-    data->xformTmp3.clear();
-    data->bvhData.clear();
-    data->scales.clear();
-    data->names.clear();
-    data->autoScales.clear();
-    data->colors.clear();
-    data->opacities.clear();
-    data->radii.clear();
-    data->filePaths.clear();
-    data->count = 0;
 }
 
 // Helper to get color for a new character

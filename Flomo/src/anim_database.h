@@ -14,78 +14,6 @@
 #include "character_data.h"
 #include "app_config.h"
 
-//----------------------------------------------------------------------------------
-// Animation Database
-//----------------------------------------------------------------------------------
-
-// A unified view of all loaded animations, suitable for sampling by ControlledCharacter.
-struct AnimDatabase
-{
-    // Motion matching feature configuration
-    MotionMatchingFeaturesConfig featuresConfig;
-
-    // Pose drag lookahead time (seconds) - used for precomputing lookahead poses
-    float poseDragLookaheadTime = 0.1f;
-
-    // References to all loaded animations
-    int animCount = -1;
-
-    // Per-animation info
-    std::vector<int> animStartFrame;   // Global frame index where each anim starts
-    std::vector<int> animFrameCount;   // Number of frames in each anim
-    std::vector<float> animFrameTime;  // Frame time for each anim (usually same)
-
-    // Total frames across all animations
-    int totalFrames = -1;
-
-    // Scale to apply when sampling (for unit conversion)
-    float scale = 0.0f;
-
-    // Validity: true only if ALL animations are compatible with canonical skeleton
-    bool valid = false;
-
-    // ---- Motion-database specific fields ----
-    // Canonical joint count (set from first animation's joint count)
-    int jointCount = -1;
-
-    // Number of frames actually stored in the compacted motion DB (may be <= totalFrames
-    // if some clips have mismatched skeletons and are skipped)
-    int motionFrameCount = -1;
-
-    // Per-frame joint transforms: [motionFrameCount x jointCount]
-    Array2D<Vector3> globalJointPositions;      // global positions
-    Array2D<Quaternion> globalJointRotations;   // global rotations
-    Array2D<Vector3> globalJointVelocities;     // velocities (defined at midpoint between frames)
-    Array2D<Vector3> globalJointAccelerations;  // accelerations (derivative of velocity)
-
-    // local joint transforms (for blending without global->local conversion)
-    Array2D<Vector3> localJointPositions;           // local positions [motionFrameCount x jointCount]
-    Array2D<Rot6d> localJointRotations6d;           // local rotations as Rot6d [motionFrameCount x jointCount]
-    Array2D<Vector3> localJointAngularVelocities;   // local angular velocities [motionFrameCount x jointCount]
-
-    // lookahead pose for inertial dragging: pose[f] + 3*(pose[f] - pose[f-1])
-    Array2D<Rot6d> lookaheadLocalRotations6d;       // [motionFrameCount x jointCount]
-
-    // Segmentation of the compacted motion DB into clips:
-    // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
-    std::vector<int> clipStartFrame;
-    std::vector<int> clipEndFrame;
-
-    // motion matching features [motionFrameCount x featureDim]
-    int featureDim = -1;
-    Array2D<float> features;
-    int hipJointIndex = -1;            // resolved index for "Hips" in canonical skeleton
-    int toeIndices[SIDES_COUNT] = { -1, -1 };
-    int footIndices[SIDES_COUNT] = { -1, -1 };    // ankle
-    int lowlegIndices[SIDES_COUNT] = { -1, -1 };  // shin/calf
-    int uplegIndices[SIDES_COUNT] = { -1, -1 };   // thigh
-    std::vector<std::string> featureNames;
-    std::vector<FeatureType> featureTypes;      // which FeatureType each feature dimension belongs to
-
-    std::vector<float> featuresMean;            // mean of each feature dimension [featureDim]
-    std::vector<float> featuresStd;             // standard deviation of each feature dimension [featureDim]
-    Array2D<float> normalizedFeatures;          // normalized features [motionFrameCount x featureDim]
-};
 
 static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
 {
@@ -94,37 +22,6 @@ static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
         if (frame >= db->clipStartFrame[c] && frame < db->clipEndFrame[c]) return c;
     }
     return -1;
-}
-
-// Free/reset AnimDatabase to empty state
-static void AnimDatabaseFree(AnimDatabase* db)
-{
-    db->animCount = -1;
-    db->animStartFrame.clear();
-    db->animFrameCount.clear();
-    db->animFrameTime.clear();
-    db->totalFrames = -1;
-    db->scale = 0.0f;
-    db->valid = false;
-    db->jointCount = -1;
-    db->motionFrameCount = -1;
-    db->globalJointPositions.clear();
-    db->globalJointRotations.clear();
-    db->globalJointVelocities.clear();
-    db->globalJointAccelerations.clear();
-    db->localJointPositions.clear();
-    db->localJointRotations6d.clear();
-    db->localJointAngularVelocities.clear();
-    db->lookaheadLocalRotations6d.clear();
-    db->clipStartFrame.clear();
-    db->clipEndFrame.clear();
-    db->features.clear();
-    db->featureDim = 0;
-    db->featureNames.clear();
-    db->featureTypes.clear();
-    db->featuresMean.clear();
-    db->featuresStd.clear();
-    db->normalizedFeatures.clear();
 }
 
 // Compute feature normalization statistics and normalized features
@@ -150,21 +47,13 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     using std::string;
     using std::span;
 
+    AnimDatabaseFree(db);
+
     db->animCount = characterData->count;
     db->animStartFrame.resize(db->animCount);
     db->animFrameCount.resize(db->animCount);
     db->animFrameTime.resize(db->animCount);
     db->motionFrameCount = 0;
-    db->globalJointPositions.clear();
-    db->globalJointRotations.clear();
-    db->globalJointVelocities.clear();
-    db->globalJointAccelerations.clear();
-    db->localJointPositions.clear();
-    db->localJointRotations6d.clear();
-    db->localJointAngularVelocities.clear();
-    db->lookaheadLocalRotations6d.clear();
-    db->clipStartFrame.clear();
-    db->clipEndFrame.clear();
     db->valid = false; // pessimistic until proven valid
 
     int globalFrame = 0;
@@ -273,8 +162,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
         db->clipEndFrame.push_back(motionFrameIdx);
     }
-
-    TransformDataFree(&tmpXform);
 
     // Compute velocities for each joint at each frame
     // Velocity at frame i is defined at midpoint between frame i and i+1: v = (pos[i+1] - pos[i]) / frameTime
@@ -391,7 +278,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
     }
 
-    // Compute lookahead poses: pose[f] + n * (pose[f] - pose[f-1]) = (1+n)*pose[f] - n*pose[f-1]
+    // Compute lookahead poses: pose[f] + n * (pose[f+1] - pose[f]) = n*pose[f+1] - (n-1)*pose[f]
     // where n = lookaheadTime / frameTime (extrapolates lookaheadTime seconds ahead)
     for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
     {
@@ -399,19 +286,19 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipEnd = db->clipEndFrame[c];
         const float frameTime = db->animFrameTime[c];
         const float n = db->poseDragLookaheadTime / frameTime;
-        const float currWeight = 1.0f + n;
-        const float prevWeight = n;
+        const float nextWeight = n;
+        const float currWeight = 1.0f - n;
 
         for (int f = clipStart; f < clipEnd; ++f)
         {
-            const bool isFirstFrame = (f == clipStart);
+            const bool isLastFrame = (f == clipEnd - 1);
 
             span<Rot6d> lookaheadRow = db->lookaheadLocalRotations6d.row_view(f);
             span<const Rot6d> currRow = db->localJointRotations6d.row_view(f);
 
-            if (isFirstFrame || clipEnd - clipStart <= 1)
+            if (isLastFrame || clipEnd - clipStart <= 1)
             {
-                // no previous frame to extrapolate from, just copy current
+                // no next frame to extrapolate from, just copy current
                 for (int j = 0; j < db->jointCount; ++j)
                 {
                     lookaheadRow[j] = currRow[j];
@@ -419,18 +306,18 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             }
             else
             {
-                span<const Rot6d> prevRow = db->localJointRotations6d.row_view(f - 1);
+                span<const Rot6d> nextRow = db->localJointRotations6d.row_view(f + 1);
 
                 for (int j = 0; j < db->jointCount; ++j)
                 {
-                    // lookahead = (1+n)*curr - n*prev
+                    // lookahead = (1-n)*curr + n*next = curr + n*(next - curr)
                     Rot6d result;
-                    result.ax = currWeight * currRow[j].ax - prevWeight * prevRow[j].ax;
-                    result.ay = currWeight * currRow[j].ay - prevWeight * prevRow[j].ay;
-                    result.az = currWeight * currRow[j].az - prevWeight * prevRow[j].az;
-                    result.bx = currWeight * currRow[j].bx - prevWeight * prevRow[j].bx;
-                    result.by = currWeight * currRow[j].by - prevWeight * prevRow[j].by;
-                    result.bz = currWeight * currRow[j].bz - prevWeight * prevRow[j].bz;
+                    result.ax = currWeight * currRow[j].ax + nextWeight * nextRow[j].ax;
+                    result.ay = currWeight * currRow[j].ay + nextWeight * nextRow[j].ay;
+                    result.az = currWeight * currRow[j].az + nextWeight * nextRow[j].az;
+                    result.bx = currWeight * currRow[j].bx + nextWeight * nextRow[j].bx;
+                    result.by = currWeight * currRow[j].by + nextWeight * nextRow[j].by;
+                    result.bz = currWeight * currRow[j].bz + nextWeight * nextRow[j].bz;
                     Rot6dNormalize(result);
                     lookaheadRow[j] = result;
                 }
@@ -563,6 +450,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     if (cfg.IsFeatureEnabled(FeatureType::ToeVel)) db->featureDim += 4;
     if (cfg.IsFeatureEnabled(FeatureType::ToeDiff)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::PastPosition)) db->featureDim += 2;
 
     db->features.clear();
     db->featureNames.clear();
@@ -698,10 +586,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         // DIFFERENCE: toeDifference = Left - Right (in hip horizontal frame) => (dx, dz)
         if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
         {
-            const float diffX = localLeftPos.x - localRightPos.x;
-            const float diffZ = localLeftPos.z - localRightPos.z;
-            featRow[currentFeature++] = diffX;
-            featRow[currentFeature++] = diffZ;
+            featRow[currentFeature++] = localLeftPos.x - localRightPos.x;
+            featRow[currentFeature++] = localLeftPos.z - localRightPos.z;
 
             if (isFirstFrame)
             {
@@ -761,9 +647,47 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     db->featureTypes.push_back(FeatureType::FutureVel);
                     db->featureTypes.push_back(FeatureType::FutureVel);
                 }
+            }        
+        }
+
+
+        // PAST POSITION: past hip position in current hip horizontal frame (XZ)
+        if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
+        {
+            Vector3 pastPosLocal = Vector3Zero();
+
+            assert(db->hipJointIndex);
+
+            const float frameTime = db->animFrameTime[clipIdx];
+            const float pastTime = cfg.pastTimeOffset;
+            const int pastFrameOffset = (int)(pastTime / frameTime + 0.5f);
+            const int pastFrame = f - pastFrameOffset;
+
+            // Check if past frame is within the same clip
+            if (pastFrame >= clipStart && pastFrame < clipEnd)
+            {
+                // Get past hip position
+                span<const Vector3> pastPosRow = db->globalJointPositions.row_view(pastFrame);
+                const Vector3 pastHipPos = pastPosRow[db->hipJointIndex];
+
+                // Compute vector from current hip to past hip
+                const Vector3 hipToPastHip = Vector3Subtract(pastHipPos, hipPos);
+
+                // Transform to current hip horizontal frame
+                pastPosLocal = Vector3RotateByQuaternion(hipToPastHip, invHipYaw);
             }
 
-        
+            // Store only XZ components (horizontal position)
+            featRow[currentFeature++] = pastPosLocal.x;
+            featRow[currentFeature++] = pastPosLocal.z;
+
+            if (isFirstFrame)
+            {
+                db->featureNames.push_back(string("PastPosX"));
+                db->featureNames.push_back(string("PastPosZ"));
+                db->featureTypes.push_back(FeatureType::PastPosition);
+                db->featureTypes.push_back(FeatureType::PastPosition);
+            }
         }
 
         assert(currentFeature == db->featureDim);

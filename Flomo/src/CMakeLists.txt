@@ -27,6 +27,7 @@ set(FLOMO_SOURCES
 
 # All the header files our project uses
 set(FLOMO_HEADERS
+    definitions.h
     pch.h
     math_utils.h
     utils.h

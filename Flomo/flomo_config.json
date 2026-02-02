@@ -1,8 +1,8 @@
 {
-    "windowX": 0,
-    "windowY": 23,
-    "windowWidth": 1920,
-    "windowHeight": 1129,
+    "windowX": 85,
+    "windowY": 31,
+    "windowWidth": 3350,
+    "windowHeight": 1417,
     "cameraPosX": 4.1247,
     "cameraPosY": 3.4299,
     "cameraPosZ": 14.5478,
@@ -39,9 +39,10 @@
     "drawAccelerations": false,
     "drawRootVelocities": false,
     "drawToeVelocities": false,
-    "drawFootIK": true,
-    "animationMode": 0,
-    "defaultBlendTime": 0.2500,
+    "drawFootIK": false,
+  "drawPastHistory": false,
+    "animationMode": 1,
+    "defaultBlendTime": 0.1800,
     "switchInterval": 0.8800,
     "mmSearchPeriod": 0.1000,
     "poseDragLookaheadTime": 0.2000,
@@ -54,11 +55,13 @@
     "drawPlayerInput": true
   "motionMatchingConfig": {
   "featureWeights": {
-    "Toe Position": 1,
+    "Toe Position": 0,
     "Toe Velocity": 1,
     "Toe Difference": 1,
-    "Future Velocity": 1
+    "Future Velocity": 1,
+    "Past Position": 0.3
   },
+  "pastTimeOffset": 0.1,
   "futureTrajPointTimes": [0.2, 0.4, 0.8]
 },
 }

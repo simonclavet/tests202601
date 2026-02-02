@@ -5,27 +5,11 @@
 #include <stdlib.h>
 #include <vector>
 
+#include "definitions.h"
 #include "raylib.h"
 #include "raymath.h"
 #include "math_utils.h"
 #include "bvh_parser.h"
-
-//----------------------------------------------------------------------------------
-// Transform Data
-//----------------------------------------------------------------------------------
-
-// Structure for containing a sampled pose as joint transforms
-struct TransformData
-{
-    int jointCount;
-    std::vector<int> parents;
-    std::vector<bool> endSite;
-    std::vector<Vector3> localPositions;
-    std::vector<Quaternion> localRotations;
-    std::vector<Vector3> globalPositions;
-    std::vector<Quaternion> globalRotations;
-
-};
 
 static inline void TransformDataInit(TransformData* data)
 {
@@ -55,21 +39,6 @@ static inline void TransformDataResize(TransformData* data, const BVHData* bvh)
         data->endSite[i] = bvh->joints[i].endSite;
         data->parents[i] = bvh->joints[i].parent;
     }
-}
-
-static inline void TransformDataFree(TransformData* data)
-{
-    // Vectors automatically clean up their memory when they go out of scope,
-    // but we can clear them explicitly if needed
-    data->parents.clear();
-    data->endSite.clear();
-    data->localPositions.clear();
-    data->localRotations.clear();
-    data->globalPositions.clear();
-    data->globalRotations.clear();
-
-    // If you want to ensure memory is freed, you can use swap trick
-    // but usually clear() is sufficient as vectors manage their own memory
 }
 
 // Sample joint transforms from a given frame of the BVH file and with a given scale
