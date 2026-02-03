@@ -137,6 +137,7 @@ struct AppConfig {
     float cameraPitch = 0.0f;
     float cameraMoveSpeed = 5.0f;
     int cameraMode = 1;  // 0 = Orbit, 1 = Unreal
+    float cameraTargetBlendtime = 0.2f;  // Smooth target following blendtime for Orbit and LazyTurretFollower
 
     // Render settings (persisted)
     // Colors stored as separate ints so parsing/writing JSON remains simple here.
@@ -267,6 +268,15 @@ struct AnimDatabase
     // lookahead pose for inertial dragging: pose[f] + 3*(pose[f] - pose[f-1])
     Array2D<Rot6d> lookaheadLocalRotations6d;       // [motionFrameCount x jointCount]
 
+    // root motion velocities (stored separately for clarity)
+    // These are linear XZ velocities defined at frame midpoints
+    std::vector<Vector3> rootMotionVelocities;     // [motionFrameCount] - XZ velocity only
+    std::vector<float> rootMotionYawRates;         // [motionFrameCount] - yaw angular velocity (rad/s)
+
+    // lookahead root motion velocities (extrapolated for smooth anticipation)
+    std::vector<Vector3> lookaheadRootMotionVelocities;  // [motionFrameCount] - extrapolated XZ velocity
+    std::vector<float> lookaheadRootMotionYawRates;      // [motionFrameCount] - extrapolated yaw rate (rad/s)
+
     // Segmentation of the compacted motion DB into clips:
     // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
     std::vector<int> clipStartFrame;
@@ -309,6 +319,10 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointRotations6d.clear();
     db->localJointAngularVelocities.clear();
     db->lookaheadLocalRotations6d.clear();
+    db->rootMotionVelocities.clear();
+    db->rootMotionYawRates.clear();
+    db->lookaheadRootMotionVelocities.clear();
+    db->lookaheadRootMotionYawRates.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
     db->features.clear();
@@ -395,6 +409,14 @@ struct BlendCursor {
     std::vector<Rot6d> localRotations6d;
     std::vector<Vector3> localAngularVelocities;
     std::vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
+
+    // Sampled root motion velocities from database (animation space, before world transform)
+    Vector3 sampledRootVelocityAnim = Vector3Zero();  // XZ velocity in animation space
+    float sampledRootYawRate = 0.0f;                   // yaw rate (rad/s)
+
+    // Sampled lookahead root motion velocities (extrapolated for anticipation)
+    Vector3 sampledLookaheadRootVelocityAnim = Vector3Zero();  // lookahead XZ velocity
+    float sampledLookaheadRootYawRate = 0.0f;                   // lookahead yaw rate (rad/s)
 
     // Global-space pose for debug visualization (computed via FK after sampling)
     std::vector<Vector3> globalPositions;
@@ -502,6 +524,11 @@ struct ControlledCharacter {
     // LookaheadDragging state
     std::vector<Rot6d> lookaheadDragPose6d;         // running pose state for lookahead dragging
     bool lookaheadDragInitialized = false;
+
+    // Lookahead root motion velocity state
+    Vector3 lookaheadDragVelocity = Vector3Zero();   // running velocity state for lookahead dragging (world space)
+    float lookaheadDragYawRate = 0.0f;               // running yaw rate for lookahead dragging (rad/s)
+    bool lookaheadVelocityInitialized = false;
 
     // Smoothed root motion state
     Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)

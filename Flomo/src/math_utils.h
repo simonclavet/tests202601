@@ -24,6 +24,14 @@ static inline float Saturate(float x)
     return Clamp(x, 0.0f, 1.0f);
 }
 
+// Clamp value to [0, 1] range (same as Saturate, but more explicit name for in-place operations)
+static inline float ClampZeroOne(float x)
+{
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
 // smoothstep: smooth interpolation with zero derivative at endpoints
 // t should be in [0, 1], returns value in [0, 1]
 static inline float SmoothStep(float t)
@@ -83,6 +91,15 @@ static inline float ClampedInvLerp(float a, float b, float value)
     if (fabsf(b - a) < 1e-6f) return 0.0f;  // Avoid division by zero
     const float t = (value - a) / (b - a);
     return Clamp(t, 0.0f, 1.0f);
+}
+
+// Wrap angle to [-PI, PI] range
+// Useful for computing angular differences and velocities
+static inline float WrapAngleToPi(float angle)
+{
+    while (angle > PI) angle -= 2.0f * PI;
+    while (angle < -PI) angle += 2.0f * PI;
+    return angle;
 }
 
 // This is a safe version of QuaternionBetween which returns a 180 deg rotation
@@ -356,6 +373,58 @@ static inline void DoubleSpringDamper(
 
     SimpleSpringDamperUsingDampingEydt(state.xi, state.vi, x_goal, y, eydt, dt);
     SimpleSpringDamperUsingDampingEydt(state.x, state.v, state.xi, y, eydt, dt);
+}
+
+// Vector3 versions of spring dampers
+static inline void SimpleSpringDamperUsingDampingEydtVector3(
+    Vector3& x,
+    Vector3& v,
+    Vector3 x_goal,
+    float damping,
+    float eydt,
+    float dt)
+{
+    const float y = damping;
+    const Vector3 j0 = Vector3Subtract(x, x_goal);
+    const Vector3 j1 = Vector3Add(v, Vector3Scale(j0, y));
+
+    x = Vector3Add(Vector3Scale(Vector3Add(j0, Vector3Scale(j1, dt)), eydt), x_goal);
+    v = Vector3Scale(Vector3Subtract(v, Vector3Scale(j1, y * dt)), eydt);
+}
+
+static inline void SimpleSpringDamperVector3(
+    Vector3& x,
+    Vector3& v,
+    Vector3 x_goal,
+    float blendtime,
+    float dt)
+{
+    const float y = HalflifeToDamping(blendtime / 2.0f) / 2.0f;
+    const float eydt = FastNegExp(y * dt);
+
+    SimpleSpringDamperUsingDampingEydtVector3(x, v, x_goal, y, eydt, dt);
+}
+
+struct DoubleSpringDamperStateVector3
+{
+    Vector3 x = Vector3Zero();
+    Vector3 v = Vector3Zero();
+    Vector3 xi = Vector3Zero();
+    Vector3 vi = Vector3Zero();
+};
+
+static inline void DoubleSpringDamperVector3(
+    DoubleSpringDamperStateVector3& state,
+    Vector3 x_goal,
+    float blendtime,
+    float dt)
+{
+    // half of the blendtime for each damper
+    const float y = HalflifeToDamping(blendtime / 4.0f) / 2.0f;
+    const float eydt = FastNegExp(y * dt);
+
+    SimpleSpringDamperUsingDampingEydtVector3(state.xi, state.vi, x_goal, y, eydt, dt);
+    SimpleSpringDamperUsingDampingEydtVector3(state.x, state.v, state.xi, y, eydt, dt);
 }
 
 

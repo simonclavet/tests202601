@@ -325,6 +325,100 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
     }
 
+    // Compute root motion velocities (XZ linear + yaw angular)
+    // These are defined at midpoints between frames, same as joint velocities
+    db->rootMotionVelocities.resize(db->motionFrameCount);
+    db->rootMotionYawRates.resize(db->motionFrameCount);
+
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float invFrameTime = 1.0f / frameTime;
+        const int rootIdx = 0;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+
+            if (clipEnd - clipStart <= 1)
+            {
+                // Single frame clip - zero velocity
+                db->rootMotionVelocities[f] = Vector3Zero();
+                db->rootMotionYawRates[f] = 0.0f;
+                continue;
+            }
+
+            if (isLastFrame)
+            {
+                // Last frame - copy from previous
+                db->rootMotionVelocities[f] = db->rootMotionVelocities[f - 1];
+                db->rootMotionYawRates[f] = db->rootMotionYawRates[f - 1];
+            }
+            else
+            {
+                // Compute XZ linear velocity from local root positions
+                span<const Vector3> pos0 = db->localJointPositions.row_view(f);
+                span<const Vector3> pos1 = db->localJointPositions.row_view(f + 1);
+
+                Vector3 deltaPos = Vector3Subtract(pos1[rootIdx], pos0[rootIdx]);
+                deltaPos.y = 0.0f;  // XZ only
+                db->rootMotionVelocities[f] = Vector3Scale(deltaPos, invFrameTime);
+
+                // Compute yaw angular velocity from local root rotations
+                span<const Rot6d> rot0 = db->localJointRotations6d.row_view(f);
+                span<const Rot6d> rot1 = db->localJointRotations6d.row_view(f + 1);
+
+                const float yaw0 = Rot6dGetYaw(rot0[rootIdx]);
+                const float yaw1 = Rot6dGetYaw(rot1[rootIdx]);
+
+                const float deltaYaw = WrapAngleToPi(yaw1 - yaw0);
+                db->rootMotionYawRates[f] = deltaYaw * invFrameTime;
+            }
+        }
+    }
+
+    // Compute lookahead root motion velocities (extrapolated for smooth anticipation)
+    // lookahead = vel[f] + n*(vel[f+1] - vel[f]) where n = lookaheadTime / frameTime
+    db->lookaheadRootMotionVelocities.resize(db->motionFrameCount);
+    db->lookaheadRootMotionYawRates.resize(db->motionFrameCount);
+
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float n = db->poseDragLookaheadTime / frameTime;
+        const float nextWeight = n;
+        const float currWeight = 1.0f - n;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+
+            if (isLastFrame || clipEnd - clipStart <= 1)
+            {
+                // no next frame to extrapolate from, just copy current
+                db->lookaheadRootMotionVelocities[f] = db->rootMotionVelocities[f];
+                db->lookaheadRootMotionYawRates[f] = db->rootMotionYawRates[f];
+            }
+            else
+            {
+                // extrapolate: lookahead = curr + n*(next - curr) = (1-n)*curr + n*next
+                const Vector3 currVel = db->rootMotionVelocities[f];
+                const Vector3 nextVel = db->rootMotionVelocities[f + 1];
+                db->lookaheadRootMotionVelocities[f] = Vector3Add(
+                    Vector3Scale(currVel, currWeight),
+                    Vector3Scale(nextVel, nextWeight));
+
+                const float currYawRate = db->rootMotionYawRates[f];
+                const float nextYawRate = db->rootMotionYawRates[f + 1];
+                db->lookaheadRootMotionYawRates[f] = currWeight * currYawRate + nextWeight * nextYawRate;
+            }
+        }
+    }
+
     TraceLog(LOG_INFO, "AnimDatabase: built motion DB with %d frames and %d joints",
         db->motionFrameCount, db->jointCount);
 
@@ -656,7 +750,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             Vector3 pastPosLocal = Vector3Zero();
 
-            assert(db->hipJointIndex);
+            assert(db->hipJointIndex != -1);
 
             const float frameTime = db->animFrameTime[clipIdx];
             const float pastTime = cfg.pastTimeOffset;
@@ -833,7 +927,11 @@ static inline void SampleCursorPoseLerp6d(
     std::vector<Vector3>* outAngularVelocities,
     std::vector<Rot6d>* outLookaheadRotations6d,
     Vector3* outRootPos,
-    Rot6d* outRootRot6d)
+    Rot6d* outRootRot6d,
+    Vector3* outRootVelocity = nullptr,              // root linear velocity (XZ, animation space)
+    float* outRootYawRate = nullptr,                 // root yaw rate (rad/s)
+    Vector3* outLookaheadRootVelocity = nullptr,     // lookahead root velocity (XZ, animation space)
+    float* outLookaheadRootYawRate = nullptr)        // lookahead root yaw rate (rad/s)
 {
     using std::span;
 
@@ -884,6 +982,50 @@ static inline void SampleCursorPoseLerp6d(
 
     if (outRootPos) *outRootPos = outPositions[0];
     if (outRootRot6d) *outRootRot6d = outRotations6d[0];
+
+    // Sample root motion velocity at midpoint (animTime + velocityTimeOffset)
+    if (outRootVelocity || outRootYawRate)
+    {
+        int vf0, vf1;
+        float vAlpha;
+        GetInterFrameAlpha(db, animIndex, animTime + velocityTimeOffset, vf0, vf1, vAlpha);
+
+        if (outRootVelocity)
+        {
+            const Vector3 vel0 = db->rootMotionVelocities[clipStart + vf0];
+            const Vector3 vel1 = db->rootMotionVelocities[clipStart + vf1];
+            *outRootVelocity = Vector3Lerp(vel0, vel1, vAlpha);
+        }
+
+        if (outRootYawRate)
+        {
+            const float rate0 = db->rootMotionYawRates[clipStart + vf0];
+            const float rate1 = db->rootMotionYawRates[clipStart + vf1];
+            *outRootYawRate = Lerp(rate0, rate1, vAlpha);
+        }
+    }
+
+    // Sample lookahead root motion velocity (extrapolated for anticipation)
+    if (outLookaheadRootVelocity || outLookaheadRootYawRate)
+    {
+        int lf0, lf1;
+        float lAlpha;
+        GetInterFrameAlpha(db, animIndex, animTime, lf0, lf1, lAlpha);
+
+        if (outLookaheadRootVelocity)
+        {
+            const Vector3 vel0 = db->lookaheadRootMotionVelocities[clipStart + lf0];
+            const Vector3 vel1 = db->lookaheadRootMotionVelocities[clipStart + lf1];
+            *outLookaheadRootVelocity = Vector3Lerp(vel0, vel1, lAlpha);
+        }
+
+        if (outLookaheadRootYawRate)
+        {
+            const float rate0 = db->lookaheadRootMotionYawRates[clipStart + lf0];
+            const float rate1 = db->lookaheadRootMotionYawRates[clipStart + lf1];
+            *outLookaheadRootYawRate = Lerp(rate0, rate1, lAlpha);
+        }
+    }
 }
 
 // sample global toe velocity from db->globalJointVelocities at animTime

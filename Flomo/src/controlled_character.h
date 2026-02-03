@@ -204,6 +204,9 @@ static void ControlledCharacterUpdate(
         return;
     }
 
+    // Early exit if timestep is too small (prevents division by zero and unnecessary updates)
+    if (dt <= 1e-6f) return;
+
     const BVHData* bvh = &characterData->bvhData[cc->animIndex];
 
     bool firstFrame = true;
@@ -289,9 +292,9 @@ static void ControlledCharacterUpdate(
         cc->animTime = fmodf(cc->animTime, currentMaxTime);
     }
 
-    // --------- Per-cursor update: sample pose, update weights, compute per-cursor root delta ----------
-    Vector3 blendedWorldDelta = Vector3Zero();
-    float blendedYawDelta = 0.0f;
+    // --------- Per-cursor update: sample pose, update weights, blend velocities ----------
+    Vector3 blendedVelocity = Vector3Zero();
+    float blendedYawRate = 0.0f;
     float totalRootWeight = 0.0f;
 
     for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
@@ -309,6 +312,10 @@ static void ControlledCharacterUpdate(
         // Velocity sampled at midpoint of frame interval for better accuracy
         Vector3 sampledRootPos;
         Rot6d sampledRootRot6d;
+        Vector3 sampledRootVelAnim;
+        float sampledRootYawRate;
+        Vector3 sampledLookaheadRootVelAnim;
+        float sampledLookaheadRootYawRate;
         SampleCursorPoseLerp6d(
             db,
             cur.animIndex,
@@ -319,7 +326,17 @@ static void ControlledCharacterUpdate(
             &cur.localAngularVelocities,
             &cur.lookaheadRotations6d,
             &sampledRootPos,
-            &sampledRootRot6d);
+            &sampledRootRot6d,
+            &sampledRootVelAnim,
+            &sampledRootYawRate,
+            &sampledLookaheadRootVelAnim,
+            &sampledLookaheadRootYawRate);
+
+        // Store sampled velocities in cursor
+        cur.sampledRootVelocityAnim = sampledRootVelAnim;
+        cur.sampledRootYawRate = sampledRootYawRate;
+        cur.sampledLookaheadRootVelocityAnim = sampledLookaheadRootVelAnim;
+        cur.sampledLookaheadRootYawRate = sampledLookaheadRootYawRate;
 
         // Sample global toe velocities from database (for foot IK)
         // These are in animation-world space, we'll transform them to character-world after getting root yaw
@@ -329,24 +346,26 @@ static void ControlledCharacterUpdate(
         // Update weight via spring integrator
         DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
 
-        // clamp the output weight
-        if (cur.weightSpring.x < 0.0f) cur.weightSpring.x = 0.0f;
-        if (cur.weightSpring.x > 1.0f) cur.weightSpring.x = 1.0f;
+        // Clamp the output weight to [0, 1]
+        cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
 
-        // Compute per-cursor root delta in animation-local space and convert to world-space
-        const Vector3 currLocalRootPos = sampledRootPos;
-        const Rot6d currLocalRootRot6d = sampledRootRot6d;
-        const Vector3 prevLocalRootPos = cur.prevLocalRootPos;
-        const Rot6d prevLocalRootRot6d = cur.prevLocalRootRot6d;
-
-        Vector3 deltaPosAnim = Vector3Subtract(currLocalRootPos, prevLocalRootPos);
-        deltaPosAnim.y = 0.0f;
-
-        // extract yaw from Rot6d and rotate delta position to local space
-        const float prevYaw = Rot6dGetYaw(prevLocalRootRot6d);
-        const float currYaw = Rot6dGetYaw(currLocalRootRot6d);
-        const Rot6d invPrevYawRot = Rot6dFromYaw(-prevYaw);
+        // Transform root velocity from animation space to world space
+        // Extract current root yaw from sampled rotation
+        const float currYaw = Rot6dGetYaw(sampledRootRot6d);
         const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
+
+        // Remove yaw from velocity (get heading-relative velocity)
+        Vector3 rootVelLocal;
+        Rot6dTransformVector(invCurrYawRot, sampledRootVelAnim, rootVelLocal);
+
+        // Rotate to character world space
+        const Vector3 rootVelWorld = Vector3RotateByQuaternion(rootVelLocal, cc->worldRotation);
+
+        // Store velocities in cursor (for acceleration-based blending)
+        cur.prevRootVelocity = cur.rootVelocity;
+        cur.prevRootYawRate = cur.rootYawRate;
+        cur.rootVelocity = rootVelWorld;
+        cur.rootYawRate = sampledRootYawRate;
 
         // Transform toe velocities from animation-world to character-world
         // 1. Remove animation's root yaw (to get heading-relative velocity)
@@ -358,39 +377,17 @@ static void ControlledCharacterUpdate(
             cur.globalToeVelocity[side] = Vector3RotateByQuaternion(toeVelLocal, cc->worldRotation);
         }
 
-        Vector3 deltaLocal;
-        Rot6dTransformVector(invPrevYawRot, deltaPosAnim, deltaLocal);
-        const Vector3 deltaWorld = Vector3RotateByQuaternion(deltaLocal, cc->worldRotation);
-
-        // compute yaw delta (simple subtraction since we have angles directly)
-        float deltaYaw = currYaw - prevYaw;
-        if (deltaYaw > PI) deltaYaw -= 2.0f * PI;
-        else if (deltaYaw < -PI) deltaYaw += 2.0f * PI;
-
-        // Store deltas for debug visualization
-        cur.lastDeltaWorld = deltaWorld;
-        cur.lastDeltaYaw = deltaYaw;
-
-        // Compute velocity from delta
-        if (dt > 1e-6f)
-        {
-            cur.prevRootVelocity = cur.rootVelocity;
-            cur.prevRootYawRate = cur.rootYawRate;
-            cur.rootVelocity = Vector3Scale(deltaWorld, 1.0f / dt);
-            cur.rootYawRate = deltaYaw / dt;
-        }
-
         const float wgt = cur.weightSpring.x;
         if (wgt > 1e-6f)
         {
-            blendedWorldDelta = Vector3Add(blendedWorldDelta, Vector3Scale(deltaWorld, wgt));
-            blendedYawDelta += deltaYaw * wgt;
+            blendedVelocity = Vector3Add(blendedVelocity, Vector3Scale(cur.rootVelocity, wgt));
+            blendedYawRate += cur.rootYawRate * wgt;
             totalRootWeight += wgt;
         }
 
-        // store current root as prev for next frame
-        cur.prevLocalRootPos = currLocalRootPos;
-        cur.prevLocalRootRot6d = currLocalRootRot6d;
+        // Store current root state for next frame (still needed for some features)
+        cur.prevLocalRootPos = sampledRootPos;
+        cur.prevLocalRootRot6d = sampledRootRot6d;
 
         // Strip yaw from root rotation BEFORE blending to avoid Rot6d singularity
         // when blending anims facing opposite directions.
@@ -440,19 +437,46 @@ static void ControlledCharacterUpdate(
 
     assert(totalRootWeight > 1e-6f);
 
-    const Vector3 finalWorldDelta = Vector3Scale(blendedWorldDelta, 1.0f / totalRootWeight);
-    const float finalYawDelta = blendedYawDelta / totalRootWeight;
+    const Vector3 finalVelocity = Vector3Scale(blendedVelocity, 1.0f / totalRootWeight);
+    const float finalYawRate = blendedYawRate / totalRootWeight;
 
-    // Store for debug visualization
+    // For lookahead dragging mode, also blend lookahead velocities
+    Vector3 blendedLookaheadVelocity = Vector3Zero();
+    float blendedLookaheadYawRate = 0.0f;
+    if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+    {
+        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+        {
+            const BlendCursor& cur = cc->cursors[ci];
+            if (!cur.active) continue;
+            const float w = cur.normalizedWeight;
+            if (w <= 1e-6f) continue;
+
+            // Transform lookahead velocities to world space (same as regular velocities)
+            const float currYaw = Rot6dGetYaw(cur.prevLocalRootRot6d);
+            const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
+
+            Vector3 lookaheadVelLocal;
+            Rot6dTransformVector(invCurrYawRot, cur.sampledLookaheadRootVelocityAnim, lookaheadVelLocal);
+            const Vector3 lookaheadVelWorld = Vector3RotateByQuaternion(lookaheadVelLocal, cc->worldRotation);
+
+            blendedLookaheadVelocity = Vector3Add(blendedLookaheadVelocity, Vector3Scale(lookaheadVelWorld, w));
+            blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * w;
+        }
+        blendedLookaheadVelocity = Vector3Scale(blendedLookaheadVelocity, 1.0f / totalRootWeight);
+        blendedLookaheadYawRate /= totalRootWeight;
+    }
+
+    // Store deltas for debug visualization (computed from velocity)
+    const Vector3 finalWorldDelta = Vector3Scale(finalVelocity, dt);
+    const float finalYawDelta = finalYawRate * dt;
     cc->lastBlendedDeltaWorld = finalWorldDelta;
     cc->lastBlendedDeltaYaw = finalYawDelta;
 
     // Apply root motion (with optional velocity-based smoothing)
-    if (cc->cursorBlendMode == CursorBlendMode::VelBlending && dt > 1e-6f)
+    if (cc->cursorBlendMode == CursorBlendMode::VelBlending)
     {
-        // Blend velocities and accelerations from cursors using normalized weights
-        Vector3 blendedVelocity = Vector3Zero();
-        float blendedYawRate = 0.0f;
+        // Compute blended acceleration from cursor velocities (velocities already blended in main loop)
         Vector3 blendedAcceleration = Vector3Zero();
         float blendedYawAccel = 0.0f;
 
@@ -463,16 +487,18 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
-            // accumulate weighted velocity
-            blendedVelocity = Vector3Add(blendedVelocity, Vector3Scale(cur.rootVelocity, w));
-            blendedYawRate += cur.rootYawRate * w;
-
             // compute and accumulate weighted acceleration
             const Vector3 acc = Vector3Scale(Vector3Subtract(cur.rootVelocity, cur.prevRootVelocity), 1.0f / dt);
             const float yawAcc = (cur.rootYawRate - cur.prevRootYawRate) / dt;
             blendedAcceleration = Vector3Add(blendedAcceleration, Vector3Scale(acc, w));
             blendedYawAccel += yawAcc * w;
         }
+
+        // Normalize the already-blended velocity from main loop
+        const Vector3 blendedVelNormalized = Vector3Scale(blendedVelocity, 1.0f / totalRootWeight);
+        const float blendedYawRateNormalized = blendedYawRate / totalRootWeight;
+        blendedVelocity = blendedVelNormalized;
+        blendedYawRate = blendedYawRateNormalized;
 
         // Initialize on first frame
         if (!cc->rootMotionInitialized)
@@ -508,19 +534,45 @@ static void ControlledCharacterUpdate(
         const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, smoothedYawDelta);
         cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
     }
+    else if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+    {
+        // Lookahead dragging: lerp running velocity towards extrapolated future velocity
+        // Initialize on first frame
+        if (!cc->lookaheadVelocityInitialized)
+        {
+            cc->lookaheadDragVelocity = finalVelocity;
+            cc->lookaheadDragYawRate = finalYawRate;
+            cc->lookaheadVelocityInitialized = true;
+        }
+
+        // Lerp towards lookahead target with alpha = dt / lookaheadTime
+        const float lookaheadTime = Max(dt, config.poseDragLookaheadTime);
+        const float alpha = dt / lookaheadTime;
+        cc->lookaheadDragVelocity = Vector3Lerp(cc->lookaheadDragVelocity, blendedLookaheadVelocity, alpha);
+        cc->lookaheadDragYawRate = Lerp(cc->lookaheadDragYawRate, blendedLookaheadYawRate, alpha);
+
+        // Apply the running velocity
+        const Vector3 dragDelta = Vector3Scale(cc->lookaheadDragVelocity, dt);
+        const float dragYawDelta = cc->lookaheadDragYawRate * dt;
+
+        cc->worldPosition = Vector3Add(cc->worldPosition, dragDelta);
+        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, dragYawDelta);
+        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+
+        // Update smoothed velocity for visualization
+        cc->smoothedRootVelocity = cc->lookaheadDragVelocity;
+        cc->smoothedRootYawRate = cc->lookaheadDragYawRate;
+    }
     else
     {
-        // Direct application without smoothing
+        // Basic mode: direct application of blended velocity
         cc->worldPosition = Vector3Add(cc->worldPosition, finalWorldDelta);
         const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalYawDelta);
         cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
 
-        // Still update smoothedRootVelocity for visualization
-        if (dt > 1e-6f)
-        {
-            cc->smoothedRootVelocity = Vector3Scale(finalWorldDelta, 1.0f / dt);
-            cc->smoothedRootYawRate = finalYawDelta / dt;
-        }
+        // Update smoothedRootVelocity for visualization
+        cc->smoothedRootVelocity = finalVelocity;
+        cc->smoothedRootYawRate = finalYawRate;
     }
 
     // --- Rot6d blending using normalized weights (no double-cover issues, simple weighted average then normalize) ---
@@ -804,7 +856,7 @@ static void ControlledCharacterUpdate(
         if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount) continue;
 
         const Vector3 currentPos = cc->xformData.globalPositions[toeIdx];
-        if (cc->toeTrackingPreIKInitialized && dt > 1e-6f)
+        if (cc->toeTrackingPreIKInitialized)
         {
             cc->toeVelocityPreIK[side] = Vector3Scale(
                 Vector3Subtract(currentPos, cc->prevToeGlobalPosPreIK[side]), 1.0f / dt);
@@ -862,9 +914,7 @@ static void ControlledCharacterUpdate(
         }
         else
         {
-            if (dt > 1e-6f)
-            {
-                // Update intermediate virtual toe (no speed clamp)
+            // Update intermediate virtual toe (no speed clamp)
                 // Step 1: Primary motion from blended cursor velocity (XYZ)
                 const Vector3 blendedToeVel = cc->toeBlendedVelocity[side];
                 const Vector3 velocityDisplacement = Vector3Scale(blendedToeVel, dt);
@@ -969,7 +1019,6 @@ static void ControlledCharacterUpdate(
                 {
                     cc->virtualToeUnlockClampRadius[side] = 0.0f;
                 }
-            }
         }
     }
 
@@ -983,8 +1032,8 @@ static void ControlledCharacterUpdate(
         static constexpr float HISTORY_SAMPLE_INTERVAL = 0.01f;  // 10ms between samples
         static constexpr float HISTORY_MAX_DURATION = 0.5f;      // keep 500ms of history
 
-        // Check if we should sample (interval elapsed AND dt not too small to avoid duplicates on paused frames)
-        if (dt > 1e-6f && (worldTime - cc->lastHistorySampleTime) >= HISTORY_SAMPLE_INTERVAL)
+        // Check if we should sample (interval elapsed)
+        if ((worldTime - cc->lastHistorySampleTime) >= HISTORY_SAMPLE_INTERVAL)
         {
             // Add new history point at the back
             HistoryPoint newPoint;
@@ -1044,7 +1093,7 @@ static void ControlledCharacterUpdate(
         if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount) continue;
 
         const Vector3 currentPos = cc->xformData.globalPositions[toeIdx];
-        if (cc->toeTrackingInitialized && dt > 1e-6f)
+        if (cc->toeTrackingInitialized)
         {
             cc->toeVelocity[side] = Vector3Scale(
                 Vector3Subtract(currentPos, cc->prevToeGlobalPos[side]), 1.0f / dt);

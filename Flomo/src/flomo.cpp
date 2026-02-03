@@ -35,7 +35,7 @@
 #include "utils.h"
 
 // Un-comment to enable profiling
-//#define ENABLE_PROFILE
+#define ENABLE_PROFILE
 #include "profiler.h"
 
 
@@ -122,6 +122,8 @@ static void TestCudaAndLibtorch()
 
 #define AO_CAPSULES_MAX 32
 #define SHADOW_CAPSULES_MAX 64
+//#define SHADOW_CAPSULES_MAX 16
+
 
 
 // Shader uniform location indices (cached for performance)
@@ -445,19 +447,47 @@ static inline void DrawWireFrames(CapsuleData* capsuleData, Color color)
 // GUI
 //----------------------------------------------------------------------------------
 static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterData,
-    const ControlledCharacter* controlledCharacter, int argc, char** argv)
+    const ControlledCharacter* controlledCharacter, AppConfig* config, int argc, char** argv)
 {
     ImGui::SetNextWindowPos(ImVec2(20, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(220, 320), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Camera")) {
         // Camera mode selector
-        const char* modeNames[] = { "Orbit", "Unreal" };
+        const char* modeNames[] = { "Orbit", "Unreal", "Turret Follower" };
         int currentMode = static_cast<int>(camera->mode);
-        if (ImGui::Combo("Mode", &currentMode, modeNames, 2)) {
-            camera->mode = static_cast<FlomoCameraMode>(currentMode);
+        if (ImGui::Combo("Mode", &currentMode, modeNames, 3)) {
+            const FlomoCameraMode newMode = static_cast<FlomoCameraMode>(currentMode);
+
+            // Compute target position for syncing (used by Orbit and Turret modes)
+            Vector3 targetPosition = Vector3{ 0.0f, 1.0f, 0.0f };
+            if (camera->orbit.track)
+            {
+                if (camera->orbit.trackControlledCharacter && controlledCharacter->active)
+                {
+                    const int trackBone = MinInt(camera->orbit.trackBone,
+                        controlledCharacter->xformData.jointCount - 1);
+                    targetPosition = controlledCharacter->xformData.globalPositions[trackBone];
+                }
+                else if (characterData->count > 0 &&
+                    camera->orbit.trackBone < characterData->xformData[characterData->active].jointCount)
+                {
+                    targetPosition = characterData->xformData[characterData->active].globalPositions[camera->orbit.trackBone];
+                }
+            }
+
+            // Sync all modes from current state, then switch
+            CameraSyncAllModesFromCurrent(camera, targetPosition);
+            camera->mode = newMode;
         }
 
         ImGui::Separator();
+
+        // Target blending (used by Orbit and LazyTurretFollower)
+        if (camera->mode == FlomoCameraMode::Orbit || camera->mode == FlomoCameraMode::LazyTurretFollower)
+        {
+            ImGui::SliderFloat("Target Blend", &config->cameraTargetBlendtime, 0.0f, 1.0f, "%.2f");
+            ImGui::Separator();
+        }
 
         if (camera->mode == FlomoCameraMode::Orbit)
         {
@@ -504,7 +534,7 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 ImGui::Combo("##trackbone", &camera->orbit.trackBone, items.data(), (int)items.size());
             }
         }
-        else if (camera->mode == FlomoCameraMode::Unreal)
+        else if (camera->mode == FlomoCameraMode::UnrealEditor)
         {
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RMB + WASD - Move");
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RMB + Q/E - Down/Up");
@@ -525,6 +555,22 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 camera->unreal.pitch = 0.0f;
                 camera->unreal.moveSpeed = 5.0f;
             }
+        }
+        else if (camera->mode == FlomoCameraMode::LazyTurretFollower)
+        {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "WASD - Move Character");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Camera follows passively");
+            ImGui::Separator();
+
+            ImGui::Text("Position: [%.2f, %.2f, %.2f]",
+                camera->turret.position.x, camera->turret.position.y, camera->turret.position.z);
+            ImGui::Text("Azimuth: %.2f  Altitude: %.2f", camera->turret.azimuth, camera->turret.altitude);
+            ImGui::Text("Distance: %.2f", camera->turret.distance);
+
+            ImGui::SliderFloat("Min Distance", &camera->turret.minDistance, 1.0f, 10.0f, "%.1f");
+            ImGui::SliderFloat("Max Distance", &camera->turret.maxDistance,
+                camera->turret.minDistance, 20.0f, "%.1f");
+            ImGui::SliderFloat("Smooth Time", &camera->turret.smoothTime, 0.05f, 1.0f, "%.2f");
         }
     }
     ImGui::End();
@@ -549,42 +595,27 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::SliderFloat("Sun Azimuth", &config->sunAzimuth, -PI, PI, "%.2f");
         ImGui::SliderFloat("Sun Altitude", &config->sunAltitude, 0.0f, 0.49f * PI, "%.2f");
 
-        ImGui::Columns(2);
+        // Single column layout for all checkboxes
+        ImGui::Columns(2, "render_checkboxes", false);
+
         ImGui::Checkbox("Draw Origin", &config->drawOrigin);
-        ImGui::NextColumn();
-        ImGui::Checkbox("Draw Grid", &config->drawGrid);
-        ImGui::Columns(1);
-
-        ImGui::Columns(2);
         ImGui::Checkbox("Draw Checker", &config->drawChecker);
-        ImGui::NextColumn();
-        ImGui::Checkbox("Draw Capsules", &config->drawCapsules);
-        ImGui::Columns(1);
-
-        ImGui::Columns(2);
         ImGui::Checkbox("Draw Wireframes", &config->drawWireframes);
-        ImGui::NextColumn();
-        ImGui::Checkbox("Draw Skeleton", &config->drawSkeleton);
-        ImGui::Columns(1);
-
-        ImGui::Columns(2);
         ImGui::Checkbox("Draw Transforms", &config->drawTransforms);
-        ImGui::NextColumn();
-        ImGui::Checkbox("Draw AO", &config->drawAO);
-        ImGui::Columns(1);
-
-        ImGui::Columns(2);
         ImGui::Checkbox("Draw Shadows", &config->drawShadows);
-        ImGui::NextColumn();
-        ImGui::Checkbox("Draw End Sites", &config->drawEndSites);
-        ImGui::Columns(1);
-
-        ImGui::Columns(2);
         ImGui::Checkbox("Draw FPS", &config->drawFPS);
+
         ImGui::NextColumn();
+
+        ImGui::Checkbox("Draw Grid", &config->drawGrid);
+        ImGui::Checkbox("Draw Capsules", &config->drawCapsules);
+        ImGui::Checkbox("Draw Skeleton", &config->drawSkeleton);
+        ImGui::Checkbox("Draw AO", &config->drawAO);
+        ImGui::Checkbox("Draw End Sites", &config->drawEndSites);
         if (genoModelLoaded) {
             ImGui::Checkbox("Mesh Character", genoRenderMode);
         }
+
         ImGui::Columns(1);
 
         ImGui::Separator();
@@ -1342,6 +1373,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         OrbitCameraUpdate(
             &app->camera,
             boneTarget,
+            app->config.cameraTargetBlendtime,
             (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.x : 0.0f,  // RMB rotates
             (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.y : 0.0f,
             (acceptInput && IsMouseButtonDown(2)) ? mouseDelta.x : 0.0f,  // MMB pans
@@ -1349,7 +1381,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             scrollInput,  // Scroll zooms
             dt);
     }
-    else if (app->camera.mode == FlomoCameraMode::Unreal)
+    else if (app->camera.mode == FlomoCameraMode::UnrealEditor)
     {
         // Unreal camera: RMB + WASD/QE moves, scroll adjusts speed
         const bool isActive = IsMouseButtonDown(1) && !imguiWantsMouse;
@@ -1373,9 +1405,26 @@ static void ApplicationUpdate(void* voidApplicationState)
             isPanning,
             dt);
     }
+    else if (app->camera.mode == FlomoCameraMode::LazyTurretFollower)
+    {
+        // Lazy turret follower: hybrid mode - can rotate/zoom like orbit, smoothly follows otherwise
+        const bool acceptInput = !imguiWantsMouse;
+        const float scrollInput = (acceptInput && !IsMouseButtonDown(2)) ? mouseWheel : 0.0f;
+
+        LazyTurretCameraUpdate(
+            &app->camera,
+            boneTarget,
+            app->config.cameraTargetBlendtime,
+            (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.x : 0.0f,  // RMB rotates
+            (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.y : 0.0f,
+            scrollInput,  // Scroll zooms
+            dt);
+    }
 
     // Update Player Control Input (WASD relative to camera)
-    if (app->controlledCharacter.active && !imguiWantsKeyboard)
+    if (app->controlledCharacter.active && 
+        !imguiWantsKeyboard &&
+        app->camera.mode != FlomoCameraMode::UnrealEditor)
     {
         PlayerControlInput& input = app->controlledCharacter.playerInput;
 
@@ -1566,12 +1615,17 @@ static void ApplicationUpdate(void* voidApplicationState)
                 // Gather all capsules casting shadows on this ground segment
 
                 PROFILE_BEGIN(RenderingGroundSegmentShadow);
-
                 app->capsuleData.shadowCapsuleCount = 0;
-                if (app->config.drawCapsules && app->config.drawShadows)
+                const float groundShadowDistance = 20.0f;
+                if (Vector3DistanceSqr(groundSegmentPosition, camTarget) < Square(groundShadowDistance))
                 {
-                    CapsuleDataUpdateShadowCapsulesForGroundSegment(&app->capsuleData, groundSegmentPosition, sunLightDir, app->config.sunLightConeAngle);
+                    // Only compute shadows for ground segments near the camera
+                    if (app->config.drawCapsules && app->config.drawShadows)
+                    {
+                        CapsuleDataUpdateShadowCapsulesForGroundSegment(&app->capsuleData, groundSegmentPosition, sunLightDir, app->config.sunLightConeAngle);
+                    }
                 }
+
                 const int shadowCapsuleCount = MinInt(app->capsuleData.shadowCapsuleCount, SHADOW_CAPSULES_MAX);
 
                 PROFILE_END(RenderingGroundSegmentShadow);
@@ -1680,7 +1734,11 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->capsuleData.shadowCapsuleCount = 0;
             if (app->config.drawShadows)
             {
-                CapsuleDataUpdateShadowCapsulesForCapsule(&app->capsuleData, j, sunLightDir, app->config.sunLightConeAngle);
+                const bool isCloseToCamera = i < 50; // Approximate check based on sort order
+                if (isCloseToCamera)
+                {
+                    CapsuleDataUpdateShadowCapsulesForCapsule(&app->capsuleData, j, sunLightDir, app->config.sunLightConeAngle);
+                }
             }
             const int shadowCapsuleCount = MinInt(app->capsuleData.shadowCapsuleCount, SHADOW_CAPSULES_MAX);
 
@@ -2341,7 +2399,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
 
         // Camera Settings
-        ImGuiCamera(&app->camera, &app->characterData, &app->controlledCharacter, app->argc, app->argv);
+        ImGuiCamera(&app->camera, &app->characterData, &app->controlledCharacter, &app->config, app->argc, app->argv);
 
         // Characters
         ImGuiCharacterData(&app->characterData,
@@ -2688,7 +2746,7 @@ int main(int argc, char** argv)
         app.camera.unreal.yaw = app.config.cameraYaw;
         app.camera.unreal.pitch = app.config.cameraPitch;
         app.camera.unreal.moveSpeed = app.config.cameraMoveSpeed;
-        app.camera.mode = (app.config.cameraMode == 0) ? FlomoCameraMode::Orbit : FlomoCameraMode::Unreal;
+        app.camera.mode = (app.config.cameraMode == 0) ? FlomoCameraMode::Orbit : FlomoCameraMode::UnrealEditor;
     }
 
     // Shader
