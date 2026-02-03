@@ -35,7 +35,7 @@
 #include "utils.h"
 
 // Un-comment to enable profiling
-#define ENABLE_PROFILE
+//#define ENABLE_PROFILE
 #include "profiler.h"
 
 
@@ -460,18 +460,18 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
 
             // Compute target position for syncing (used by Orbit and Turret modes)
             Vector3 targetPosition = Vector3{ 0.0f, 1.0f, 0.0f };
-            if (camera->orbit.track)
+            if (camera->track)
             {
-                if (camera->orbit.trackControlledCharacter && controlledCharacter->active)
+                if (camera->trackControlledCharacter && controlledCharacter->active)
                 {
-                    const int trackBone = MinInt(camera->orbit.trackBone,
+                    const int trackBone = MinInt(camera->trackBone,
                         controlledCharacter->xformData.jointCount - 1);
                     targetPosition = controlledCharacter->xformData.globalPositions[trackBone];
                 }
                 else if (characterData->count > 0 &&
-                    camera->orbit.trackBone < characterData->xformData[characterData->active].jointCount)
+                    camera->trackBone < characterData->xformData[characterData->active].jointCount)
                 {
-                    targetPosition = characterData->xformData[characterData->active].globalPositions[camera->orbit.trackBone];
+                    targetPosition = characterData->xformData[characterData->active].globalPositions[camera->trackBone];
                 }
             }
 
@@ -511,18 +511,20 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
 
             ImGui::Separator();
 
-            if (characterData->count > 0) {
-                ImGui::Checkbox("Track Bone", &camera->orbit.track);
+            if (characterData->count > 0 || controlledCharacter->active) {
+                ImGui::Checkbox("Track Bone", &camera->track);
 
-                // Option to track controlled character
-                if (controlledCharacter->active) {
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Controlled", &camera->orbit.trackControlledCharacter);
-                }
-
-                // Build joint name list for combo
+                // Build joint name list for combo (use controlled character joints if tracking it)
                 vector<string> joints;
-                string comboStr = characterData->jointNamesCombo[characterData->active];
+                string comboStr;
+                if (camera->trackControlledCharacter && controlledCharacter->active)
+                {
+                    comboStr = controlledCharacter->jointNamesCombo;
+                }
+                else if (characterData->count > 0)
+                {
+                    comboStr = characterData->jointNamesCombo[characterData->active];
+                }
                 stringstream ss(comboStr);
                 string token;
                 while (getline(ss, token, ';')) {
@@ -531,7 +533,10 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 vector<const char*> items;
                 for (const string& s : joints) items.push_back(s.c_str());
 
-                ImGui::Combo("##trackbone", &camera->orbit.trackBone, items.data(), (int)items.size());
+                if (!items.empty())
+                {
+                    ImGui::Combo("##trackbone", &camera->trackBone, items.data(), (int)items.size());
+                }
             }
         }
         else if (camera->mode == FlomoCameraMode::UnrealEditor)
@@ -571,6 +576,36 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
             ImGui::SliderFloat("Max Distance", &camera->turret.maxDistance,
                 camera->turret.minDistance, 20.0f, "%.1f");
             ImGui::SliderFloat("Smooth Time", &camera->turret.smoothTime, 0.05f, 1.0f, "%.2f");
+
+            ImGui::Separator();
+
+            if (characterData->count > 0 || controlledCharacter->active) {
+                ImGui::Checkbox("Track Bone", &camera->track);
+
+                // Build joint name list for combo (use controlled character joints if tracking it)
+                vector<string> joints;
+                string comboStr;
+                if (camera->trackControlledCharacter && controlledCharacter->active)
+                {
+                    comboStr = controlledCharacter->jointNamesCombo;
+                }
+                else if (characterData->count > 0)
+                {
+                    comboStr = characterData->jointNamesCombo[characterData->active];
+                }
+                stringstream ss(comboStr);
+                string token;
+                while (getline(ss, token, ';')) {
+                    joints.push_back(token);
+                }
+                vector<const char*> items;
+                for (const string& s : joints) items.push_back(s.c_str());
+
+                if (!items.empty())
+                {
+                    ImGui::Combo("##trackbone", &camera->trackBone, items.data(), (int)items.size());
+                }
+            }
         }
     }
     ImGui::End();
@@ -635,7 +670,8 @@ static inline void ImGuiRenderSettings(AppConfig* config,
 
 static inline void ImGuiCharacterData(
     CharacterData* characterData,
-    //GuiWindowFileDialogState* fileDialogState,
+    CameraSystem* camera,
+    ControlledCharacter* controlledCharacter,
     ScrubberSettings* scrubberSettings,
     char* errMsg,
     int argc,
@@ -660,6 +696,27 @@ static inline void ImGuiCharacterData(
             errMsg[0] = '\0';
         }
 
+        // Show controlled character first if active (as camera target option)
+        if (controlledCharacter->active)
+        {
+            const bool isSelected = camera->trackControlledCharacter;
+            if (ImGui::RadioButton("Controlled", isSelected))
+            {
+                camera->trackControlledCharacter = true;
+            }
+            // Color swatch for controlled character
+            ImGui::SameLine();
+            const Color ctrlColor = Color{ 100, 200, 255, 255 };  // light blue
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ctrlColor.r / 255.f, ctrlColor.g / 255.f, ctrlColor.b / 255.f, ctrlColor.a / 255.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ctrlColor.r / 255.f, ctrlColor.g / 255.f, ctrlColor.b / 255.f, ctrlColor.a / 255.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(ctrlColor.r / 255.f, ctrlColor.g / 255.f, ctrlColor.b / 255.f, ctrlColor.a / 255.f));
+            ImGui::Button("##colorCtrl", ImVec2(20, 20));
+            ImGui::PopStyleColor(3);
+            ImVec2 min = ImGui::GetItemRectMin();
+            ImVec2 max = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRect(min, max, IM_COL32(128, 128, 128, 255));
+        }
+
         for (int i = 0; i < characterData->count; i++) {
             string bvhNameShort;
             if (characterData->names[i].length() < 100) {
@@ -668,8 +725,17 @@ static inline void ImGuiCharacterData(
             else {
                 bvhNameShort = characterData->names[i].substr(0, 96) + "...";
             }
-            //bool bvhSelected = i == characterData->active;
-            ImGui::RadioButton(bvhNameShort.c_str(), &characterData->active, i); // Using RadioButton for selection
+
+            // When controlled character exists, use visual selection based on trackControlledCharacter
+            const bool isSelected = controlledCharacter->active
+                ? (!camera->trackControlledCharacter && i == characterData->active)
+                : (i == characterData->active);
+
+            if (ImGui::RadioButton(bvhNameShort.c_str(), isSelected))
+            {
+                characterData->active = i;
+                camera->trackControlledCharacter = false;  // Switch to tracking this character
+            }
 
             ImGui::SameLine();
             Color color = characterData->colors[i];
@@ -1298,21 +1364,21 @@ static void ApplicationUpdate(void* voidApplicationState)
     const Vector2 mouseDelta = GetMouseDelta();
     const float mouseWheel = GetMouseWheelMove();
 
-    // Get bone target for orbit camera (used for mode switching too)
+    // Get bone target for orbit and turret camera modes
     Vector3 boneTarget = Vector3{ 0.0f, 1.0f, 0.0f };
-    if (app->camera.orbit.track)
+    if (app->camera.track)
     {
-        if (app->camera.orbit.trackControlledCharacter && app->controlledCharacter.active)
+        if (app->camera.trackControlledCharacter && app->controlledCharacter.active)
         {
             // Track controlled character's root (joint 0) or hips
-            const int trackBone = MinInt(app->camera.orbit.trackBone,
+            const int trackBone = MinInt(app->camera.trackBone,
                 app->controlledCharacter.xformData.jointCount - 1);
             boneTarget = app->controlledCharacter.xformData.globalPositions[trackBone];
         }
         else if (app->characterData.count > 0 &&
-            app->camera.orbit.trackBone < app->characterData.xformData[app->characterData.active].jointCount)
+            app->camera.trackBone < app->characterData.xformData[app->characterData.active].jointCount)
         {
-            boneTarget = app->characterData.xformData[app->characterData.active].globalPositions[app->camera.orbit.trackBone];
+            boneTarget = app->characterData.xformData[app->characterData.active].globalPositions[app->camera.trackBone];
         }
     }
 
@@ -2403,7 +2469,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         // Characters
         ImGuiCharacterData(&app->characterData,
-            //&app->fileDialogState, 
+            &app->camera, &app->controlledCharacter,
             &app->scrubberSettings,
             app->errMsg, app->argc, app->argv);
 
@@ -2443,7 +2509,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             // Show features based on what camera is tracking
             ImGui::Separator();
 
-            const bool trackingControlled = app->camera.orbit.trackControlledCharacter &&
+            const bool trackingControlled = app->camera.trackControlledCharacter &&
                                             app->controlledCharacter.active;
 
             if (trackingControlled && !app->controlledCharacter.mmQuery.empty())

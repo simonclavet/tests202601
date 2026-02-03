@@ -155,3 +155,24 @@ static inline void ProfileTickersUpdate()
 #define PROFILE_TICKERS_INIT()
 #define PROFILE_TICKERS_UPDATE()
 #endif
+
+
+//--------------------------------------
+// One-off console timing (for loading/building operations): NOT IN THE TICK!
+//--------------------------------------
+
+//#ifdef ENABLE_PROFILE // do it all the time because they should not be done in the tick
+#define LOG_PROFILE_START(name) \
+        std::chrono::high_resolution_clock::time_point __logProfile_##name##_start = std::chrono::high_resolution_clock::now();
+
+#define LOG_PROFILE_END(name) \
+        do { \
+            std::chrono::high_resolution_clock::time_point __logProfile_##name##_end = std::chrono::high_resolution_clock::now(); \
+            std::chrono::milliseconds __logProfile_##name##_duration = std::chrono::duration_cast<std::chrono::milliseconds>( \
+                __logProfile_##name##_end - __logProfile_##name##_start); \
+            TraceLog(LOG_INFO, #name ": %lld ms", (long long)__logProfile_##name##_duration.count()); \
+        } while(0)
+//#else
+//#define LOG_PROFILE_START(name)
+//#define LOG_PROFILE_END(name)
+//#endif

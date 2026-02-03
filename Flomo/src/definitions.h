@@ -268,14 +268,14 @@ struct AnimDatabase
     // lookahead pose for inertial dragging: pose[f] + 3*(pose[f] - pose[f-1])
     Array2D<Rot6d> lookaheadLocalRotations6d;       // [motionFrameCount x jointCount]
 
-    // root motion velocities (stored separately for clarity)
-    // These are linear XZ velocities defined at frame midpoints
-    std::vector<Vector3> rootMotionVelocities;     // [motionFrameCount] - XZ velocity only
-    std::vector<float> rootMotionYawRates;         // [motionFrameCount] - yaw angular velocity (rad/s)
+    // root motion velocities in LOCAL space (heading-relative, XZ only)
+    // velocity at frame f is transformed by inverse of root yaw at frame f
+    std::vector<Vector3> rootMotionVelocitiesLocal;      // [motionFrameCount] - XZ velocity in local space
+    std::vector<float> rootMotionYawRates;               // [motionFrameCount] - yaw angular velocity (rad/s)
 
-    // lookahead root motion velocities (extrapolated for smooth anticipation)
-    std::vector<Vector3> lookaheadRootMotionVelocities;  // [motionFrameCount] - extrapolated XZ velocity
-    std::vector<float> lookaheadRootMotionYawRates;      // [motionFrameCount] - extrapolated yaw rate (rad/s)
+    // lookahead root motion velocities (extrapolated for smooth anticipation, also in local space)
+    std::vector<Vector3> lookaheadRootMotionVelocitiesLocal;  // [motionFrameCount] - extrapolated XZ velocity
+    std::vector<float> lookaheadRootMotionYawRates;           // [motionFrameCount] - extrapolated yaw rate (rad/s)
 
     // Segmentation of the compacted motion DB into clips:
     // clipStartFrame[c] .. clipEndFrame[c]-1 are frames for clip c in motion DB frame space.
@@ -319,9 +319,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointRotations6d.clear();
     db->localJointAngularVelocities.clear();
     db->lookaheadLocalRotations6d.clear();
-    db->rootMotionVelocities.clear();
+    db->rootMotionVelocitiesLocal.clear();
     db->rootMotionYawRates.clear();
-    db->lookaheadRootMotionVelocities.clear();
+    db->lookaheadRootMotionVelocitiesLocal.clear();
     db->lookaheadRootMotionYawRates.clear();
     db->clipStartFrame.clear();
     db->clipEndFrame.clear();
@@ -410,12 +410,12 @@ struct BlendCursor {
     std::vector<Vector3> localAngularVelocities;
     std::vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
 
-    // Sampled root motion velocities from database (animation space, before world transform)
-    Vector3 sampledRootVelocityAnim = Vector3Zero();  // XZ velocity in animation space
+    // Sampled root motion velocities from database (local/heading-relative space)
+    Vector3 sampledRootVelocityLocal = Vector3Zero();  // XZ velocity in local space
     float sampledRootYawRate = 0.0f;                   // yaw rate (rad/s)
 
-    // Sampled lookahead root motion velocities (extrapolated for anticipation)
-    Vector3 sampledLookaheadRootVelocityAnim = Vector3Zero();  // lookahead XZ velocity
+    // Sampled lookahead root motion velocities (extrapolated for anticipation, also local space)
+    Vector3 sampledLookaheadRootVelocityLocal = Vector3Zero();  // lookahead XZ velocity
     float sampledLookaheadRootYawRate = 0.0f;                   // lookahead yaw rate (rad/s)
 
     // Global-space pose for debug visualization (computed via FK after sampling)
@@ -502,6 +502,8 @@ struct ControlledCharacter {
     const BVHData* skeleton;
     bool active;
 
+    // Joint names combo string for UI (semicolon-separated)
+    std::string jointNamesCombo;
 
     // -----------------------
     // Blending cursor pool

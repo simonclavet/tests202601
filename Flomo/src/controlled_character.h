@@ -29,6 +29,14 @@ static void ControlledCharacterInit(
     cc->scale = scale;
     cc->active = true;
 
+    // Build joint names combo string for UI
+    cc->jointNamesCombo.clear();
+    for (int j = 0; j < skeleton->jointCount; ++j)
+    {
+        if (j > 0) cc->jointNamesCombo += ";";
+        cc->jointNamesCombo += skeleton->joints[j].name;
+    }
+
     // Start offset from origin so we can see both characters
     cc->worldPosition = Vector3{ 2.0f, 0.0f, 0.0f };
     cc->worldRotation = QuaternionIdentity();
@@ -154,7 +162,7 @@ static void SpawnBlendCursor(
 
     Vector3 rootPos;
     Rot6d rootRot6d;
-    SampleCursorPoseLerp6d(
+    SamplePoseAndMotion(
         db,
         cursor->animIndex,
         cursor->animTime,
@@ -164,7 +172,11 @@ static void SpawnBlendCursor(
         &cursor->localAngularVelocities,
         &cursor->lookaheadRotations6d,
         &rootPos,
-        &rootRot6d);
+        &rootRot6d,
+        nullptr,  // outRootVelocityLocal
+        nullptr,  // outRootYawRate
+        nullptr,  // outLookaheadRootVelocityLocal
+        nullptr); // outLookaheadRootYawRate
 
     cursor->prevLocalRootPos = rootPos;
     cursor->prevLocalRootRot6d = rootRot6d;
@@ -312,11 +324,11 @@ static void ControlledCharacterUpdate(
         // Velocity sampled at midpoint of frame interval for better accuracy
         Vector3 sampledRootPos;
         Rot6d sampledRootRot6d;
-        Vector3 sampledRootVelAnim;
+        Vector3 sampledRootVelLocal;
         float sampledRootYawRate;
-        Vector3 sampledLookaheadRootVelAnim;
+        Vector3 sampledLookaheadRootVelLocal;
         float sampledLookaheadRootYawRate;
-        SampleCursorPoseLerp6d(
+        SamplePoseAndMotion(
             db,
             cur.animIndex,
             cur.animTime,
@@ -327,19 +339,19 @@ static void ControlledCharacterUpdate(
             &cur.lookaheadRotations6d,
             &sampledRootPos,
             &sampledRootRot6d,
-            &sampledRootVelAnim,
+            &sampledRootVelLocal,
             &sampledRootYawRate,
-            &sampledLookaheadRootVelAnim,
+            &sampledLookaheadRootVelLocal,
             &sampledLookaheadRootYawRate);
 
-        // Store sampled velocities in cursor
-        cur.sampledRootVelocityAnim = sampledRootVelAnim;
+        // Store sampled velocities in cursor (now in local/heading-relative space)
+        cur.sampledRootVelocityLocal = sampledRootVelLocal;
         cur.sampledRootYawRate = sampledRootYawRate;
-        cur.sampledLookaheadRootVelocityAnim = sampledLookaheadRootVelAnim;
+        cur.sampledLookaheadRootVelocityLocal = sampledLookaheadRootVelLocal;
         cur.sampledLookaheadRootYawRate = sampledLookaheadRootYawRate;
 
         // Sample global toe velocities from database (for foot IK)
-        // These are in animation-world space, we'll transform them to character-world after getting root yaw
+        // These are still in animation-world space, need to transform
         Vector3 animSpaceToeVel[SIDES_COUNT];
         SampleGlobalToeVelocity(db, cur.animIndex, cur.animTime - dt * 0.5f, animSpaceToeVel);
 
@@ -349,17 +361,9 @@ static void ControlledCharacterUpdate(
         // Clamp the output weight to [0, 1]
         cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
 
-        // Transform root velocity from animation space to world space
-        // Extract current root yaw from sampled rotation
-        const float currYaw = Rot6dGetYaw(sampledRootRot6d);
-        const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
-
-        // Remove yaw from velocity (get heading-relative velocity)
-        Vector3 rootVelLocal;
-        Rot6dTransformVector(invCurrYawRot, sampledRootVelAnim, rootVelLocal);
-
-        // Rotate to character world space
-        const Vector3 rootVelWorld = Vector3RotateByQuaternion(rootVelLocal, cc->worldRotation);
+        // Transform root velocity from local space to world space
+        // Local space is heading-relative, so just rotate by character's worldRotation
+        const Vector3 rootVelWorld = Vector3RotateByQuaternion(sampledRootVelLocal, cc->worldRotation);
 
         // Store velocities in cursor (for acceleration-based blending)
         cur.prevRootVelocity = cur.rootVelocity;
@@ -368,8 +372,9 @@ static void ControlledCharacterUpdate(
         cur.rootYawRate = sampledRootYawRate;
 
         // Transform toe velocities from animation-world to character-world
-        // 1. Remove animation's root yaw (to get heading-relative velocity)
-        // 2. Rotate by character's worldRotation
+        // Need to extract yaw to convert toe velocities (they're still in anim space)
+        const float currYaw = Rot6dGetYaw(sampledRootRot6d);
+        const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
         for (int side : sides)
         {
             Vector3 toeVelLocal;
@@ -452,13 +457,9 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
-            // Transform lookahead velocities to world space (same as regular velocities)
-            const float currYaw = Rot6dGetYaw(cur.prevLocalRootRot6d);
-            const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
-
-            Vector3 lookaheadVelLocal;
-            Rot6dTransformVector(invCurrYawRot, cur.sampledLookaheadRootVelocityAnim, lookaheadVelLocal);
-            const Vector3 lookaheadVelWorld = Vector3RotateByQuaternion(lookaheadVelLocal, cc->worldRotation);
+            // Transform lookahead velocities to world space
+            // They're already in local space, just apply worldRotation
+            const Vector3 lookaheadVelWorld = Vector3RotateByQuaternion(cur.sampledLookaheadRootVelocityLocal, cc->worldRotation);
 
             blendedLookaheadVelocity = Vector3Add(blendedLookaheadVelocity, Vector3Scale(lookaheadVelWorld, w));
             blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * w;

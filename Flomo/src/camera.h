@@ -22,9 +22,6 @@ struct OrbitCamera {
     float altitude;
     float distance;
     Vector3 offset;
-    bool track;
-    int trackBone;
-    bool trackControlledCharacter;  // If true, track controlled character instead of active character
 };
 
 // Unreal-style free camera
@@ -62,6 +59,11 @@ struct CameraSystem {
 
     // Smooth target following (used by Orbit and LazyTurretFollower)
     DoubleSpringDamperStateVector3 smoothedTarget;  // Damped target position
+
+    // Shared tracking settings (used by Orbit and LazyTurretFollower)
+    bool track = true;
+    int trackBone = 0;
+    bool trackControlledCharacter = true;  // If true, track controlled character instead of active character
 };
 
 static inline void CameraSystemInit(CameraSystem* cam, int argc, char** argv)
@@ -82,9 +84,11 @@ static inline void CameraSystemInit(CameraSystem* cam, int argc, char** argv)
     cam->orbit.altitude = ArgFloat(argc, argv, "cameraAltitude", 0.4f);
     cam->orbit.distance = ArgFloat(argc, argv, "cameraDistance", 4.0f);
     cam->orbit.offset = ArgVector3(argc, argv, "cameraOffset", Vector3Zero());
-    cam->orbit.track = ArgBool(argc, argv, "cameraTrack", true);
-    cam->orbit.trackBone = ArgInt(argc, argv, "cameraTrackBone", 0);
-    cam->orbit.trackControlledCharacter = true;
+
+    // Shared tracking settings
+    cam->track = ArgBool(argc, argv, "cameraTrack", true);
+    cam->trackBone = ArgInt(argc, argv, "cameraTrackBone", 0);
+    cam->trackControlledCharacter = true;
 
     // Initialize Unreal camera
     cam->unreal.position = Vector3{ 2.0f, 1.5f, 5.0f };
@@ -113,8 +117,6 @@ static inline void OrbitCameraInit(OrbitCamera* camera, int argc, char** argv)
     camera->altitude = ArgFloat(argc, argv, "cameraAltitude", 0.4f);
     camera->distance = ArgFloat(argc, argv, "cameraDistance", 4.0f);
     camera->offset = ArgVector3(argc, argv, "cameraOffset", Vector3Zero());
-    camera->track = ArgBool(argc, argv, "cameraTrack", true);
-    camera->trackBone = ArgInt(argc, argv, "cameraTrackBone", 0);
 }
 
 // Update orbit camera and write results to cam3d
@@ -229,7 +231,7 @@ static inline void LazyTurretCameraUpdate(
         // Smooth position for distance constraints
         SimpleSpringDamperVector3(turret->position, turret->velocity, desiredPosition, turret->smoothTime, dt);
 
-        // Update azimuth/altitude from actual camera position (so user control starts smoothly)
+        // Update azimuth/altitude/distance from actual camera position (so user control starts smoothly)
         const Vector3 actualOffset = Vector3Subtract(turret->position, cam->smoothedTarget.x);
         const Vector3 horizontal = Vector3{ actualOffset.x, 0.0f, actualOffset.z };
         const float horizontalDist = Vector3Length(horizontal);
@@ -237,6 +239,7 @@ static inline void LazyTurretCameraUpdate(
         turret->azimuth = atan2f(actualOffset.x, actualOffset.z);
         turret->altitude = (horizontalDist > 0.001f) ? atanf(actualOffset.y / horizontalDist) : 0.0f;
         turret->altitude = Clamp(turret->altitude, 0.0f, 0.4f * PI);
+        turret->distance = Vector3Length(actualOffset);
     }
 
     // Update cam3d - always look at smoothed target
