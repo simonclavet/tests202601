@@ -360,6 +360,8 @@ struct ApplicationState {
     bool debugPaused = false;
     double worldTime = 0.0;  // accumulated time with timescale applied
 
+    // Flag for pending database rebuild (set when config changes, cleared when rebuilt)
+    bool animDatabaseRebuildPending = false;
 };
 
 
@@ -661,6 +663,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Root Velocities", &config->drawRootVelocities);
         ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
         ImGui::Checkbox("Draw Foot IK", &config->drawFootIK);
+        ImGui::Checkbox("Draw Basic Blend", &config->drawBasicBlend);
         ImGui::Checkbox("Draw Player Input", &config->drawPlayerInput);
         ImGui::Checkbox("Draw Past History", &config->drawPastHistory);
 
@@ -896,14 +899,18 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         else if (config->cursorBlendMode == CursorBlendMode::LookaheadDragging)
         {
             ImGui::SetNextItemWidth(80);
-            if (ImGui::InputFloat("Lookahead Time", &config->poseDragLookaheadTime, 0.0f, 0.0f, "%.3f"))
+            if (ImGui::InputFloat("Lookahead Time", &config->poseDragLookaheadTimeEditor, 0.0f, 0.0f, "%.3f"))
             {
-                // Clamp to reasonable range
-                if (config->poseDragLookaheadTime < 0.03f) config->poseDragLookaheadTime = 0.03f;
-                if (config->poseDragLookaheadTime > 0.2f) config->poseDragLookaheadTime = 0.2f;
-                // Rebuild database with new lookahead time
-                app->animDatabase.poseDragLookaheadTime = config->poseDragLookaheadTime;
-                AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
+                config->poseDragLookaheadTimeEditor = Clamp(config->poseDragLookaheadTimeEditor, 0.01f, 0.2f);
+                app->animDatabaseRebuildPending = true;
+            }
+            ImGui::SetNextItemWidth(80);
+            if (ImGui::InputFloat("Extrap Mult", &config->lookaheadExtrapolationMult, 0.0f, 0.0f, "%.2f"))
+            {
+                config->lookaheadExtrapolationMult = Clamp(config->lookaheadExtrapolationMult, 0.5f, 2.0f);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Extrapolation multiplier (1.0=exact, >1=overshoot to compensate lag)");
             }
         }
 
@@ -934,7 +941,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
 
         // Motion Matching Features
         AnimDatabase& db = app->animDatabase;
-        MotionMatchingFeaturesConfig& mmConfig = config->mmConfigEditor;
+        MotionMatchingFeaturesConfig& editedMMConfig = config->mmConfigEditor;
         bool configChanged = false;
 
         ImGui::Text("Feature Weights:");
@@ -945,7 +952,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         {
             const FeatureType type = static_cast<FeatureType>(i);
             const char* name = FeatureTypeName(type);
-            float weight = mmConfig.features[i].weight;
+            float weight = editedMMConfig.features[i].weight;
 
             ImGui::PushID(i);
             ImGui::Text("%s:", name);
@@ -954,7 +961,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             if (ImGui::InputFloat("##weight", &weight, 0.0f, 0.0f, "%.3f"))
             {
                 // Clamp to >= 0
-                mmConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
+                editedMMConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
                 configChanged = true;
             }
             ImGui::PopID();
@@ -966,7 +973,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
 
         // Future trajectory times configuration
         ImGui::Text("Future Trajectory Times (s):");
-        const size_t timeCount = mmConfig.futureTrajPointTimes.size();
+        const size_t timeCount = editedMMConfig.futureTrajPointTimes.size();
 
         for (size_t i = 0; i < timeCount; ++i)
         {
@@ -976,7 +983,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             ImGui::SameLine(100);
             ImGui::SetNextItemWidth(80);
 
-            float timeVal = mmConfig.futureTrajPointTimes[i];
+            float timeVal = editedMMConfig.futureTrajPointTimes[i];
             if (ImGui::InputFloat("##time", &timeVal, 0.0f, 0.0f, "%.3f"))
             {
                 // Clamp to >= 0.001
@@ -985,17 +992,17 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
                 // Enforce increasing order: clamp to be >= previous time
                 if (i > 0)
                 {
-                    const float prevTime = mmConfig.futureTrajPointTimes[i - 1];
+                    const float prevTime = editedMMConfig.futureTrajPointTimes[i - 1];
                     timeVal = (timeVal < prevTime) ? prevTime : timeVal;
                 }
 
                 // Enforce increasing order: clamp next times to be >= this time
-                mmConfig.futureTrajPointTimes[i] = timeVal;
+                editedMMConfig.futureTrajPointTimes[i] = timeVal;
                 for (size_t j = i + 1; j < timeCount; ++j)
                 {
-                    if (mmConfig.futureTrajPointTimes[j] < timeVal)
+                    if (editedMMConfig.futureTrajPointTimes[j] < timeVal)
                     {
-                        mmConfig.futureTrajPointTimes[j] = timeVal;
+                        editedMMConfig.futureTrajPointTimes[j] = timeVal;
                     }
                 }
 
@@ -1011,23 +1018,35 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         ImGui::Text("Past Time Offset (s):");
         ImGui::SameLine(180);
         ImGui::SetNextItemWidth(80);
-        float pastTime = mmConfig.pastTimeOffset;
+        float pastTime = editedMMConfig.pastTimeOffset;
         if (ImGui::InputFloat("##pasttime", &pastTime, 0.0f, 0.0f, "%.3f"))
         {
             // Clamp to >= 0.001
-            mmConfig.pastTimeOffset = (pastTime < 0.001f) ? 0.001f : pastTime;
+            editedMMConfig.pastTimeOffset = (pastTime < 0.001f) ? 0.001f : pastTime;
             configChanged = true;
         }
 
         if (configChanged)
         {
-            // Rebuild animation database with new config
-            db.featuresConfig = mmConfig;
-            db.poseDragLookaheadTime = config->poseDragLookaheadTime;
-            AnimDatabaseRebuild(&db, &app->characterData);
-            TraceLog(LOG_INFO, "Motion matching config updated");
+            // Mark for rebuild (don't rebuild on every keypress)
+            app->animDatabaseRebuildPending = true;
         }
-        
+
+        // Show rebuild button when changes are pending
+        if (app->animDatabaseRebuildPending)
+        {
+            ImGui::Separator();
+            if (ImGui::Button("Rebuild Database"))
+            {
+                db.featuresConfig = editedMMConfig;
+                db.poseDragLookaheadTime = config->poseDragLookaheadTimeEditor;
+                AnimDatabaseRebuild(&db, &app->characterData);
+                app->animDatabaseRebuildPending = false;
+                TraceLog(LOG_INFO, "Motion matching config updated");
+            }
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Changes pending");
+        }
     }
     ImGui::End();
 }
@@ -1565,6 +1584,30 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->controlledCharacter.color,
             app->controlledCharacter.opacity,
             !app->config.drawEndSites);
+
+        // Add pre-IK capsules (semi-transparent yellow/orange) when foot IK visualization is enabled
+        if (app->config.drawFootIK && app->controlledCharacter.debugSaveBeforeIK)
+        {
+            CapsuleDataAppendFromTransformData(
+                &app->capsuleData,
+                &app->controlledCharacter.xformBeforeIK,
+                app->controlledCharacter.radius,
+                Color{ 255, 180, 0, 255 },  // orange/yellow to match skeleton
+                0.4f,  // semi-transparent
+                !app->config.drawEndSites);
+        }
+
+        // Add basic blend capsules (semi-transparent green) for comparison with lookahead
+        if (app->config.drawBasicBlend)
+        {
+            CapsuleDataAppendFromTransformData(
+                &app->capsuleData,
+                &app->controlledCharacter.xformBasicBlend,
+                app->controlledCharacter.radius,
+                Color{ 100, 255, 100, 255 },  // green
+                0.4f,  // semi-transparent
+                !app->config.drawEndSites);
+        }
     }
 
     PROFILE_END(Update);
@@ -1907,6 +1950,16 @@ static void ApplicationUpdate(void* voidApplicationState)
                 DARKGRAY,
                 GRAY);
         }
+
+        // Draw controlled character skeleton (uses character's color)
+        if (app->controlledCharacter.active && app->controlledCharacter.xformData.jointCount > 0)
+        {
+            DrawSkeleton(
+                &app->controlledCharacter.xformData,
+                app->config.drawEndSites,
+                app->controlledCharacter.color,
+                GRAY);
+        }
     }
 
     // Draw joint velocities
@@ -1931,7 +1984,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
-            span<const Vector3> velRow = app->animDatabase.globalJointVelocities.row_view(motionFrame);
+            span<const Vector3> velRow = app->animDatabase.jointVelocitiesRootSpace.row_view(motionFrame);
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
@@ -1966,7 +2019,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
-            span<const Vector3> accRow = app->animDatabase.globalJointAccelerations.row_view(motionFrame);
+            span<const Vector3> accRow = app->animDatabase.jointAccelerationsRootSpace.row_view(motionFrame);
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
@@ -2062,7 +2115,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         const AnimDatabase& db = app->animDatabase;
 
         // Draw full FK skeleton BEFORE IK (semi-transparent orange/yellow wireframe)
-        if (cc.debugSaveBeforeIK)
+        if (app->config.drawSkeleton && cc.debugSaveBeforeIK && cc.xformBeforeIK.jointCount > 0)
         {
             const int jc = cc.xformBeforeIK.jointCount;
             for (int j = 0; j < jc; ++j)
@@ -2118,12 +2171,12 @@ static void ApplicationUpdate(void* voidApplicationState)
                     const unsigned char fadeAlpha = (unsigned char)(unlockProgress * 200.0f + 55.0f);
                     const Color clampColor = Color{ 255, (unsigned char)(unlockProgress * 128.0f), 0, fadeAlpha };
 
-                    DrawSphereWires(cc.intermediateVirtualToePos[side], clampRadius, 8, 8, clampColor);
+                    DrawSphereWires(cc.lookaheadDragToePos[side], clampRadius, 8, 8, clampColor);
                 }
             }
 
             // Intermediate virtual toe (cyan) - unconstrained natural motion
-            DrawSphere(cc.intermediateVirtualToePos[side], 0.022f, LIME);
+            DrawSphere(cc.lookaheadDragToePos[side], 0.022f, LIME);
 
             // Final virtual toe (magenta) - constrained, this is the IK target
             DrawSphere(cc.virtualToePos[side], 0.025f, MAGENTA);
@@ -2131,7 +2184,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             // Draw line showing constraint between intermediate and final
             if (app->config.enableTimedUnlocking && cc.virtualToeUnlockTimer[side] >= 0.0f)
             {
-                DrawLine3D(cc.intermediateVirtualToePos[side], cc.virtualToePos[side], Color{ 255, 128, 255, 180 });
+                DrawLine3D(cc.lookaheadDragToePos[side], cc.virtualToePos[side], Color{ 255, 128, 255, 180 });
             }
 
             // FK toe position BEFORE IK (yellow) - where the toe was before correction
@@ -2151,6 +2204,32 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             // Current (post-IK) toe position (skyblue) - to compare with target
             DrawSphere(cc.xformData.globalPositions[toeIdx], 0.018f, SKYBLUE);
+        }
+    }
+
+    // Draw basic blend skeleton (semi-transparent green wireframe) - independent of foot IK
+    if (app->controlledCharacter.active &&
+        app->config.drawSkeleton &&
+        app->config.drawBasicBlend &&
+        app->controlledCharacter.xformBasicBlend.jointCount > 0)
+    {
+        const ControlledCharacter& cc = app->controlledCharacter;
+        const int jc = cc.xformBasicBlend.jointCount;
+        for (int j = 0; j < jc; ++j)
+        {
+            // Draw joint sphere (semi-transparent green)
+            if (!cc.xformBasicBlend.endSite[j])
+            {
+                DrawSphereWires(cc.xformBasicBlend.globalPositions[j], 0.012f, 4, 6, Color{ 100, 255, 100, 128 });
+            }
+
+            // Draw bone to parent
+            const int p = cc.xformBasicBlend.parents[j];
+            if (p != -1 && !cc.xformBasicBlend.endSite[j])
+            {
+                DrawLine3D(cc.xformBasicBlend.globalPositions[j], cc.xformBasicBlend.globalPositions[p],
+                    Color{ 80, 200, 80, 128 });
+            }
         }
     }
 
@@ -2338,7 +2417,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     //            for (int j = 0; j < jointCount; ++j)
     //            {
     //                const size_t idx = (size_t)motionFrameIndex * jointCount + j;
-    //                const Vector3 jp = app->animDatabase.globalJointPositions[idx];
+    //                const Vector3 jp = app->animDatabase.jointPositionsAnimSpace[idx];
 
     //                // If this joint is an end-site for this character, draw slightly different primitive
     //                bool isEnd = false;
@@ -2366,7 +2445,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     //                if (parent != -1 && parent < jointCount)
     //                {
     //                    const size_t pidx = (size_t)motionFrameIndex * jointCount + parent;
-    //                    const Vector3 pjp = app->animDatabase.globalJointPositions[pidx];
+    //                    const Vector3 pjp = app->animDatabase.jointPositionsAnimSpace[pidx];
     //                    DrawLine3D(jp, pjp, drawColor);
     //                }
     //            }
@@ -2812,7 +2891,7 @@ int main(int argc, char** argv)
         app.camera.unreal.yaw = app.config.cameraYaw;
         app.camera.unreal.pitch = app.config.cameraPitch;
         app.camera.unreal.moveSpeed = app.config.cameraMoveSpeed;
-        app.camera.mode = (app.config.cameraMode == 0) ? FlomoCameraMode::Orbit : FlomoCameraMode::UnrealEditor;
+        app.camera.mode = static_cast<FlomoCameraMode>(ClampInt(app.config.cameraMode, 0, 2));
     }
 
     // Shader
@@ -3032,7 +3111,7 @@ int main(int argc, char** argv)
     app.config.cameraYaw = app.camera.unreal.yaw;
     app.config.cameraPitch = app.camera.unreal.pitch;
     app.config.cameraMoveSpeed = app.camera.unreal.moveSpeed;
-    app.config.cameraMode = (app.camera.mode == FlomoCameraMode::Orbit) ? 0 : 1;
+    app.config.cameraMode = static_cast<int>(app.camera.mode);
 
 
     SaveAppConfig(app.config);

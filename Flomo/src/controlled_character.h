@@ -63,6 +63,9 @@ static void ControlledCharacterInit(
     TransformDataResize(&cc->xformBeforeIK, skeleton);
     cc->debugSaveBeforeIK = true;  // enable by default for debugging
 
+    // Initialize basic blend debug transform buffer
+    TransformDataInit(&cc->xformBasicBlend);
+    TransformDataResize(&cc->xformBasicBlend, skeleton);
 
     // Ensure blend cursors have storage sized to joint count
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
@@ -173,10 +176,13 @@ static void SpawnBlendCursor(
         &cursor->lookaheadRotations6d,
         &rootPos,
         &rootRot6d,
-        nullptr,  // outRootVelocityLocal
+        nullptr,  // outRootVelocityRootSpace
         nullptr,  // outRootYawRate
-        nullptr,  // outLookaheadRootVelocityLocal
-        nullptr); // outLookaheadRootYawRate
+        nullptr,  // outLookaheadRootVelocityRootSpace
+        nullptr,  // outLookaheadRootYawRate
+        &cursor->sampledLookaheadHipsHeight,
+        &cursor->sampledHipRotationYawFree,
+        &cursor->sampledLookaheadHipRotationYawFree);
 
     cursor->prevLocalRootPos = rootPos;
     cursor->prevLocalRootRot6d = rootRot6d;
@@ -304,6 +310,37 @@ static void ControlledCharacterUpdate(
         cc->animTime = fmodf(cc->animTime, currentMaxTime);
     }
 
+    // --- Update motion matching feature velocity (independent from actual velocity) ---
+    // This velocity is used for FutureVel features and updated using maxAcceleration
+    {
+        if (!cc->virtualControlSmoothedVelocityInitialized)
+        {
+            cc->virtualControlSmoothedVelocity = Vector3Zero();
+            cc->virtualControlSmoothedVelocityInitialized = true;
+        }
+
+        // Update feature velocity towards desired velocity using maximum acceleration
+        const Vector3 desiredVel = cc->playerInput.desiredVelocity;
+        const float maxAccel = config.virtualControlMaxAcceleration;
+        const float maxDeltaVelMag = maxAccel * dt;
+
+        const Vector3 velDelta = Vector3Subtract(cc->playerInput.desiredVelocity, cc->virtualControlSmoothedVelocity);
+        const float velDeltaMag = Vector3Length(velDelta);
+
+        if (velDeltaMag <= maxDeltaVelMag)
+        {
+            // Can reach desired velocity within this timestep
+            cc->virtualControlSmoothedVelocity = cc->playerInput.desiredVelocity;
+        }
+        else if (velDeltaMag > 1e-6f)
+        {
+            // Clamp to max achievable change
+            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
+            cc->virtualControlSmoothedVelocity = Vector3Add(cc->virtualControlSmoothedVelocity, Vector3Scale(velDeltaDir, maxDeltaVelMag));
+        }
+    }
+
+
     // --------- Per-cursor update: sample pose, update weights, blend velocities ----------
     Vector3 blendedVelocity = Vector3Zero();
     float blendedYawRate = 0.0f;
@@ -324,10 +361,13 @@ static void ControlledCharacterUpdate(
         // Velocity sampled at midpoint of frame interval for better accuracy
         Vector3 sampledRootPos;
         Rot6d sampledRootRot6d;
-        Vector3 sampledRootVelLocal;
+        Vector3 sampledRootVelRootSpace;
         float sampledRootYawRate;
-        Vector3 sampledLookaheadRootVelLocal;
+        Vector3 sampledLookaheadRootVelRootSpace;
         float sampledLookaheadRootYawRate;
+        float sampledLookaheadHipsHeight;
+        Rot6d sampledHipRotationYawFree;
+        Rot6d sampledLookaheadHipRotationYawFree;
         SamplePoseAndMotion(
             db,
             cur.animIndex,
@@ -339,21 +379,29 @@ static void ControlledCharacterUpdate(
             &cur.lookaheadRotations6d,
             &sampledRootPos,
             &sampledRootRot6d,
-            &sampledRootVelLocal,
+            &sampledRootVelRootSpace,
             &sampledRootYawRate,
-            &sampledLookaheadRootVelLocal,
-            &sampledLookaheadRootYawRate);
+            &sampledLookaheadRootVelRootSpace,
+            &sampledLookaheadRootYawRate,
+            &sampledLookaheadHipsHeight,
+            &sampledHipRotationYawFree,
+            &sampledLookaheadHipRotationYawFree);
 
-        // Store sampled velocities in cursor (now in local/heading-relative space)
-        cur.sampledRootVelocityLocal = sampledRootVelLocal;
+        // Store sampled values in cursor
+        cur.sampledRootVelocityRootSpace = sampledRootVelRootSpace;
         cur.sampledRootYawRate = sampledRootYawRate;
-        cur.sampledLookaheadRootVelocityLocal = sampledLookaheadRootVelLocal;
+        cur.sampledLookaheadRootVelocityRootSpace = sampledLookaheadRootVelRootSpace;
         cur.sampledLookaheadRootYawRate = sampledLookaheadRootYawRate;
+        cur.sampledLookaheadHipsHeight = sampledLookaheadHipsHeight;
+        cur.sampledHipRotationYawFree = sampledHipRotationYawFree;
+        cur.sampledLookaheadHipRotationYawFree = sampledLookaheadHipRotationYawFree;
 
-        // Sample global toe velocities from database (for foot IK)
-        // These are still in animation-world space, need to transform
-        Vector3 animSpaceToeVel[SIDES_COUNT];
-        SampleGlobalToeVelocity(db, cur.animIndex, cur.animTime - dt * 0.5f, animSpaceToeVel);
+        // Sample toe velocities from database (already in root space)
+        Vector3 toeVelRootSpace[SIDES_COUNT];
+        SampleToeVelocityRootSpace(db, cur.animIndex, cur.animTime - dt * 0.5f, toeVelRootSpace);
+
+        // Sample lookahead toe positions (for predictive foot IK)
+        SampleLookaheadToePosRootSpace(db, cur.animIndex, cur.animTime, cur.sampledLookaheadToePosRootSpace);
 
         // Update weight via spring integrator
         DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
@@ -361,9 +409,9 @@ static void ControlledCharacterUpdate(
         // Clamp the output weight to [0, 1]
         cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
 
-        // Transform root velocity from local space to world space
-        // Local space is heading-relative, so just rotate by character's worldRotation
-        const Vector3 rootVelWorld = Vector3RotateByQuaternion(sampledRootVelLocal, cc->worldRotation);
+        // Transform root velocity from root space to world space
+        // Root space is heading-relative, just rotate by character's worldRotation
+        const Vector3 rootVelWorld = Vector3RotateByQuaternion(sampledRootVelRootSpace, cc->worldRotation);
 
         // Store velocities in cursor (for acceleration-based blending)
         cur.prevRootVelocity = cur.rootVelocity;
@@ -371,15 +419,10 @@ static void ControlledCharacterUpdate(
         cur.rootVelocity = rootVelWorld;
         cur.rootYawRate = sampledRootYawRate;
 
-        // Transform toe velocities from animation-world to character-world
-        // Need to extract yaw to convert toe velocities (they're still in anim space)
-        const float currYaw = Rot6dGetYaw(sampledRootRot6d);
-        const Rot6d invCurrYawRot = Rot6dFromYaw(-currYaw);
+        // Transform toe velocities from root space to world space
         for (int side : sides)
         {
-            Vector3 toeVelLocal;
-            Rot6dTransformVector(invCurrYawRot, animSpaceToeVel[side], toeVelLocal);
-            cur.globalToeVelocity[side] = Vector3RotateByQuaternion(toeVelLocal, cc->worldRotation);
+            cur.toeVelocityWorld[side] = Vector3RotateByQuaternion(toeVelRootSpace[side], cc->worldRotation);
         }
 
         const float wgt = cur.weightSpring.x;
@@ -436,7 +479,7 @@ static void ControlledCharacterUpdate(
         {
             cc->toeBlendedVelocity[side] = Vector3Add(
                 cc->toeBlendedVelocity[side],
-                Vector3Scale(cur.globalToeVelocity[side], w));
+                Vector3Scale(cur.toeVelocityWorld[side], w));
         }
     }
 
@@ -459,7 +502,7 @@ static void ControlledCharacterUpdate(
 
             // Transform lookahead velocities to world space
             // They're already in local space, just apply worldRotation
-            const Vector3 lookaheadVelWorld = Vector3RotateByQuaternion(cur.sampledLookaheadRootVelocityLocal, cc->worldRotation);
+            const Vector3 lookaheadVelWorld = Vector3RotateByQuaternion(cur.sampledLookaheadRootVelocityRootSpace, cc->worldRotation);
 
             blendedLookaheadVelocity = Vector3Add(blendedLookaheadVelocity, Vector3Scale(lookaheadVelWorld, w));
             blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * w;
@@ -547,7 +590,7 @@ static void ControlledCharacterUpdate(
         }
 
         // Lerp towards lookahead target with alpha = dt / lookaheadTime
-        const float lookaheadTime = Max(dt, config.poseDragLookaheadTime);
+        const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
         const float alpha = dt / lookaheadTime;
         cc->lookaheadDragVelocity = Vector3Lerp(cc->lookaheadDragVelocity, blendedLookaheadVelocity, alpha);
         cc->lookaheadDragYawRate = Lerp(cc->lookaheadDragYawRate, blendedLookaheadYawRate, alpha);
@@ -641,6 +684,34 @@ static void ControlledCharacterUpdate(
             }
         }
 
+        // Save basic blend pose (before lookahead modifications) for debug visualization
+        if (config.drawBasicBlend)
+        {
+            // Copy positions (already accumulated in posAccum)
+            for (int j = 0; j < jc; ++j)
+            {
+                cc->xformBasicBlend.localPositions[j] = posAccum[j];
+            }
+            // Convert blendedRot6d to quaternions
+            for (int j = 0; j < jc; ++j)
+            {
+                Rot6dToQuaternion(blendedRot6d[j], cc->xformBasicBlend.localRotations[j]);
+            }
+            // Zero out root XZ translation
+            cc->xformBasicBlend.localPositions[0].x = 0.0f;
+            cc->xformBasicBlend.localPositions[0].z = 0.0f;
+            // FK
+            TransformDataForwardKinematics(&cc->xformBasicBlend);
+            // Transform to world space
+            for (int i = 0; i < jc; ++i)
+            {
+                cc->xformBasicBlend.globalPositions[i] = Vector3Add(
+                    Vector3RotateByQuaternion(cc->xformBasicBlend.globalPositions[i], cc->worldRotation),
+                    cc->worldPosition);
+                cc->xformBasicBlend.globalRotations[i] = QuaternionMultiply(
+                    cc->worldRotation, cc->xformBasicBlend.globalRotations[i]);
+            }
+        }
 
         // Other joints (1+): choose blend mode
         switch (cc->cursorBlendMode)
@@ -648,14 +719,15 @@ static void ControlledCharacterUpdate(
         case CursorBlendMode::LookaheadDragging:
         {
             // Lookahead dragging: lerp running pose towards extrapolated future
-           // with alpha = dt / lookaheadTime so animation tracks perfectly when not transitioning
+            // with alpha = dt / lookaheadTime so animation tracks perfectly when not transitioning
 
-           // Special handling for hip (joint 0): we need yaw-stripped versions for blending
-           // because each cursor's hip rotation is in different animation space
-            Rot6d blendedLookaheadHipNoYaw = Rot6dIdentity();
-            blendedLookaheadHipNoYaw.ax = 0.0f;  // zero it out (identity has ax=1)
+            // Hip rotation: use the dedicated yaw-free tracks from the database
+            // This avoids all the runtime yaw-stripping issues
+            // Blend both current and lookahead yaw-free hip rotations from cursors
+            Rot6d blendedHipYawFree = Rot6dZero();
 
-            // Re-accumulate lookahead rotations for hip with yaw stripped
+            Rot6d blendedLookaheadHipYawFree = Rot6dZero();
+
             for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
             {
                 const BlendCursor& cur = cc->cursors[ci];
@@ -663,33 +735,45 @@ static void ControlledCharacterUpdate(
                 const float w = cur.normalizedWeight;
                 if (w <= 1e-6f) continue;
 
-                // For hip: strip yaw from lookahead before accumulating
-                Rot6d laHipNoYaw = cur.lookaheadRotations6d[0];
-                Rot6dRemoveYComponent(laHipNoYaw, laHipNoYaw);
-
-                Rot6dScaledAdd(w, laHipNoYaw, blendedLookaheadHipNoYaw);
+                // Use the precomputed yaw-free rotations from database
+                Rot6dScaledAdd(w, cur.sampledHipRotationYawFree, blendedHipYawFree);
+                Rot6dScaledAdd(w, cur.sampledLookaheadHipRotationYawFree, blendedLookaheadHipYawFree);
             }
 
-
-            // Normalize the blended hip lookahead (yaw-stripped)
-            const float lenLA = sqrtf(blendedLookaheadHipNoYaw.ax * blendedLookaheadHipNoYaw.ax +
-                blendedLookaheadHipNoYaw.ay * blendedLookaheadHipNoYaw.ay +
-                blendedLookaheadHipNoYaw.az * blendedLookaheadHipNoYaw.az);
-            if (lenLA > 1e-6f)
+            // Normalize the blended current hip
             {
-                Rot6dNormalize(blendedLookaheadHipNoYaw);
-            }
-            else
-            {
-                blendedLookaheadHipNoYaw = Rot6dIdentity();
+                const float len = sqrtf(blendedHipYawFree.ax * blendedHipYawFree.ax +
+                    blendedHipYawFree.ay * blendedHipYawFree.ay +
+                    blendedHipYawFree.az * blendedHipYawFree.az);
+                if (len > 1e-6f)
+                {
+                    Rot6dNormalize(blendedHipYawFree);
+                }
+                else
+                {
+                    blendedHipYawFree = Rot6dIdentity();
+                }
             }
 
+            // Normalize the blended lookahead hip
+            {
+                const float len = sqrtf(blendedLookaheadHipYawFree.ax * blendedLookaheadHipYawFree.ax +
+                    blendedLookaheadHipYawFree.ay * blendedLookaheadHipYawFree.ay +
+                    blendedLookaheadHipYawFree.az * blendedLookaheadHipYawFree.az);
+                if (len > 1e-6f)
+                {
+                    Rot6dNormalize(blendedLookaheadHipYawFree);
+                }
+                else
+                {
+                    blendedLookaheadHipYawFree = Rot6dIdentity();
+                }
+            }
+
+            // Initialize drag states
             if (!cc->lookaheadDragInitialized)
             {
-                // Initialize hip with yaw-stripped version
-                cc->lookaheadDragPose6d[0] = blendedRot6d[0];  // current blended (already yaw-stripped)
-
-                // Initialize other joints normally
+                // Initialize other joints (not hip - hip uses separate track)
                 for (int j = 1; j < jc; ++j)
                 {
                     cc->lookaheadDragPose6d[j] = blendedRot6d[j];
@@ -697,34 +781,74 @@ static void ControlledCharacterUpdate(
                 cc->lookaheadDragInitialized = true;
             }
 
-            const float lookaheadTime = Max(dt, config.poseDragLookaheadTime);
-            if (lookaheadTime > 1e-6f)
+            if (!cc->lookaheadDragHipRotationInitialized)
             {
-                const float alpha = dt / lookaheadTime;
-
-                // Hip: lerp towards yaw-stripped lookahead target
-                Rot6dLerp(cc->lookaheadDragPose6d[0], blendedLookaheadHipNoYaw, alpha, cc->lookaheadDragPose6d[0]);
-
-                // Other joints: use normal lookahead targets
-                for (int j = 1; j < jc; ++j)
-                {
-                    Rot6dLerp(cc->lookaheadDragPose6d[j], blendedLookaheadRot6d[j], alpha, cc->lookaheadDragPose6d[j]);
-                }
-            }
-            else
-            {
-                cc->lookaheadDragPose6d[0] = blendedRot6d[0];  // yaw-stripped current
-                for (int j = 1; j < jc; ++j)
-                {
-                    cc->lookaheadDragPose6d[j] = blendedRot6d[j];
-                }
+                // Initialize hip drag state from current blended yaw-free rotation (from database)
+                cc->lookaheadDragHipRotationYawFree = blendedHipYawFree;
+                cc->lookaheadDragHipRotationInitialized = true;
             }
 
-            // Convert to quaternions (hip already yaw-stripped, so convert directly)
-            for (int j = 0; j < jc; ++j)
+            // lookaheadTime >= dt ensures alpha <= 1 (no overshoot)
+            const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+            const float alpha = dt / lookaheadTime;
+            assert(alpha <= 1.0f);
+
+            // Apply extrapolation multiplier: effectiveTarget = blended + (lookahead - blended) * mult
+            const float extrapMult = config.lookaheadExtrapolationMult;
+
+            // Hip: drag using the dedicated yaw-free tracks (both from database)
+            {
+                Rot6d effectiveHipTarget;
+                Rot6dLerp(blendedHipYawFree, blendedLookaheadHipYawFree, extrapMult, effectiveHipTarget);
+                Rot6dLerp(cc->lookaheadDragHipRotationYawFree, effectiveHipTarget, alpha, cc->lookaheadDragHipRotationYawFree);
+            }
+
+            // Other joints: extrapolate then lerp
+            for (int j = 1; j < jc; ++j)
+            {
+                Rot6d effectiveTarget;
+                Rot6dLerp(blendedRot6d[j], blendedLookaheadRot6d[j], extrapMult, effectiveTarget);
+                Rot6dLerp(cc->lookaheadDragPose6d[j], effectiveTarget, alpha, cc->lookaheadDragPose6d[j]);
+            }
+
+            // Convert to quaternions
+            // TEST: use blended yaw-free directly (no dragging) to verify database values
+            //Rot6dToQuaternion(blendedHipYawFree, cc->xformData.localRotations[0]);
+            Rot6dToQuaternion(cc->lookaheadDragHipRotationYawFree, cc->xformData.localRotations[0]);
+            for (int j = 1; j < jc; ++j)
             {
                 Rot6dToQuaternion(cc->lookaheadDragPose6d[j], cc->xformData.localRotations[j]);
             }
+
+            // Lookahead hips height dragging
+            // Blend lookahead heights from cursors
+            float blendedLookaheadHipsHeight = 0.0f;
+            for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+            {
+                const BlendCursor& cur = cc->cursors[ci];
+                if (!cur.active) continue;
+                const float w = cur.normalizedWeight;
+                if (w <= 1e-6f) continue;
+
+                blendedLookaheadHipsHeight += cur.sampledLookaheadHipsHeight * w;
+            }
+
+            // Initialize hips height dragging state
+            if (!cc->lookaheadDragHipsHeightInitialized)
+            {
+                // Start from current blended height (not lookahead)
+                cc->lookaheadDragHipsHeight = posAccum[0].y;
+                cc->lookaheadDragHipsHeightInitialized = true;
+            }
+
+            // Apply extrapolation multiplier then drag towards target (reuses alpha from above)
+            const float blendedHeight = posAccum[0].y;
+            const float effectiveHeightTarget = blendedHeight + (blendedLookaheadHipsHeight - blendedHeight) * extrapMult;
+            cc->lookaheadDragHipsHeight = Lerp(cc->lookaheadDragHipsHeight, effectiveHeightTarget, alpha);
+
+            // Apply dragged height to hip Y position
+            cc->xformData.localPositions[0].y = cc->lookaheadDragHipsHeight;
+
             break;
         }
         case CursorBlendMode::VelBlending:
@@ -870,15 +994,19 @@ static void ControlledCharacterUpdate(
     }
     cc->toeTrackingPreIKInitialized = true;
 
-    // Update virtual toe positions
-    // Intermediate: cursor velocity + viscous return (NO speed clamp) - represents natural motion
-    // Final: intermediate + speed clamp + unlock clamp - constrained for IK
+    // Update virtual toe positions using lookahead dragging
+    // lookaheadDragToePos: drags toward blended lookahead target (unconstrained, for unlock detection)
+    // virtualToePos: speed-clamped for IK (constrained)
+    const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+    const float toeAlpha = dt / lookaheadTime;
+    assert(toeAlpha <= 1.0f);
+
     for (int side : sides)
     {
         const int toeIdx = db->toeIndices[side];
         if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount)
         {
-            if (!cc->virtualToeInitialized)
+            if (!cc->lookaheadDragToePosInitialized)
             {
                 TraceLog(LOG_WARNING, "Virtual toe: can't find %s toe joint (idx=%d, jointCount=%d)",
                     StringFromSide(side), toeIdx, cc->xformData.jointCount);
@@ -886,10 +1014,12 @@ static void ControlledCharacterUpdate(
             continue;
         }
 
-        // Blend toe position from cursors using normalized weights
-        float blendedToeX = 0.0f;
-        float blendedToeY = 0.0f;
-        float blendedToeZ = 0.0f;
+        // Blend lookahead toe positions and hip position from cursors
+        Vector3 blendedLookaheadToePosRootSpace = Vector3Zero();
+        Vector3 blendedHipPosWorld = Vector3Zero();
+        Vector3 blendedToePos = Vector3Zero();
+        const int hipIdx = db->hipJointIndex;
+
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
             const BlendCursor& cur = cc->cursors[ci];
@@ -897,50 +1027,56 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
+            blendedLookaheadToePosRootSpace = Vector3Add(
+                blendedLookaheadToePosRootSpace,
+                Vector3Scale(cur.sampledLookaheadToePosRootSpace[side], w));
+
+            // Get hip world position for root space -> world space transform
+            if (hipIdx >= 0 && hipIdx < (int)cur.globalPositions.size())
+            {
+                blendedHipPosWorld = Vector3Add(blendedHipPosWorld, Vector3Scale(cur.globalPositions[hipIdx], w));
+            }
+
+            // Get toe position for speed clamp reference
             if (toeIdx < (int)cur.globalPositions.size())
             {
-                blendedToeX += cur.globalPositions[toeIdx].x * w;
-                blendedToeY += cur.globalPositions[toeIdx].y * w;
-                blendedToeZ += cur.globalPositions[toeIdx].z * w;
+                blendedToePos = Vector3Add(blendedToePos, Vector3Scale(cur.globalPositions[toeIdx], w));
             }
         }
-        const Vector3 blendedToePos = Vector3{ blendedToeX, blendedToeY, blendedToeZ };
 
-        if (!cc->virtualToeInitialized)
+        // Transform lookahead toe from root space to world space
+        // Root space is relative to ground-projected hip (hipPos.x, 0, hipPos.z), heading-aligned
+        // So: rotate by worldRotation, then add blended hip world position (ground-projected)
+        const Vector3 blendedLookaheadToePosWorld = Vector3Add(
+            Vector3RotateByQuaternion(blendedLookaheadToePosRootSpace, cc->worldRotation),
+            Vector3{ blendedHipPosWorld.x, 0.0f, blendedHipPosWorld.z });
+
+        if (!cc->lookaheadDragToePosInitialized)
         {
-            cc->intermediateVirtualToePos[side] = blendedToePos;
+            cc->lookaheadDragToePos[side] = blendedToePos;
             cc->virtualToePos[side] = blendedToePos;
             TraceLog(LOG_INFO, "Virtual toe: initialized %s toe at (%.2f, %.2f, %.2f)",
                 StringFromSide(side), cc->virtualToePos[side].x, cc->virtualToePos[side].y, cc->virtualToePos[side].z);
         }
         else
         {
-            // Update intermediate virtual toe (no speed clamp)
-                // Step 1: Primary motion from blended cursor velocity (XYZ)
+            // Apply extrapolation multiplier then drag toward target (unconstrained, for unlock detection)
+            const Vector3 effectiveToeTarget = Vector3Add(blendedToePos,
+                Vector3Scale(Vector3Subtract(blendedLookaheadToePosWorld, blendedToePos), config.lookaheadExtrapolationMult));
+            cc->lookaheadDragToePos[side] = Vector3Lerp(cc->lookaheadDragToePos[side], effectiveToeTarget, toeAlpha);
+
+            // Update virtualToePos: try to go DIRECTLY to target, but speed-clamped
+            // No dragging - infinite stiffness, just clamped max speed
+            const Vector3 prevVirtualToePos = cc->virtualToePos[side];
+            Vector3 newVirtualToePos = cc->lookaheadDragToePos[side];  // target directly
+
+            const bool doSpeedClamp = true;
+            if (doSpeedClamp)
+            {
+                // Speed clamp (XZ only) based on blended toe velocity
                 const Vector3 blendedToeVel = cc->toeBlendedVelocity[side];
-                const Vector3 velocityDisplacement = Vector3Scale(blendedToeVel, dt);
-
-                // Step 2: Viscous return force toward FK blended position
-                const Vector3 intermediatePlusVel = Vector3Add(cc->intermediateVirtualToePos[side], velocityDisplacement);
-                const Vector3 toTarget = Vector3Subtract(blendedToePos, intermediatePlusVel);
-
-                const float returnHalflife = 0.1f;
-                const float returnAlpha = 1.0f - powf(0.5f, dt / returnHalflife);
-                const Vector3 returnDisplacement = Vector3Scale(toTarget, returnAlpha);
-
-                // Step 3: Combine (NO speed clamp for intermediate)
-                const Vector3 intermediateDisplacement = Vector3Add(velocityDisplacement, returnDisplacement);
-                cc->intermediateVirtualToePos[side] = Vector3Add(cc->intermediateVirtualToePos[side], intermediateDisplacement);
-
-                // Update final virtual toe with speed clamp
-                // Start from current final position and apply same forces
-                const Vector3 finalPlusVel = Vector3Add(cc->virtualToePos[side], velocityDisplacement);
-                const Vector3 toTargetFinal = Vector3Subtract(blendedToePos, finalPlusVel);
-                const Vector3 returnDisplacementFinal = Vector3Scale(toTargetFinal, returnAlpha);
-                Vector3 finalDisplacement = Vector3Add(velocityDisplacement, returnDisplacementFinal);
-
-                // Step 4: Speed clamp (XZ only) for final virtual toe
-                const float distXZ = Vector3Length2D(finalDisplacement);
+                const Vector3 displacement = Vector3Subtract(newVirtualToePos, prevVirtualToePos);
+                const float distXZ = Vector3Length2D(displacement);
 
                 if (distXZ > 1e-6f)
                 {
@@ -948,9 +1084,9 @@ static void ControlledCharacterUpdate(
 
                     const float lowSpeed = 0.5f;
                     const float highSpeed = 2.0f;
-                    const float lowMult = 1.2f;
-                    const float highMult = 1.7f;
                     const float howFast = ClampedInvLerp(lowSpeed, highSpeed, blendedSpeedXZ);
+                    const float lowMult = 1.1f;
+                    const float highMult = 1.4f;
                     const float speedMultiplier = SmoothLerp(lowMult, highMult, howFast);
                     const float maxSpeed = blendedSpeedXZ * speedMultiplier;
                     const float maxDistXZ = maxSpeed * dt;
@@ -958,72 +1094,69 @@ static void ControlledCharacterUpdate(
                     if (distXZ > maxDistXZ)
                     {
                         const float scale = maxDistXZ / distXZ;
-                        finalDisplacement.x *= scale;
-                        finalDisplacement.z *= scale;
+                        newVirtualToePos.x = prevVirtualToePos.x + displacement.x * scale;
+                        newVirtualToePos.z = prevVirtualToePos.z + displacement.z * scale;
+                        // Y is NOT clamped - height should track target directly
                     }
                 }
+            }
 
-                cc->virtualToePos[side] = Vector3Add(cc->virtualToePos[side], finalDisplacement);
+            cc->virtualToePos[side] = newVirtualToePos;
 
-                // Check unlock condition: distance between final and intermediate (XZ only)
-                const Vector3 unlockDelta = Vector3Subtract(cc->intermediateVirtualToePos[side], cc->virtualToePos[side]);
-                const float distXZUnlock = Vector3Length2D(unlockDelta);
+            // Check unlock condition: distance between lookaheadDrag (unconstrained) and virtual (constrained)
+            const Vector3 unlockDelta = Vector3Subtract(cc->lookaheadDragToePos[side], cc->virtualToePos[side]);
+            const float distXZUnlock = Vector3Length2D(unlockDelta);
 
-                // Trigger unlock when final can't keep up with intermediate
-                // BUT only if the other foot is not currently unlocked
-                const int otherSide = OtherSideInt(side);
-                const bool otherFootUnlocked = (cc->virtualToeUnlockTimer[otherSide] >= 0.0f);
+            // Trigger unlock when constrained can't keep up with unconstrained
+            const int otherSide = OtherSideInt(side);
+            const bool otherFootUnlocked = (cc->virtualToeUnlockTimer[otherSide] >= 0.0f);
 
-                if (config.enableTimedUnlocking &&
-                    distXZUnlock > config.unlockDistance &&
-                    cc->virtualToeUnlockTimer[side] < 0.0f &&
-                    !otherFootUnlocked)
+            if (config.enableTimedUnlocking &&
+                distXZUnlock > config.unlockDistance &&
+                cc->virtualToeUnlockTimer[side] < 0.0f &&
+                !otherFootUnlocked)
+            {
+                cc->virtualToeUnlockTimer[side] = config.unlockDuration;
+                cc->virtualToeUnlockStartDistance[side] = distXZUnlock;
+            }
+
+            // Update unlock timer
+            if (cc->virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                cc->virtualToeUnlockTimer[side] -= dt;
+                if (cc->virtualToeUnlockTimer[side] < 0.0f)
                 {
-                    cc->virtualToeUnlockTimer[side] = config.unlockDuration;
-                    cc->virtualToeUnlockStartDistance[side] = distXZUnlock;  // REMEMBER actual distance at unlock
-                    //TraceLog(LOG_INFO, "Virtual toe %s unlocked: final-intermediate dist %.3f > %.3f (start dist %.3f)",
-                    //    StringFromSide(side), distXZUnlock, config.unlockDistance, distXZUnlock);
-                }                
-                
-                // Update unlock timer
-                if (cc->virtualToeUnlockTimer[side] >= 0.0f)
-                {
-                    cc->virtualToeUnlockTimer[side] -= dt;
-                    if (cc->virtualToeUnlockTimer[side] < 0.0f)
-                    {
-                        cc->virtualToeUnlockTimer[side] = -1.0f;
-                    }
+                    cc->virtualToeUnlockTimer[side] = -1.0f;
                 }
+            }
 
-                // If unlocked, pull final toward intermediate (shrinking sphere constraint)
-                if (config.enableTimedUnlocking && cc->virtualToeUnlockTimer[side] >= 0.0f)
+            // If unlocked, pull constrained toward unconstrained (shrinking sphere)
+            if (config.enableTimedUnlocking && cc->virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                const float unlockProgress = cc->virtualToeUnlockTimer[side] / config.unlockDuration;
+                const float smoothUnlockProgress = SmoothStep(unlockProgress);
+                const float maxClampDist = cc->virtualToeUnlockStartDistance[side] * smoothUnlockProgress;
+
+                cc->virtualToeUnlockClampRadius[side] = maxClampDist;
+
+                const Vector3 clampDelta = Vector3Subtract(cc->lookaheadDragToePos[side], cc->virtualToePos[side]);
+                const float distXZClamp = Vector3Length2D(clampDelta);
+
+                if (distXZClamp > maxClampDist)
                 {
-                    const float unlockProgress = cc->virtualToeUnlockTimer[side] / config.unlockDuration;
-                    const float smoothUnlockProgress = SmoothStep(unlockProgress);
-                    // Shrink from actual unlock distance to 0, not from unlockDistance
-                    const float maxClampDist = cc->virtualToeUnlockStartDistance[side] * smoothUnlockProgress;
-
-                    // Store for debug visualization
-                    cc->virtualToeUnlockClampRadius[side] = maxClampDist;
-
-                    const Vector3 clampDelta = Vector3Subtract(cc->intermediateVirtualToePos[side], cc->virtualToePos[side]);
-                    const float distXZClamp = Vector3Length2D(clampDelta);
-
-                    if (distXZClamp > maxClampDist)
-                    {
-                        const float clampScale = maxClampDist / distXZClamp;
-                        cc->virtualToePos[side].x = cc->intermediateVirtualToePos[side].x - clampDelta.x * clampScale;
-                        cc->virtualToePos[side].z = cc->intermediateVirtualToePos[side].z - clampDelta.z * clampScale;
-                    }
+                    const float clampScale = maxClampDist / distXZClamp;
+                    cc->virtualToePos[side].x = cc->lookaheadDragToePos[side].x - clampDelta.x * clampScale;
+                    cc->virtualToePos[side].z = cc->lookaheadDragToePos[side].z - clampDelta.z * clampScale;
                 }
-                else
-                {
-                    cc->virtualToeUnlockClampRadius[side] = 0.0f;
-                }
+            }
+            else
+            {
+                cc->virtualToeUnlockClampRadius[side] = 0.0f;
+            }
         }
     }
 
-    cc->virtualToeInitialized = true;   
+    cc->lookaheadDragToePosInitialized = true;   
     
 
 

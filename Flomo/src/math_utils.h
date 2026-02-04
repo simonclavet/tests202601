@@ -65,7 +65,6 @@ static inline int MinInt(int x, int y)
     return x < y ? x : y;
 }
 
-
 // Acos that prevents domain errors (NaNs) if inputs are slightly > 1.0 or < -1.0
 static inline float SafeAcos(float x) {
     if (x > 1.0f) return 0.0f;
@@ -688,6 +687,13 @@ static inline Rot6d Rot6dIdentity()
 {
     return Rot6d{ 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
 }
+
+// use this only to initialize accumulators
+static inline Rot6d Rot6dZero()
+{
+    return Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+}
+
 
 // extract Y-rotation (yaw) angle from Rot6d
 // the first column (a) of a Y-rotation matrix is [cos(y), 0, -sin(y)]

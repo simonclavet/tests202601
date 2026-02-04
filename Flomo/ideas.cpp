@@ -626,3 +626,16 @@ public:
         poseInitialized = false;
     }
 };
+
+
+
+/*
+
+What I can see is that sometimes the error between basic and lookahead is large even if the anim is not extremely fast.
+And error sometimes is mostly due to hips rotation. The guy is sometimes banked more in basic than in lookahead, and the 
+legs and torso are significantly offseted in opposite direction (hips just rotated not enough)
+
+
+
+
+*/

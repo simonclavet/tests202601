@@ -191,7 +191,8 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.defaultBlendTime = ResolveFloatConfig(buffer, "defaultBlendTime", config.defaultBlendTime, argc, argv);
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
     config.mmSearchPeriod = ResolveFloatConfig(buffer, "mmSearchPeriod", config.mmSearchPeriod, argc, argv);
-    config.poseDragLookaheadTime = ResolveFloatConfig(buffer, "poseDragLookaheadTime", config.poseDragLookaheadTime, argc, argv);
+    config.virtualControlMaxAcceleration = ResolveFloatConfig(buffer, "virtualControlMaxAcceleration", config.virtualControlMaxAcceleration, argc, argv);
+    config.poseDragLookaheadTimeEditor = ResolveFloatConfig(buffer, "poseDragLookaheadTime", config.poseDragLookaheadTimeEditor, argc, argv);
 
     config.cursorBlendMode = static_cast<CursorBlendMode>(ResolveIntConfig(buffer, "cursorBlendMode", static_cast<int>(config.cursorBlendMode), argc, argv));
     config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
@@ -287,7 +288,7 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", config.defaultBlendTime);
     fprintf(file, "    \"switchInterval\": %.4f,\n", config.switchInterval);
     fprintf(file, "    \"mmSearchPeriod\": %.4f,\n", config.mmSearchPeriod);
-    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", config.poseDragLookaheadTime);
+    fprintf(file, "    \"virtualControlMaxAcceleration\": %.4f,\n", config.virtualControlMaxAcceleration);
 
     fprintf(file, "    \"cursorBlendMode\": %d,\n", static_cast<int>(config.cursorBlendMode));
     fprintf(file, "    \"blendPosReturnTime\": %.4f,\n", config.blendPosReturnTime);
@@ -302,6 +303,7 @@ static inline void SaveAppConfig(const AppConfig& config)
     // Save motion matching config
     std::string mmConfigJson = MotionMatchingConfigToJson(config.mmConfigEditor);
     fprintf(file, "  \"motionMatchingConfig\": %s,\n", mmConfigJson.c_str());
+    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", config.poseDragLookaheadTimeEditor);
 
     fprintf(file, "}\n");
 

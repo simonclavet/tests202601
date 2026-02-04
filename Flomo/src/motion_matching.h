@@ -10,6 +10,53 @@
 #include "utils.h"
 #include "definitions.h"
 
+// Compute future velocities at given trajectory times
+// Uses acceleration-based extrapolation from current towards desired
+// currentVel: current velocity (XZ, world space)
+// desiredVel: desired velocity (XZ, world space)
+// maxAcceleration: maximum acceleration constraint (m/s^2)
+// futureTimes: array of future time offsets (seconds)
+// outVelocities: output array (must be sized to match futureTimes)
+static inline void ComputeFutureVelocities(
+    const Vector3& currentVel,
+    const Vector3& desiredVel,
+    float maxAcceleration,
+    const std::vector<float>& futureTimes,
+    std::vector<Vector3>& outVelocities)
+{
+    outVelocities.resize(futureTimes.size());
+
+    for (int p = 0; p < (int)futureTimes.size(); ++p)
+    {
+        const float futureTime = futureTimes[p];
+
+        // How much velocity can change in this time?
+        const float maxDeltaVelMag = maxAcceleration * futureTime;
+
+        // Compute velocity at futureTime: move from current towards desired, clamped by max change
+        const Vector3 velDelta = Vector3Subtract(desiredVel, currentVel);
+        const float velDeltaMag = Vector3Length(velDelta);
+
+        Vector3 futureVel;
+        if (velDeltaMag <= maxDeltaVelMag)
+        {
+            // Can reach desired velocity within this time
+            futureVel = desiredVel;
+        }
+        else if (velDeltaMag > 1e-6f)
+        {
+            // Clamp to max achievable change
+            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
+            futureVel = Vector3Add(currentVel, Vector3Scale(velDeltaDir, maxDeltaVelMag));
+        }
+        else
+        {
+            futureVel = currentVel;
+        }
+
+        outVelocities[p] = futureVel;
+    }
+}
 
 //----------------------------------------------------------------------------------
 // Motion Matching - Feature Extraction and Search
@@ -25,8 +72,8 @@ static void ComputeMotionFeatures(
     if (db == nullptr || !db->valid) return;
     if (cc == nullptr) return;
 
-    const TransformData* xform = &cc->xformData;
-    const Vector3* toeVelocity = cc->toeVelocity;
+    const TransformData* xform = &cc->xformBeforeIK;
+    const Vector3* toeVelocity = cc->toeVelocityPreIK;
     const PlayerControlInput* input = &cc->playerInput;
 
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
@@ -103,21 +150,61 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = localLeftPos.z - localRightPos.z;
     }
 
-    // FutureVel: desired velocity at future sample times
-    // Key difference: we use player's desired velocity instead of animation's future trajectory
+
+    // Compute future velocities once if either FutureVel or FutureSpeed is enabled
+    std::vector<Vector3> futureVelocities;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVel) || cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
+    {
+        const Vector3 currentVelWorld = cc->virtualControlSmoothedVelocity;
+        const Vector3 desiredVelWorld = input->desiredVelocity;
+        const float maxAcceleration = 4.0f;
+
+        ComputeFutureVelocities(currentVelWorld, desiredVelWorld, maxAcceleration, cfg.futureTrajPointTimes, futureVelocities);
+    }
+
+    // FutureVel: predicted velocity at future sample times (XZ components in root space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
     {
-        // Transform desired velocity to character's heading frame
-        const Vector3 desiredVel = input->desiredVelocity;
-        const Vector3 localDesiredVel = Vector3RotateByQuaternion(desiredVel, invHipYaw);
-
-        // Assume player holds direction constant at all future sample times
-        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        for (int p = 0; p < (int)futureVelocities.size(); ++p)
         {
-            outFeatures[fi++] = localDesiredVel.x;
-            outFeatures[fi++] = localDesiredVel.z;
+            // Transform to root space for feature output
+            const Vector3 futureVelRootSpace = Vector3RotateByQuaternion(futureVelocities[p], invHipYaw);
+            outFeatures[fi++] = futureVelRootSpace.x;
+            outFeatures[fi++] = futureVelRootSpace.z;
         }
     }
+
+    // FutureVelClamped: predicted velocity clamped to max magnitude (XZ in root space)
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped))
+    {
+        constexpr float MaxFutureVelClampedMag = 1.0f;
+
+        for (int p = 0; p < (int)futureVelocities.size(); ++p)
+        {
+            const Vector3 futureVelRootSpace = Vector3RotateByQuaternion(futureVelocities[p], invHipYaw);
+
+            // Clamp to max magnitude
+            Vector3 clampedVel = futureVelRootSpace;
+            const float mag = Vector3Length(futureVelRootSpace);
+            if (mag > MaxFutureVelClampedMag)
+            {
+                clampedVel = Vector3Scale(futureVelRootSpace, MaxFutureVelClampedMag / mag);
+            }
+
+            outFeatures[fi++] = clampedVel.x;
+            outFeatures[fi++] = clampedVel.z;
+        }
+    }
+
+    // FutureSpeed: predicted scalar speed at future sample times
+    if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
+    {
+        for (int p = 0; p < (int)futureVelocities.size(); ++p)
+        {
+            outFeatures[fi++] = Vector3Length(futureVelocities[p]);
+        }
+    }
+
 
     // PastPosition: past hip position in current hip horizontal frame (XZ)
     if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
