@@ -142,6 +142,7 @@ struct AppConfig {
     float cameraMoveSpeed = 5.0f;
     int cameraMode = 1;  // 0 = Orbit, 1 = Unreal, 2 = TurretFollower
     float cameraTargetBlendtime = 0.2f;  // Smooth target following blendtime for Orbit and LazyTurretFollower
+    bool trackHipsProjectedOnGround = false;  // Track bone 0 at Y=1m (more stable camera)
 
     // Render settings (persisted)
     // Colors stored as separate ints so parsing/writing JSON remains simple here.

@@ -64,6 +64,7 @@ struct CameraSystem {
     bool track = true;
     int trackBone = 0;
     bool trackControlledCharacter = true;  // If true, track controlled character instead of active character
+    bool trackHipsProjectedOnGround = false;  // Track bone 0 at Y=1m (more stable camera)
 };
 
 static inline void CameraSystemInit(CameraSystem* cam, int argc, char** argv)
@@ -304,7 +305,7 @@ static inline void UnrealCameraUpdate(
         const Vector3 up = Vector3{ 0, 1, 0 };
 
         // Pan speed scales with move speed
-        const float panScale = unreal->moveSpeed * 0.002f;
+        const float panScale = unreal->moveSpeed * 0.001f;
         const Vector3 panOffset = Vector3Add(
             Vector3Scale(right, -mouseDeltaX * panScale),
             Vector3Scale(up, mouseDeltaY * panScale)

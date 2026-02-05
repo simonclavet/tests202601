@@ -1,28 +1,3 @@
-/*******************************************************************************************
-*
-*    BVHView - A simple BVH animation viewer written using raylib
-*
-*  This is a simple viewer for the .bvh animation file format made using raylib. For more
-*  info on the motivation behind it and information on features and documentation please
-*  see: https://theorangeduck.com/page/bvhview
-*
-*  The program itself essentially consists of the following components:
-*
-*     - A parser for the BVH file format
-*     - A set of functions for sampling data from particular frames of the BVH file.
-*     - A set of functions for creating capsules from the skeleton structure of the BVH data
-*       and animation transforms.
-*     - A (relatively) efficient and high quality shader for rendering capsules that includes
-*       nice lighting, soft shadows, and some CPU based culling to limit the amount of work
-*       required by the GPU.
-*
-*  Coding style is roughly meant to follow the rest of raylib and community contributions
-*  are very welcome.
-*
-*******************************************************************************************/
-
-// Most headers are in pch.h (precompiled header):
-// - Standard C headers, Windows headers, raylib core, torch, STL
 
 // These must stay here (implementation headers with #define macros)
 //#define RAYGUI_WINDOWBOX_STATUSBAR_HEIGHT 24
@@ -476,6 +451,19 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                     targetPosition = characterData->xformData[characterData->active].globalPositions[camera->trackBone];
                 }
             }
+            else if (camera->trackHipsProjectedOnGround)
+            {
+                // Track bone 0 (hips) at Y=1m
+                if (camera->trackControlledCharacter && controlledCharacter->active)
+                {
+                    targetPosition = controlledCharacter->xformData.globalPositions[0];
+                }
+                else if (characterData->count > 0 && characterData->xformData[characterData->active].jointCount > 0)
+                {
+                    targetPosition = characterData->xformData[characterData->active].globalPositions[0];
+                }
+                targetPosition.y = 1.0f;
+            }
 
             // Sync all modes from current state, then switch
             CameraSyncAllModesFromCurrent(camera, targetPosition);
@@ -514,7 +502,11 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
             ImGui::Separator();
 
             if (characterData->count > 0 || controlledCharacter->active) {
-                ImGui::Checkbox("Track Bone", &camera->track);
+                // Track Bone checkbox - mutually exclusive with trackHipsProjectedOnGround
+                if (ImGui::Checkbox("Track Bone", &camera->track))
+                {
+                    if (camera->track) camera->trackHipsProjectedOnGround = false;
+                }
 
                 // Build joint name list for combo (use controlled character joints if tracking it)
                 vector<string> joints;
@@ -535,9 +527,19 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 vector<const char*> items;
                 for (const string& s : joints) items.push_back(s.c_str());
 
-                if (!items.empty())
+                if (!items.empty() && camera->track)
                 {
                     ImGui::Combo("##trackbone", &camera->trackBone, items.data(), (int)items.size());
+                }
+
+                // Track Hips Projected on Ground - mutually exclusive with track
+                if (ImGui::Checkbox("Track Hips on Ground", &camera->trackHipsProjectedOnGround))
+                {
+                    if (camera->trackHipsProjectedOnGround) camera->track = false;
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("Track bone 0 (hips) projected at Y=1m for stable camera");
                 }
             }
         }
@@ -582,7 +584,11 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
             ImGui::Separator();
 
             if (characterData->count > 0 || controlledCharacter->active) {
-                ImGui::Checkbox("Track Bone", &camera->track);
+                // Track Bone checkbox - mutually exclusive with trackHipsProjectedOnGround
+                if (ImGui::Checkbox("Track Bone##turret", &camera->track))
+                {
+                    if (camera->track) camera->trackHipsProjectedOnGround = false;
+                }
 
                 // Build joint name list for combo (use controlled character joints if tracking it)
                 vector<string> joints;
@@ -603,9 +609,19 @@ static inline void ImGuiCamera(CameraSystem* camera, CharacterData* characterDat
                 vector<const char*> items;
                 for (const string& s : joints) items.push_back(s.c_str());
 
-                if (!items.empty())
+                if (!items.empty() && camera->track)
                 {
-                    ImGui::Combo("##trackbone", &camera->trackBone, items.data(), (int)items.size());
+                    ImGui::Combo("##trackboneturret", &camera->trackBone, items.data(), (int)items.size());
+                }
+
+                // Track Hips Projected on Ground - mutually exclusive with track
+                if (ImGui::Checkbox("Track Hips on Ground##turret", &camera->trackHipsProjectedOnGround))
+                {
+                    if (camera->trackHipsProjectedOnGround) camera->track = false;
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("Track bone 0 (hips) projected at Y=1m for stable camera");
                 }
             }
         }
@@ -1162,11 +1178,12 @@ static void ApplicationUpdate(void* voidApplicationState)
             }
 
             // Resize capsule buffer for all characters + controlled character
+            // Account for up to 3x joints: normal + footIK debug + basicBlend debug
             CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
             if (app->controlledCharacter.active)
             {
                 const int totalJoints = (int)app->capsuleData.capsulePositions.size() +
-                    app->controlledCharacter.xformData.jointCount;
+                    app->controlledCharacter.xformData.jointCount * 3;
                 CapsuleDataResize(&app->capsuleData, totalJoints);
             }
 
@@ -1399,6 +1416,19 @@ static void ApplicationUpdate(void* voidApplicationState)
         {
             boneTarget = app->characterData.xformData[app->characterData.active].globalPositions[app->camera.trackBone];
         }
+    }
+    else if (app->camera.trackHipsProjectedOnGround)
+    {
+        // Track bone 0 (hips) but projected on ground at Y=1m for stable camera
+        if (app->camera.trackControlledCharacter && app->controlledCharacter.active)
+        {
+            boneTarget = app->controlledCharacter.xformData.globalPositions[0];
+        }
+        else if (app->characterData.count > 0 && app->characterData.xformData[app->characterData.active].jointCount > 0)
+        {
+            boneTarget = app->characterData.xformData[app->characterData.active].globalPositions[0];
+        }
+        boneTarget.y = 1.0f;
     }
 
     // 'F' key toggles camera mode
@@ -2876,7 +2906,9 @@ int main(int argc, char** argv)
     // Init Dear ImGui - scale based on monitor DPI
     const Vector2 dpiScale = GetWindowScaleDPI();
     rlImGuiBeginInitImGui();
-    ImGui::GetIO().FontGlobalScale = dpiScale.x;
+
+    //ImGui::GetIO().FontGlobalScale = dpiScale.x;
+    ImGui::GetIO().FontGlobalScale = 2.0f;
     ImGui::StyleColorsDark();
     rlImGuiEndInitImGui();
 
@@ -2892,6 +2924,7 @@ int main(int argc, char** argv)
         app.camera.unreal.pitch = app.config.cameraPitch;
         app.camera.unreal.moveSpeed = app.config.cameraMoveSpeed;
         app.camera.mode = static_cast<FlomoCameraMode>(ClampInt(app.config.cameraMode, 0, 2));
+        app.camera.trackHipsProjectedOnGround = app.config.trackHipsProjectedOnGround;
     }
 
     // Shader
@@ -3054,9 +3087,10 @@ int main(int argc, char** argv)
         }
 
         // Resize capsule buffer to include controlled character
+        // Account for up to 3x joints: normal + footIK debug + basicBlend debug
         {
             const int totalJoints = (int)app.capsuleData.capsulePositions.size() +
-                app.controlledCharacter.xformData.jointCount;
+                app.controlledCharacter.xformData.jointCount * 3;
             CapsuleDataResize(&app.capsuleData, totalJoints);
         }
 
@@ -3112,6 +3146,7 @@ int main(int argc, char** argv)
     app.config.cameraPitch = app.camera.unreal.pitch;
     app.config.cameraMoveSpeed = app.camera.unreal.moveSpeed;
     app.config.cameraMode = static_cast<int>(app.camera.mode);
+    app.config.trackHipsProjectedOnGround = app.camera.trackHipsProjectedOnGround;
 
 
     SaveAppConfig(app.config);

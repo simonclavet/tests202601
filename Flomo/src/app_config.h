@@ -145,6 +145,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.cameraPitch = ResolveFloatConfig(buffer, "cameraPitch", config.cameraPitch, argc, argv);
     config.cameraMoveSpeed = ResolveFloatConfig(buffer, "cameraMoveSpeed", config.cameraMoveSpeed, argc, argv);
     config.cameraMode = ResolveIntConfig(buffer, "cameraMode", config.cameraMode, argc, argv);
+    config.trackHipsProjectedOnGround = ResolveBoolConfig(buffer, "trackHipsProjectedOnGround", config.trackHipsProjectedOnGround, argc, argv);
 
 
     // Render fields (colors as arrays)
@@ -244,6 +245,7 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"cameraPitch\": %.4f,\n", config.cameraPitch);
     fprintf(file, "    \"cameraMoveSpeed\": %.4f,\n", config.cameraMoveSpeed);
     fprintf(file, "    \"cameraMode\": %d,\n", config.cameraMode);
+    fprintf(file, "    \"trackHipsProjectedOnGround\": %s,\n", config.trackHipsProjectedOnGround ? "true" : "false");
 
     // Render settings (colors as arrays)
     fprintf(file, "    \"backgroundColor\": [ %d, %d, %d ],\n", config.backgroundColor.r, config.backgroundColor.g, config.backgroundColor.b);
