@@ -506,17 +506,30 @@ void Rot6dInverse(const Rot6d& rot, Rot6d& out)
     out.bx = rot.ay; out.by = rot.by; out.bz = cy;
 }
 
-void Rot6dTransformVector(const Rot6d& rot, const Vector3& v, Vector3& out)
+//void Rot6dTransformVector(const Rot6d& rot, const Vector3& v, Vector3& out)
+//{
+//    const float cx = rot.ay * rot.bz - rot.az * rot.by;
+//    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
+//    const float cz = rot.ax * rot.by - rot.ay * rot.bx;
+//
+//    out.x = v.x * rot.ax + v.y * rot.bx + v.z * cx;
+//    out.y = v.x * rot.ay + v.y * rot.by + v.z * cy;
+//    out.z = v.x * rot.az + v.y * rot.bz + v.z * cz;
+//}
+
+static inline Vector3 Vector3RotateByRot6d(Vector3 v, const Rot6d& rot)
 {
     const float cx = rot.ay * rot.bz - rot.az * rot.by;
     const float cy = rot.az * rot.bx - rot.ax * rot.bz;
     const float cz = rot.ax * rot.by - rot.ay * rot.bx;
 
-    out.x = v.x * rot.ax + v.y * rot.bx + v.z * cx;
-    out.y = v.x * rot.ay + v.y * rot.by + v.z * cy;
-    out.z = v.x * rot.az + v.y * rot.bz + v.z * cz;
-}
+    Vector3 result;
+    result.x = v.x * rot.ax + v.y * rot.bx + v.z * cx;
+    result.y = v.x * rot.ay + v.y * rot.by + v.z * cy;
+    result.z = v.x * rot.az + v.y * rot.bz + v.z * cz;
 
+    return result;
+}
 
 void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
 {

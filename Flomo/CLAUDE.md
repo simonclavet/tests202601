@@ -31,6 +31,12 @@ cmake --build . --config RelWithDebInfo
 # Output: build/src/Debug/flomo.exe or build/src/RelWithDebInfo/flomo.exe
 ```
 
+### Claude Code Build Command
+Use forward slashes for paths in bash:
+```bash
+cd "F:/experiments/tests202601/Flomo/build" && cmake --build . --config RelWithDebInfo
+```
+
 ### Command Line Usage
 ```bash
 # View animation files (GUI mode)

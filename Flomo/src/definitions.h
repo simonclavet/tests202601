@@ -71,57 +71,22 @@ static inline const char* FeatureTypeName(FeatureType type)
     }
 }
 
-// Descriptor for a single feature type
-struct FeatureTypeDescriptor
-{
-    float weight = 1.0f;  // Weight/importance of this feature in matching (0 = disabled)
-};
-
 struct MotionMatchingFeaturesConfig
 {
-    // Per-feature-type descriptors (indexed by FeatureType enum)
-    FeatureTypeDescriptor features[static_cast<int>(FeatureType::COUNT)];
+    float featureTypeWeights[static_cast<int>(FeatureType::COUNT)];
+    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };
+    float pastTimeOffset = 0.1f;
 
-    // Future trajectory configuration (only used if FutureVelDir weight > 0)
-    std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };  // time offsets (seconds)
+    MotionMatchingFeaturesConfig()
+    {
+        for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i) featureTypeWeights[i] = 1.0f;
+    }
 
-    // Past pose configuration
-    float pastTimeOffset = 0.1f;  // time offset for past position feature (seconds)
-
-    // Helper: check if a feature is enabled (weight > 0)
     bool IsFeatureEnabled(FeatureType type) const
     {
-        const int idx = static_cast<int>(type);
-        return features[idx].weight > 0.0f;
-    }
-
-    // Helper: get weight for a feature type
-    float GetFeatureWeight(FeatureType type) const
-    {   
-        const int idx = static_cast<int>(type);
-        return features[idx].weight;
-    }
-
-    // Helper: set weight for a feature type
-    void SetFeatureWeight(FeatureType type, float weight)
-    {
-        const int idx = static_cast<int>(type);
-        features[idx].weight = weight;
+        return featureTypeWeights[static_cast<int>(type)] > 0.0f;
     }
 };
-
-// Initialize motion matching config with default values
-static inline void MotionMatchingConfigInit(MotionMatchingFeaturesConfig& config)
-{
-    // Initialize all feature weights to 1.0
-    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
-    {
-        config.features[i].weight = 1.0f;
-    }
-
-    // Default future trajectory sample times
-    config.futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };
-}
 
 
 
@@ -183,6 +148,7 @@ struct AppConfig {
     bool drawToeVelocities = false;  // Draw toe velocity vectors (actual vs blended)
     bool drawFootIK = false;         // Draw foot IK debug (virtual toe positions, etc.)
     bool drawBasicBlend = false;     // Draw basic blend result (before lookahead dragging)
+    bool drawMagicAnchor = false;    // Draw Magic anchor (spine3 projected + head→hand yaw)
     bool drawPastHistory = false;    // Draw past position history for motion matching
 
     // Animation settings
@@ -264,7 +230,7 @@ struct AnimDatabase
 
     // Per-frame joint transforms in animation space: [motionFrameCount x jointCount]
     Array2D<Vector3> jointPositionsAnimSpace;       // positions in animation world space
-    Array2D<Quaternion> jointRotationsAnimSpace;    // rotations in animation world space
+    Array2D<Rot6d> jointRotationsAnimSpace;         // rotations in animation world space
 
     // Per-frame joint velocities/accelerations in root space (heading-relative)
     Array2D<Vector3> jointVelocitiesRootSpace;      // velocities relative to character heading
@@ -272,11 +238,11 @@ struct AnimDatabase
 
     // Joint-local transforms (relative to parent joint, for blending)
     Array2D<Vector3> localJointPositions;           // local positions [motionFrameCount x jointCount]
-    Array2D<Rot6d> localJointRotations6d;           // local rotations as Rot6d [motionFrameCount x jointCount]
+    Array2D<Rot6d> localJointRotations;             // local rotations [motionFrameCount x jointCount]
     Array2D<Vector3> localJointAngularVelocities;   // local angular velocities [motionFrameCount x jointCount]
 
-    // lookahead pose for inertial dragging: pose[f] + 3*(pose[f] - pose[f-1])
-    Array2D<Rot6d> lookaheadLocalRotations6d;       // [motionFrameCount x jointCount]
+    // lookahead pose for inertial dragging
+    Array2D<Rot6d> lookaheadLocalRotations;         // [motionFrameCount x jointCount]
 
     // Root motion velocities in root space (heading-relative, XZ only)
     // Velocity at frame f is transformed by inverse of root yaw at frame f
@@ -311,11 +277,29 @@ struct AnimDatabase
     int footIndices[SIDES_COUNT] = { -1, -1 };    // ankle
     int lowlegIndices[SIDES_COUNT] = { -1, -1 };  // shin/calf
     int uplegIndices[SIDES_COUNT] = { -1, -1 };   // thigh
+    int handIndices[SIDES_COUNT] = { -1, -1 };    // hands
+
+    // Magic anchor system - alternative reference frame for blending
+    int spine3Index = -1;              // upper spine for Magic position
+    int headIndex = -1;                // head for Magic orientation
+
+    // Magic anchor transforms per frame (position = spine3 on ground, yaw = head→rightHand direction)
+    std::vector<Vector3> magicPosition;           // [motionFrameCount] - (spine3.x, 0, spine3.z)
+    std::vector<float> magicYaw;                  // [motionFrameCount] - yaw from head→rightHand
+    std::vector<Vector3> magicVelocity;           // [motionFrameCount] - XZ velocity in magic space
+    std::vector<float> magicYawRate;              // [motionFrameCount] - yaw rate (rad/s)
+    std::vector<Vector3> lookaheadMagicVelocity;  // [motionFrameCount] - extrapolated
+    std::vector<float> lookaheadMagicYawRate;     // [motionFrameCount] - extrapolated
+
+    // Hip transform relative to Magic anchor (for placing skeleton when using Magic root motion)
+    std::vector<Vector3> hipPositionInMagicSpace;        // [motionFrameCount] - hip offset from magic, in magic-heading space
+    std::vector<Rot6d> hipRotationInMagicSpace;          // [motionFrameCount] - full hip rotation relative to magic yaw
+    std::vector<Rot6d> lookaheadHipRotationInMagicSpace; // [motionFrameCount] - extrapolated for lookahead dragging
     std::vector<std::string> featureNames;
     std::vector<FeatureType> featureTypes;      // which FeatureType each feature dimension belongs to
 
     std::vector<float> featuresMean;            // mean of each feature dimension [featureDim]
-    std::vector<float> featuresStd;             // standard deviation of each feature dimension [featureDim]
+    float featureTypesStd[static_cast<int>(FeatureType::COUNT)] = {};  // std shared by all features of same type
     Array2D<float> normalizedFeatures;          // normalized features [motionFrameCount x featureDim]
 };
 
@@ -337,9 +321,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->jointVelocitiesRootSpace.clear();
     db->jointAccelerationsRootSpace.clear();
     db->localJointPositions.clear();
-    db->localJointRotations6d.clear();
+    db->localJointRotations.clear();
     db->localJointAngularVelocities.clear();
-    db->lookaheadLocalRotations6d.clear();
+    db->lookaheadLocalRotations.clear();
     db->rootMotionVelocitiesRootSpace.clear();
     db->rootMotionYawRates.clear();
     db->lookaheadRootMotionVelocitiesRootSpace.clear();
@@ -347,6 +331,12 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->lookaheadHipsHeights.clear();
     db->hipRotationYawFree.clear();
     db->lookaheadHipRotationYawFree.clear();
+    db->magicPosition.clear();
+    db->magicYaw.clear();
+    db->magicVelocity.clear();
+    db->magicYawRate.clear();
+    db->lookaheadMagicVelocity.clear();
+    db->lookaheadMagicYawRate.clear();
     for (int side : sides)
     {
         db->toePositionsRootSpace[side].clear();
@@ -359,7 +349,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->featureNames.clear();
     db->featureTypes.clear();
     db->featuresMean.clear();
-    db->featuresStd.clear();
+    for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i) db->featureTypesStd[i] = 0.0f;
     db->normalizedFeatures.clear();
 }
 
@@ -447,6 +437,17 @@ struct BlendCursor {
     Vector3 sampledLookaheadRootVelocityRootSpace = Vector3Zero();  // lookahead XZ velocity
     float sampledLookaheadRootYawRate = 0.0f;                       // lookahead yaw rate (rad/s)
 
+    // Sampled Magic anchor velocities (alternative reference frame)
+    Vector3 sampledMagicVelocity = Vector3Zero();          // XZ velocity in magic space
+    float sampledMagicYawRate = 0.0f;                      // yaw rate (rad/s)
+    Vector3 sampledLookaheadMagicVelocity = Vector3Zero(); // lookahead XZ velocity
+    float sampledLookaheadMagicYawRate = 0.0f;             // lookahead yaw rate (rad/s)
+
+    // Sampled hip transform relative to Magic anchor (for skeleton placement)
+    Vector3 sampledHipPositionInMagicSpace = Vector3Zero();          // hip offset from magic anchor
+    Rot6d sampledHipRotationInMagicSpace = Rot6dIdentity();          // hip rotation relative to magic yaw
+    Rot6d sampledLookaheadHipRotationInMagicSpace = Rot6dIdentity(); // lookahead for dragging
+
     // Sampled lookahead hips height (extrapolated Y position)
     float sampledLookaheadHipsHeight = 0.0f;
 
@@ -497,9 +498,10 @@ struct HistoryPoint
 // Every N seconds it jumps to a random time in the loaded animations while maintaining
 // its world position and facing direction.
 struct ControlledCharacter {
-    // World placement (accumulated from root motion)
+    // World placement of bone 0 (root)
     Vector3 worldPosition;
     Quaternion worldRotation;  // Character's facing direction (Y-axis rotation only)
+
 
     // Animation mode
     AnimationMode animMode = AnimationMode::RandomSwitch;
@@ -586,6 +588,22 @@ struct ControlledCharacter {
     Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
     float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
     bool rootMotionInitialized = false;
+
+    // Magic anchor system - alternative reference frame for blending
+    Vector3 magicWorldPosition = Vector3Zero();    // Magic anchor position in world
+    Quaternion magicWorldRotation = QuaternionIdentity();  // Magic anchor yaw (Y-only rotation)
+    bool magicAnchorInitialized = false;
+
+    // Blended magic velocities (similar to existing smoothedRootVelocity)
+    Vector3 smoothedMagicVelocity = Vector3Zero();
+    float smoothedMagicYawRate = 0.0f;
+
+    // Lookahead dragging for magic anchor
+    Vector3 lookaheadDragMagicVelocity = Vector3Zero();
+    float lookaheadDragMagicYawRate = 0.0f;
+    bool lookaheadMagicVelocityInitialized = false;
+
+
 
     // Motion matching feature velocity (updated independently from actual velocity)
     Vector3 virtualControlSmoothedVelocity = Vector3Zero();     // velocity used for motion matching features (world space XZ)

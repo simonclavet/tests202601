@@ -25,7 +25,7 @@ static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
 }
 
 // Updated AnimDatabaseRebuild: require all animations to match canonical skeleton.
-// Populate localJointPositions/localJointRotations6d as well as global arrays.
+// Populate localJointPositions/localJointRotations as well as global arrays.
 // If any clip mismatches jointCount we invalidate the DB (db->valid = false).
 static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* characterData)
 {
@@ -143,6 +143,15 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     const vector<string> rightUplegCandidates = { "rightupleg", "right_upleg", "r_upleg", "thigh.r", "thigh_r", "rightupperleg", "right_thigh", "rightthigh" };
     const vector<vector<string>> uplegCandidates = { leftUplegCandidates, rightUplegCandidates };
 
+    // Hand candidates for Magic anchor
+    const vector<string> leftHandCandidates = { "lefthand", "left_hand", "l_hand", "hand.l", "hand_l" };
+    const vector<string> rightHandCandidates = { "righthand", "right_hand", "r_hand", "hand.r", "hand_r" };
+    const vector<vector<string>> handCandidates = { leftHandCandidates, rightHandCandidates };
+
+    // Spine3 and head candidates for Magic anchor
+    const vector<string> spine3Candidates = { "spine3", "spine2", "chest", "upperchest", "upper_chest" };
+    const vector<string> headCandidates = { "head" };
+
     // Use helper to find hip
     db->hipJointIndex = FindJointIndexByNames(canonBvh, hipCandidates);
 
@@ -217,9 +226,36 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
     }
 
-    // Log resolved feature indices
-    TraceLog(LOG_INFO, "AnimDatabase: hip=%d", db->hipJointIndex);
+    // Find hand indices
+    for (int side : sides)
+    {
+        db->handIndices[side] = FindJointIndexByNames(canonBvh, handCandidates[side]);
+        const char* sideName = (side == SIDE_LEFT) ? "left" : "right";
+        if (db->handIndices[side] < 0)
+        {
+            TraceLog(LOG_WARNING, "AnimDatabase: %s hand not found, aborting", sideName);
+            return;
+        }
+    }
 
+    // Find spine3 and head for Magic anchor
+    db->spine3Index = FindJointIndexByNames(canonBvh, spine3Candidates);
+    db->headIndex = FindJointIndexByNames(canonBvh, headCandidates);
+
+    if (db->spine3Index < 0)
+    {
+        TraceLog(LOG_WARNING, "AnimDatabase: spine3/chest not found, aborting");
+        return;
+    }
+    if (db->headIndex < 0)
+    {
+        TraceLog(LOG_WARNING, "AnimDatabase: head not found, aborting");
+        return;
+    }
+
+    // Log resolved feature indices
+    TraceLog(LOG_INFO, "AnimDatabase: hip=%d, spine3=%d, head=%d, leftHand=%d, rightHand=%d",
+        db->hipJointIndex, db->spine3Index, db->headIndex, db->handIndices[SIDE_LEFT], db->handIndices[SIDE_RIGHT]);
 
     // allocate compact storage [motionFrameCount x jointCount]
     db->motionFrameCount = includedFrames;
@@ -228,9 +264,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->jointVelocitiesRootSpace.resize(db->motionFrameCount, db->jointCount);
     db->jointAccelerationsRootSpace.resize(db->motionFrameCount, db->jointCount);
     db->localJointPositions.resize(db->motionFrameCount, db->jointCount);
-    db->localJointRotations6d.resize(db->motionFrameCount, db->jointCount);
+    db->localJointRotations.resize(db->motionFrameCount, db->jointCount);
     db->localJointAngularVelocities.resize(db->motionFrameCount, db->jointCount);
-    db->lookaheadLocalRotations6d.resize(db->motionFrameCount, db->jointCount);
+    db->lookaheadLocalRotations.resize(db->motionFrameCount, db->jointCount);
 
     // sample each compatible clip frame and fill the flat arrays
     TransformData tmpXform;
@@ -249,14 +285,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             TransformDataForwardKinematics(&tmpXform);
 
             span<Vector3> globalPos = db->jointPositionsAnimSpace.row_view(motionFrameIdx);
-            span<Quaternion> globalRot = db->jointRotationsAnimSpace.row_view(motionFrameIdx);
+            span<Rot6d> globalRot = db->jointRotationsAnimSpace.row_view(motionFrameIdx);
             span<Vector3> localPos = db->localJointPositions.row_view(motionFrameIdx);
-            span<Rot6d> localRot = db->localJointRotations6d.row_view(motionFrameIdx);
+            span<Rot6d> localRot = db->localJointRotations.row_view(motionFrameIdx);
 
             for (int j = 0; j < db->jointCount; ++j)
             {
                 globalPos[j] = tmpXform.globalPositions[j];
-                globalRot[j] = tmpXform.globalRotations[j];
+                Rot6dFromQuaternion(tmpXform.globalRotations[j], globalRot[j]);
                 localPos[j] = tmpXform.localPositions[j];
                 Rot6dFromQuaternion(tmpXform.localRotations[j], localRot[j]);
             }
@@ -300,7 +336,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             span<const Vector3> pos1Row = db->jointPositionsAnimSpace.row_view(nextF);
 
             // Get root yaw at frame f (start of interval) for transforming to root space
-            span<const Rot6d> rot0 = db->localJointRotations6d.row_view(f);
+            span<const Rot6d> rot0 = db->localJointRotations.row_view(f);
             const float rootYaw = Rot6dGetYaw(rot0[rootIdx]);
             const Rot6d invYawRot = Rot6dFromYaw(-rootYaw);
 
@@ -308,9 +344,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {
                 Vector3 velAnimSpace = Vector3Scale(Vector3Subtract(pos1Row[j], pos0Row[j]), invFrameTime);
                 // Transform to root space (heading-relative)
-                Vector3 velRootSpace;
-                Rot6dTransformVector(invYawRot, velAnimSpace, velRootSpace);
-                velRow[j] = velRootSpace;
+                velRow[j] = Vector3RotateByRot6d(velAnimSpace, invYawRot);
             }
         }
     }
@@ -381,8 +415,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 continue;
             }
 
-            span<const Rot6d> rot0Row = db->localJointRotations6d.row_view(prevF);
-            span<const Rot6d> rot1Row = db->localJointRotations6d.row_view(nextF);
+            span<const Rot6d> rot0Row = db->localJointRotations.row_view(prevF);
+            span<const Rot6d> rot1Row = db->localJointRotations.row_view(nextF);
 
             for (int j = 0; j < db->jointCount; ++j)
             {
@@ -406,8 +440,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             const bool isLastFrame = (f == clipEnd - 1);
 
-            span<Rot6d> lookaheadRow = db->lookaheadLocalRotations6d.row_view(f);
-            span<const Rot6d> currRow = db->localJointRotations6d.row_view(f);
+            span<Rot6d> lookaheadRow = db->lookaheadLocalRotations.row_view(f);
+            span<const Rot6d> currRow = db->localJointRotations.row_view(f);
 
             if (isLastFrame || clipEnd - clipStart <= 1)
             {
@@ -419,7 +453,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             }
             else
             {
-                span<const Rot6d> nextRow = db->localJointRotations6d.row_view(f + 1);
+                span<const Rot6d> nextRow = db->localJointRotations.row_view(f + 1);
 
                 for (int j = 0; j < db->jointCount; ++j)
                 {
@@ -492,16 +526,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 velAnim = Vector3Scale(velAnim, invFrameTime);
 
                 // Get yaw at frame f (start of interval) and transform velocity to local space
-                span<const Rot6d> rot0 = db->localJointRotations6d.row_view(f);
+                span<const Rot6d> rot0 = db->localJointRotations.row_view(f);
                 const float yaw0 = Rot6dGetYaw(rot0[rootIdx]);
                 const Rot6d invYawRot = Rot6dFromYaw(-yaw0);
 
-                Vector3 velLocal;
-                Rot6dTransformVector(invYawRot, velAnim, velLocal);
-                db->rootMotionVelocitiesRootSpace[f] = velLocal;
+                db->rootMotionVelocitiesRootSpace[f] = Vector3RotateByRot6d(velAnim, invYawRot);
 
                 // Compute yaw angular velocity from local root rotations
-                span<const Rot6d> rot1 = db->localJointRotations6d.row_view(f + 1);
+                span<const Rot6d> rot1 = db->localJointRotations.row_view(f + 1);
                 const float yaw1 = Rot6dGetYaw(rot1[rootIdx]);
 
                 const float deltaYaw = WrapAngleToPi(yaw1 - yaw0);
@@ -613,7 +645,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const bool isLastFrame = (f == clipEnd - 1);
 
             // Get hip rotation and strip yaw
-            span<const Rot6d> rotRow = db->localJointRotations6d.row_view(f);
+            span<const Rot6d> rotRow = db->localJointRotations.row_view(f);
             Rot6d hipNoYaw;
             Rot6dRemoveYComponent(rotRow[hipIdx], hipNoYaw);
             db->hipRotationYawFree[f] = hipNoYaw;
@@ -626,7 +658,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             else
             {
                 // Get next frame's yaw-free hip rotation
-                span<const Rot6d> nextRotRow = db->localJointRotations6d.row_view(f + 1);
+                span<const Rot6d> nextRotRow = db->localJointRotations.row_view(f + 1);
                 Rot6d nextHipNoYaw;
                 Rot6dRemoveYComponent(nextRotRow[hipIdx], nextHipNoYaw);
 
@@ -646,6 +678,184 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     }
 
     TraceLog(LOG_INFO, "AnimDatabase: computed yaw-free hip rotation track");
+
+    // Compute Magic anchor: position = spine3 on ground, yaw = head→rightHand direction
+    db->magicPosition.resize(db->motionFrameCount);
+    db->magicYaw.resize(db->motionFrameCount);
+    db->magicVelocity.resize(db->motionFrameCount);
+    db->magicYawRate.resize(db->motionFrameCount);
+    db->lookaheadMagicVelocity.resize(db->motionFrameCount);
+    db->lookaheadMagicYawRate.resize(db->motionFrameCount);
+
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float invFrameTime = 1.0f / frameTime;
+        const float n = db->poseDragLookaheadTime / frameTime;
+        const float nextWeight = n;
+        const float currWeight = 1.0f - n;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+            span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
+
+            // Magic position = spine3 projected to ground
+            const Vector3 spine3Pos = posRow[db->spine3Index];
+            db->magicPosition[f] = Vector3{ spine3Pos.x, 0.0f, spine3Pos.z };
+
+            // Magic yaw = direction from head to right hand projected onto XZ plane
+            const Vector3 headPos = posRow[db->headIndex];
+            const Vector3 handPos = posRow[db->handIndices[SIDE_RIGHT]];
+            const Vector3 headToHand = Vector3Subtract(handPos, headPos);
+            db->magicYaw[f] = atan2f(headToHand.x, headToHand.z);  // yaw angle
+
+            // Compute velocities
+            if (isLastFrame || clipEnd - clipStart <= 1)
+            {
+                if (f > clipStart)
+                {
+                    db->magicVelocity[f] = db->magicVelocity[f - 1];
+                    db->magicYawRate[f] = db->magicYawRate[f - 1];
+                }
+                else
+                {
+                    db->magicVelocity[f] = Vector3Zero();
+                    db->magicYawRate[f] = 0.0f;
+                }
+            }
+            else
+            {
+                span<const Vector3> nextPosRow = db->jointPositionsAnimSpace.row_view(f + 1);
+
+                // Position velocity (in magic space - rotated by inverse magic yaw)
+                const Vector3 nextSpine3Pos = nextPosRow[db->spine3Index];
+                const Vector3 nextMagicPos = Vector3{ nextSpine3Pos.x, 0.0f, nextSpine3Pos.z };
+                Vector3 velAnim = Vector3Scale(Vector3Subtract(nextMagicPos, db->magicPosition[f]), invFrameTime);
+
+                // Transform to magic space (heading-relative)
+                const float magicYaw = db->magicYaw[f];
+                const float cosY = cosf(-magicYaw);
+                const float sinY = sinf(-magicYaw);
+                db->magicVelocity[f] = Vector3{
+                    velAnim.x * cosY - velAnim.z * sinY,
+                    0.0f,
+                    velAnim.x * sinY + velAnim.z * cosY
+                };
+
+                // Yaw rate
+                const Vector3 nextHeadPos = nextPosRow[db->headIndex];
+                const Vector3 nextHandPos = nextPosRow[db->handIndices[SIDE_RIGHT]];
+                const Vector3 nextHeadToHand = Vector3Subtract(nextHandPos, nextHeadPos);
+                const float nextMagicYaw = atan2f(nextHeadToHand.x, nextHeadToHand.z);
+                db->magicYawRate[f] = WrapAngleToPi(nextMagicYaw - magicYaw) * invFrameTime;
+            }
+        }
+
+        // Compute lookahead velocities
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+
+            if (isLastFrame || clipEnd - clipStart <= 1)
+            {
+                db->lookaheadMagicVelocity[f] = db->magicVelocity[f];
+                db->lookaheadMagicYawRate[f] = db->magicYawRate[f];
+            }
+            else
+            {
+                // Extrapolate: lookahead = (1-n)*curr + n*next
+                const Vector3 currVel = db->magicVelocity[f];
+                const Vector3 nextVel = db->magicVelocity[f + 1];
+                db->lookaheadMagicVelocity[f] = Vector3Add(
+                    Vector3Scale(currVel, currWeight),
+                    Vector3Scale(nextVel, nextWeight));
+
+                const float currYawRate = db->magicYawRate[f];
+                const float nextYawRate = db->magicYawRate[f + 1];
+                db->lookaheadMagicYawRate[f] = currWeight * currYawRate + nextWeight * nextYawRate;
+            }
+        }
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: computed Magic anchor tracks");
+
+    // Compute hip transform relative to Magic anchor (for placing skeleton when using Magic root motion)
+    db->hipPositionInMagicSpace.resize(db->motionFrameCount);
+    db->hipRotationInMagicSpace.resize(db->motionFrameCount);
+    db->lookaheadHipRotationInMagicSpace.resize(db->motionFrameCount);
+
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const int hipIdx = db->hipJointIndex;
+        const float frameTime = db->animFrameTime[c];
+        const float n = db->poseDragLookaheadTime / frameTime;
+        const float nextWeight = n;
+        const float currWeight = 1.0f - n;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const bool isLastFrame = (f == clipEnd - 1);
+            span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
+            span<const Rot6d> rotRow = db->localJointRotations.row_view(f);
+
+            // Get hip position and rotation in animation space
+            const Vector3 hipPos = posRow[hipIdx];
+            const Rot6d hipRot = rotRow[hipIdx];
+
+            // Get Magic position and yaw
+            const Vector3 magicPos = db->magicPosition[f];
+            const float magicYaw = db->magicYaw[f];
+
+            // Compute hip position relative to magic, in magic-heading space
+            // hip_in_magic = invMagicYaw * (hipPos - magicPos)
+            const Vector3 magicToHip = Vector3Subtract(hipPos, magicPos);
+            const float cosY = cosf(-magicYaw);
+            const float sinY = sinf(-magicYaw);
+            db->hipPositionInMagicSpace[f] = Vector3{
+                magicToHip.x * cosY - magicToHip.z * sinY,
+                magicToHip.y,  // keep Y (hip height)
+                magicToHip.x * sinY + magicToHip.z * cosY
+            };
+
+            // Compute hip rotation relative to magic yaw: hipRotInMagic = invMagicYaw * hipRot
+            const Rot6d invMagicYawRot = Rot6dFromYaw(-magicYaw);
+            Rot6dMultiply(invMagicYawRot, hipRot, db->hipRotationInMagicSpace[f]);
+
+            // Compute lookahead hip rotation in magic space
+            if (isLastFrame || clipEnd - clipStart <= 1)
+            {
+                db->lookaheadHipRotationInMagicSpace[f] = db->hipRotationInMagicSpace[f];
+            }
+            else
+            {
+                // Get next frame's hip rotation in magic space
+                span<const Rot6d> nextRotRow = db->localJointRotations.row_view(f + 1);
+                const Rot6d nextHipRot = nextRotRow[hipIdx];
+                const float nextMagicYaw = db->magicYaw[f + 1];
+                const Rot6d invNextMagicYawRot = Rot6dFromYaw(-nextMagicYaw);
+                Rot6d nextHipRotInMagic;
+                Rot6dMultiply(invNextMagicYawRot, nextHipRot, nextHipRotInMagic);
+
+                // Extrapolate: lookahead = (1-n)*curr + n*next
+                const Rot6d& curr = db->hipRotationInMagicSpace[f];
+                Rot6d& lookahead = db->lookaheadHipRotationInMagicSpace[f];
+                lookahead.ax = currWeight * curr.ax + nextWeight * nextHipRotInMagic.ax;
+                lookahead.ay = currWeight * curr.ay + nextWeight * nextHipRotInMagic.ay;
+                lookahead.az = currWeight * curr.az + nextWeight * nextHipRotInMagic.az;
+                lookahead.bx = currWeight * curr.bx + nextWeight * nextHipRotInMagic.bx;
+                lookahead.by = currWeight * curr.by + nextWeight * nextHipRotInMagic.by;
+                lookahead.bz = currWeight * curr.bz + nextWeight * nextHipRotInMagic.bz;
+                Rot6dNormalize(lookahead);
+            }
+        }
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: computed hip-in-magic-space tracks");
 
     // Compute toe positions in root space (relative to hip, heading-aligned)
     // and lookahead toe positions (extrapolated)
@@ -669,12 +879,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             const bool isLastFrame = (f == clipEnd - 1);
             span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
-            span<const Quaternion> rotRow = db->jointRotationsAnimSpace.row_view(f);
+            span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
 
             // Get hip position and yaw for transforming to root space
             const Vector3 hipPos = posRow[hipIdx];
-            const Quaternion hipYaw = QuaternionYComponent(rotRow[hipIdx]);
-            const Quaternion invHipYaw = QuaternionInvert(hipYaw);
+            const float hipYaw = Rot6dGetYaw(rotRow[hipIdx]);
+            const Rot6d invHipYawRot = Rot6dFromYaw(-hipYaw);
 
             for (int side : sides)
             {
@@ -691,9 +901,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 const Vector3 groundRootToToe = Vector3Subtract(toePos, groundRootPos);
 
                 // Transform to heading-aligned space
-                const Vector3 toePosRootSpace = Vector3RotateByQuaternion(groundRootToToe, invHipYaw);
+                const Vector3 toePosRootSpace = Vector3RotateByRot6d(groundRootToToe, invHipYawRot);
                 db->toePositionsRootSpace[side][f] = toePosRootSpace;
-                
+
                 // Lookahead toe position
                 if (isLastFrame || clipEnd - clipStart <= 1)
                 {
@@ -703,23 +913,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 {
                     // Get next frame's toe and hip positions
                     span<const Vector3> nextPosRow = db->jointPositionsAnimSpace.row_view(f + 1);
-                    const Vector3 nextHipPos = nextPosRow[hipIdx];
                     const Vector3 nextToePos = nextPosRow[toeIdx];
 
-                    //const Vector3 nextGroundRootPos = Vector3{ nextHipPos.x, 0.0f, nextHipPos.z };
-
                     // Compute leg vector (toe relative to hip) at next frame
-                    //const Vector3 groundRootToNextToe = Vector3Subtract(nextToePos, nextGroundRootPos);
                     const Vector3 groundRootToNextToe = Vector3Subtract(nextToePos, groundRootPos);
 
-                    //span<const Quaternion> nextRotRow = db->jointRotationsAnimSpace.row_view(f + 1);
-                    //const Quaternion nextHipYaw = (hipIdx >= 0) ? QuaternionYComponent(nextRotRow[hipIdx]) : QuaternionIdentity();
-                    //const Quaternion invNextHipYaw = QuaternionInvert(nextHipYaw);
-
                     // Rotate into current frame's heading space (same rotational frame as toePosRootSpace)
-                    const Vector3 nextToePosRootSpace = Vector3RotateByQuaternion(groundRootToNextToe, invHipYaw);
-                    //const Vector3 nextToePosRootSpace = Vector3RotateByQuaternion(groundRootToNextToe, invNextHipYaw);
-
+                    const Vector3 nextToePosRootSpace = Vector3RotateByRot6d(groundRootToNextToe, invHipYawRot);
+                    
                     // Extrapolate: lookahead = (1-n)*curr + n*next
                     db->lookaheadToePositionsRootSpace[side][f] = Vector3Add(
                         Vector3Scale(toePosRootSpace, currWeight),
@@ -767,7 +968,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         assert(dt > 1e-8f);
 
         span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
-        span<const Quaternion> rotRow = db->jointRotationsAnimSpace.row_view(f);
+        span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
         span<float> featRow = db->features.row_view(f);
 
         Vector3 hipPos = { 0.0f, 0.0f, 0.0f };
@@ -792,21 +993,23 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // Extract hip yaw (if available) once per frame
-        Quaternion hipYaw = QuaternionIdentity();
+        float hipYaw = 0.0f;
         if (db->hipJointIndex >= 0)
         {
-            hipYaw = QuaternionYComponent(rotRow[db->hipJointIndex]);
+            hipYaw = Rot6dGetYaw(rotRow[db->hipJointIndex]);
         }
-        const Quaternion invHipYaw = QuaternionInvert(hipYaw);
+        const float invHipYaw = -hipYaw;
+        const Rot6d hipYawRot = Rot6dFromYaw(hipYaw);
+        const Rot6d invHipYawRot = Rot6dFromYaw(invHipYaw);
 
         int currentFeature = 0;
 
         // Precompute local toe positions (hip horizontal frame) - used by pos and diff
         const Vector3 hipToLeft = Vector3Subtract(leftPos, hipPos);
-        const Vector3 localLeftPos = Vector3RotateByQuaternion(hipToLeft, invHipYaw);
+        Vector3 localLeftPos = Vector3RotateByRot6d(hipToLeft, invHipYawRot);
 
         const Vector3 hipToRight = Vector3Subtract(rightPos, hipPos);
-        const Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
+        const Vector3 localRightPos = Vector3RotateByRot6d(hipToRight, invHipYawRot);
 
         // POSITION: toePos->Left(X, Z), Right(X, Z)
         if (cfg.IsFeatureEnabled(FeatureType::ToePos))
@@ -843,14 +1046,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 {
                     const Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
                     const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
-                    localLeftVel = Vector3RotateByQuaternion(velLeftWorld, invHipYaw);
+                    localLeftVel = Vector3RotateByRot6d(velLeftWorld, invHipYawRot);
                 }
 
                 if (rightIdx >= 0)
                 {
                     const Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
                     const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
-                    localRightVel = Vector3RotateByQuaternion(velRightWorld, invHipYaw);
+                    localRightVel = Vector3RotateByRot6d(velRightWorld, invHipYawRot);
                 }
             }
 
@@ -897,9 +1100,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const int rootIdx = 0;
 
             // Get current root yaw for transforming to root space
-            const Quaternion currRootRot = rotRow[rootIdx];
-            const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
-            const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
+            //const Quaternion currRootRot = rotRow[rootIdx];
+            //const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
+            //const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
 
             for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
             {
@@ -920,7 +1123,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     futureVelAnimSpace.y = 0.0f;  // XZ only
 
                     // Transform to rootSpace relative to current frame's yaw
-                    futureVelRootSpace = Vector3RotateByQuaternion(futureVelAnimSpace, invCurrRootYaw);
+                    futureVelRootSpace = Vector3RotateByRot6d(futureVelAnimSpace, invHipYawRot);
                 }
                 // else: future frame outside clip or at last frame, leave as zero
 
@@ -950,9 +1153,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const float invFrameTime = 1.0f / frameTime;
             const int rootIdx = 0;
 
-            const Quaternion currRootRot = rotRow[rootIdx];
-            const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
-            const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
+            //const Quaternion currRootRot = rotRow[rootIdx];
+            //const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
+            //const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
 
             for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
             {
@@ -970,7 +1173,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                         Vector3Subtract(futurePosRow1[rootIdx], futurePosRow0[rootIdx]), invFrameTime);
                     futureVelAnimSpace.y = 0.0f;  // XZ only
 
-                    futureVelRootSpace = Vector3RotateByQuaternion(futureVelAnimSpace, invCurrRootYaw);
+                    futureVelRootSpace = Vector3RotateByRot6d(futureVelAnimSpace, invHipYawRot);
 
                     // Clamp to max magnitude
                     const float mag = Vector3Length(futureVelRootSpace);
@@ -1006,9 +1209,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             const int rootIdx = 0;
 
             // Get current root yaw (not needed for speed, but kept for consistency)
-            const Quaternion currRootRot = rotRow[rootIdx];
-            const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
-            const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
+            //const Quaternion currRootRot = rotRow[rootIdx];
+            //const Quaternion currRootYaw = QuaternionYComponent(currRootRot);
+            //const Quaternion invCurrRootYaw = QuaternionInvert(currRootYaw);
 
             for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
             {
@@ -1068,7 +1271,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 const Vector3 hipToPastHip = Vector3Subtract(pastHipPos, hipPos);
 
                 // Transform to current hip horizontal frame
-                pastPosLocal = Vector3RotateByQuaternion(hipToPastHip, invHipYaw);
+                pastPosLocal = Vector3RotateByRot6d(hipToPastHip, invHipYawRot);
             }
 
             // Store only XZ components (horizontal position)
@@ -1088,9 +1291,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     }
 
 
-    // Allocate mean and std vectors
+    // Allocate mean vector (per-dimension)
     db->featuresMean.resize(db->featureDim, 0.0f);
-    db->featuresStd.resize(db->featureDim, 0.0f);
 
     // Compute mean for each feature dimension
     for (int d = 0; d < db->featureDim; ++d)
@@ -1103,26 +1305,43 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->featuresMean[d] = (float)(sum / db->motionFrameCount);
     }
 
-    // Compute standard deviation for each feature dimension
+    // Compute standard deviation per feature TYPE (shared across all dimensions of the same type)
+    // First pass: sum squared differences grouped by feature type
+    double typesSumSquaredDiff[static_cast<int>(FeatureType::COUNT)] = {};
+    int typesCount[static_cast<int>(FeatureType::COUNT)] = {};
+
     for (int d = 0; d < db->featureDim; ++d)
     {
-        double sumSquaredDiff = 0.0;
+        const int typeIdx = static_cast<int>(db->featureTypes[d]);
         for (int f = 0; f < db->motionFrameCount; ++f)
         {
             const double diff = db->features.at(f, d) - db->featuresMean[d];
-            sumSquaredDiff += diff * diff;
+            typesSumSquaredDiff[typeIdx] += diff * diff;
         }
-        const double variance = sumSquaredDiff / db->motionFrameCount;
-        db->featuresStd[d] = (float)std::sqrt(variance);
+        typesCount[typeIdx] += db->motionFrameCount;
+    }
 
-        // Avoid division by zero - use 1.0 if std is too small
-        if (db->featuresStd[d] < 1e-8f)
+    // Compute std for each feature type
+    for (int t = 0; t < static_cast<int>(FeatureType::COUNT); ++t)
+    {
+        if (typesCount[t] > 0)
         {
-            db->featuresStd[d] = 1.0f;
+            const double variance = typesSumSquaredDiff[t] / typesCount[t];
+            db->featureTypesStd[t] = (float)std::sqrt(variance);
+
+            // avoid division by zero
+            if (db->featureTypesStd[t] < 1e-8f)
+            {
+                db->featureTypesStd[t] = 1.0f;
+            }
+        }
+        else
+        {
+            db->featureTypesStd[t] = 1.0f;
         }
     }
 
-    // Compute normalized features: (x - mean) / std
+    // Compute normalized features: (x - mean) / typeStd
     db->normalizedFeatures.resize(db->motionFrameCount, db->featureDim);
     for (int f = 0; f < db->motionFrameCount; ++f)
     {
@@ -1131,11 +1350,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
         for (int d = 0; d < db->featureDim; ++d)
         {
-            normRow[d] = (featRow[d] - db->featuresMean[d]) / db->featuresStd[d];
+            const int typeIdx = static_cast<int>(db->featureTypes[d]);
+            normRow[d] = (featRow[d] - db->featuresMean[d]) / db->featureTypesStd[typeIdx];
         }
     }
 
-    TraceLog(LOG_INFO, "AnimDatabase: computed feature normalization (mean/std for %d dimensions)", db->featureDim);
+    TraceLog(LOG_INFO, "AnimDatabase: computed feature normalization (mean per-dim, std per-type for %d dimensions)", db->featureDim);
 
     // Apply feature type weights to normalized features
     for (int f = 0; f < db->motionFrameCount; ++f)
@@ -1145,7 +1365,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         for (int d = 0; d < db->featureDim; ++d)
         {
             const FeatureType featureType = db->featureTypes[d];
-            const float weight = cfg.GetFeatureWeight(featureType);
+            const float weight = cfg.featureTypeWeights[(int)featureType];
             normRow[d] *= weight;
         }
     }
@@ -1240,7 +1460,14 @@ static inline void SamplePoseAndMotion(
     float* outLookaheadRootYawRate,               // lookahead root yaw rate (rad/s)
     float* outLookaheadHipsHeight,                // lookahead hips Y position
     Rot6d* outHipRotationYawFree,                 // current hip rotation (yaw-free)
-    Rot6d* outLookaheadHipRotationYawFree)        // lookahead hip rotation (yaw-free)
+    Rot6d* outLookaheadHipRotationYawFree,        // lookahead hip rotation (yaw-free)
+    Vector3* outMagicVelocity,                    // Magic anchor XZ velocity
+    float* outMagicYawRate,                       // Magic anchor yaw rate
+    Vector3* outLookaheadMagicVelocity,           // lookahead Magic velocity
+    float* outLookaheadMagicYawRate,              // lookahead Magic yaw rate
+    Vector3* outHipPositionInMagicSpace,          // hip position relative to magic anchor
+    Rot6d* outHipRotationInMagicSpace,            // hip rotation relative to magic yaw
+    Rot6d* outLookaheadHipRotationInMagicSpace)   // lookahead hip rotation for dragging
 {
     using std::span;
 
@@ -1254,8 +1481,8 @@ static inline void SamplePoseAndMotion(
 
     span<const Vector3> posRow0 = db->localJointPositions.row_view(clipStart + f0);
     span<const Vector3> posRow1 = db->localJointPositions.row_view(clipStart + f1);
-    span<const Rot6d> rotRow0 = db->localJointRotations6d.row_view(clipStart + f0);
-    span<const Rot6d> rotRow1 = db->localJointRotations6d.row_view(clipStart + f1);
+    span<const Rot6d> rotRow0 = db->localJointRotations.row_view(clipStart + f0);
+    span<const Rot6d> rotRow1 = db->localJointRotations.row_view(clipStart + f1);
 
     for (int j = 0; j < jointCount; ++j)
     {
@@ -1281,8 +1508,8 @@ static inline void SamplePoseAndMotion(
     // sample lookahead rotations (extrapolated poses for lookahead dragging)
     if (outLookaheadRotations6d)
     {
-        span<const Rot6d> laRow0 = db->lookaheadLocalRotations6d.row_view(clipStart + f0);
-        span<const Rot6d> laRow1 = db->lookaheadLocalRotations6d.row_view(clipStart + f1);
+        span<const Rot6d> laRow0 = db->lookaheadLocalRotations.row_view(clipStart + f0);
+        span<const Rot6d> laRow1 = db->lookaheadLocalRotations.row_view(clipStart + f1);
         for (int j = 0; j < jointCount; ++j)
         {
             Rot6dLerp(laRow0[j], laRow1[j], alpha, (*outLookaheadRotations6d)[j]);
@@ -1359,6 +1586,72 @@ static inline void SamplePoseAndMotion(
         const Rot6d rot0 = db->lookaheadHipRotationYawFree[clipStart + f0];
         const Rot6d rot1 = db->lookaheadHipRotationYawFree[clipStart + f1];
         Rot6dLerp(rot0, rot1, alpha, *outLookaheadHipRotationYawFree);
+    }
+
+    // Sample Magic anchor velocities (alternative reference frame)
+    if (outMagicVelocity || outMagicYawRate)
+    {
+        int vf0, vf1;
+        float vAlpha;
+        GetInterFrameAlpha(db, animIndex, animTime + velocityTimeOffset, vf0, vf1, vAlpha);
+
+        if (outMagicVelocity)
+        {
+            const Vector3 vel0 = db->magicVelocity[clipStart + vf0];
+            const Vector3 vel1 = db->magicVelocity[clipStart + vf1];
+            *outMagicVelocity = Vector3Lerp(vel0, vel1, vAlpha);
+        }
+
+        if (outMagicYawRate)
+        {
+            const float rate0 = db->magicYawRate[clipStart + vf0];
+            const float rate1 = db->magicYawRate[clipStart + vf1];
+            *outMagicYawRate = Lerp(rate0, rate1, vAlpha);
+        }
+    }
+
+    // Sample lookahead Magic velocities (extrapolated for anticipation)
+    if (outLookaheadMagicVelocity || outLookaheadMagicYawRate)
+    {
+        int lf0, lf1;
+        float lAlpha;
+        GetInterFrameAlpha(db, animIndex, animTime, lf0, lf1, lAlpha);
+
+        if (outLookaheadMagicVelocity)
+        {
+            const Vector3 vel0 = db->lookaheadMagicVelocity[clipStart + lf0];
+            const Vector3 vel1 = db->lookaheadMagicVelocity[clipStart + lf1];
+            *outLookaheadMagicVelocity = Vector3Lerp(vel0, vel1, lAlpha);
+        }
+
+        if (outLookaheadMagicYawRate)
+        {
+            const float rate0 = db->lookaheadMagicYawRate[clipStart + lf0];
+            const float rate1 = db->lookaheadMagicYawRate[clipStart + lf1];
+            *outLookaheadMagicYawRate = Lerp(rate0, rate1, lAlpha);
+        }
+    }
+
+    // Sample hip transform relative to Magic anchor
+    if (outHipPositionInMagicSpace)
+    {
+        const Vector3 pos0 = db->hipPositionInMagicSpace[clipStart + f0];
+        const Vector3 pos1 = db->hipPositionInMagicSpace[clipStart + f1];
+        *outHipPositionInMagicSpace = Vector3Lerp(pos0, pos1, alpha);
+    }
+
+    if (outHipRotationInMagicSpace)
+    {
+        const Rot6d rot0 = db->hipRotationInMagicSpace[clipStart + f0];
+        const Rot6d rot1 = db->hipRotationInMagicSpace[clipStart + f1];
+        Rot6dLerp(rot0, rot1, alpha, *outHipRotationInMagicSpace);
+    }
+
+    if (outLookaheadHipRotationInMagicSpace)
+    {
+        const Rot6d rot0 = db->lookaheadHipRotationInMagicSpace[clipStart + f0];
+        const Rot6d rot1 = db->lookaheadHipRotationInMagicSpace[clipStart + f1];
+        Rot6dLerp(rot0, rot1, alpha, *outLookaheadHipRotationInMagicSpace);
     }
 }
 

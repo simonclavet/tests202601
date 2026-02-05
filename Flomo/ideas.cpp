@@ -631,11 +631,38 @@ public:
 
 /*
 
-What I can see is that sometimes the error between basic and lookahead is large even if the anim is not extremely fast.
-And error sometimes is mostly due to hips rotation. The guy is sometimes banked more in basic than in lookahead, and the 
-legs and torso are significantly offseted in opposite direction (hips just rotated not enough)
+ 1. Input format: Should the desired aiming direction be a single direction 
+ (same for all future points) or different per trajectory point? 
+ I'm          guessing single direction that we want to maintain/reach.  
+
+ Answer: yes, single direction.
+ 
+ 2. Coordinate space: Should the desired aiming be in world space (absolute) or root space 
+ (relative to character heading)? Root space seems more        natural for motion matching. 
+
+ Yes the feature is root space (which means MagicSpace now)
+
+ 3. Head forward axis: Do you know which local axis is forward for your head bones? 
+ Common conventions:                                                    
+ - +Z forward (Unity-style)                                                
+ - -Z forward (some Mixamo)                                                
+ - +Y forward (some rigs)                                                  
+
+ 
+ I can start with +Z and we can adjust.                                     
+
+ Let's hardcode z forward for now.
 
 
+
+ 4. Feature structure: Should this be:                                      
+ - Just the head direction at future points (2D per point, like FutureVel)   
+ - Or the difference between desired and actual (to find poses that are already looking the right way)?   
+ My initial thought for the implementation:                                                           
+ - Add FeatureType::FutureAimDir                                                                    
+ - For database: compute head forward direction (XZ) at each future trajectory point, in root space 
+ - For query: use playerInput.desiredAimDirection (Vector2 or Vector3 with Y=0)                     
+ - Store one 2D direction per future trajectory point
 
 
 */

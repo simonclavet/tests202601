@@ -289,12 +289,13 @@ static int MotionMatchingSearch(
     std::vector<float> normalizedQuery(db->featureDim);
     for (int d = 0; d < db->featureDim; ++d)
     {
-        // Step 1: Normalize using mean and std (z-score normalization)
-        const float normalized = (query[d] - db->featuresMean[d]) / db->featuresStd[d];
+        // Step 1: Normalize using per-dimension mean and per-type std
+        const FeatureType featureType = db->featureTypes[d];
+        const int typeIdx = static_cast<int>(featureType);
+        const float normalized = (query[d] - db->featuresMean[d]) / db->featureTypesStd[typeIdx];
 
         // Step 2: Apply feature type weight (from config)
-        const FeatureType featureType = db->featureTypes[d];
-        const float weight = db->featuresConfig.GetFeatureWeight(featureType);
+        const float weight = db->featuresConfig.featureTypeWeights[typeIdx];
 
         normalizedQuery[d] = normalized * weight;
     }

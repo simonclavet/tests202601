@@ -680,6 +680,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
         ImGui::Checkbox("Draw Foot IK", &config->drawFootIK);
         ImGui::Checkbox("Draw Basic Blend", &config->drawBasicBlend);
+        ImGui::Checkbox("Draw Magic Anchor", &config->drawMagicAnchor);
         ImGui::Checkbox("Draw Player Input", &config->drawPlayerInput);
         ImGui::Checkbox("Draw Past History", &config->drawPastHistory);
 
@@ -968,7 +969,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         {
             const FeatureType type = static_cast<FeatureType>(i);
             const char* name = FeatureTypeName(type);
-            float weight = editedMMConfig.features[i].weight;
+            float weight = editedMMConfig.featureTypeWeights[i];
 
             ImGui::PushID(i);
             ImGui::Text("%s:", name);
@@ -977,7 +978,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             if (ImGui::InputFloat("##weight", &weight, 0.0f, 0.0f, "%.3f"))
             {
                 // Clamp to >= 0
-                editedMMConfig.features[i].weight = (weight < 0.0f) ? 0.0f : weight;
+                editedMMConfig.featureTypeWeights[i] = (weight < 0.0f) ? 0.0f : weight;
                 configChanged = true;
             }
             ImGui::PopID();
@@ -2135,6 +2136,84 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
     }
 
+    // Draw Magic anchor (alternative reference frame: spine3 projected + head→hand yaw)
+    if (app->controlledCharacter.active && app->config.drawMagicAnchor && app->animDatabase.valid)
+    {
+        const ControlledCharacter& cc = app->controlledCharacter;
+        const AnimDatabase& db = app->animDatabase;
+
+        if (db.spine3Index >= 0 && db.headIndex >= 0 && db.handIndices[SIDE_RIGHT] >= 0)
+        {
+            // Get joint positions from current pose
+            const Vector3 spine3Pos = cc.xformData.globalPositions[db.spine3Index];
+            const Vector3 headPos = cc.xformData.globalPositions[db.headIndex];
+            const Vector3 rightHandPos = cc.xformData.globalPositions[db.handIndices[SIDE_RIGHT]];
+
+            // Magic position = spine3 projected onto ground
+            const Vector3 magicPos = Vector3{ spine3Pos.x, 0.02f, spine3Pos.z };  // slight offset to avoid z-fighting
+
+            // Magic yaw = direction from head to right hand (projected to XZ)
+            const Vector3 headToHand = Vector3Subtract(rightHandPos, headPos);
+            const float magicYaw = atan2f(headToHand.x, headToHand.z);
+            const Quaternion magicRot = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, magicYaw);
+
+            // Draw transform axes (magenta-ish color scheme)
+            const float axisLen = 0.3f;
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ axisLen, 0.0f, 0.0f }, magicRot)), MAGENTA);
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, axisLen, 0.0f }, magicRot)), Color{ 255, 100, 255, 255 });
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, axisLen }, magicRot)), Color{ 200, 0, 200, 255 });
+
+            // Draw small sphere at anchor point
+            DrawSphere(magicPos, 0.03f, MAGENTA);
+
+            // Draw line from magic anchor to spine3 (vertical reference)
+            DrawLine3D(magicPos, spine3Pos, Color{ 255, 100, 255, 128 });
+
+            // Draw line from head to right hand (orientation reference)
+            DrawLine3D(headPos, rightHandPos, Color{ 255, 150, 255, 200 });
+        }
+    }
+
+    // Draw Magic anchor for animated character (scrubber-controlled)
+    if (app->config.drawMagicAnchor && app->animDatabase.valid && app->characterData.count > 0)
+    {
+        const TransformData& xform = app->characterData.xformData[app->characterData.active];
+        const AnimDatabase& db = app->animDatabase;
+
+        if (db.spine3Index >= 0 && db.headIndex >= 0 && db.handIndices[SIDE_RIGHT] >= 0 &&
+            db.spine3Index < xform.jointCount && db.headIndex < xform.jointCount &&
+            db.handIndices[SIDE_RIGHT] < xform.jointCount)
+        {
+            // Get joint positions from current pose
+            const Vector3 spine3Pos = xform.globalPositions[db.spine3Index];
+            const Vector3 headPos = xform.globalPositions[db.headIndex];
+            const Vector3 rightHandPos = xform.globalPositions[db.handIndices[SIDE_RIGHT]];
+
+            // Magic position = spine3 projected onto ground
+            const Vector3 magicPos = Vector3{ spine3Pos.x, 0.02f, spine3Pos.z };
+
+            // Magic yaw = direction from head to right hand (projected to XZ)
+            const Vector3 headToHand = Vector3Subtract(rightHandPos, headPos);
+            const float magicYaw = atan2f(headToHand.x, headToHand.z);
+            const Quaternion magicRot = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, magicYaw);
+
+            // Draw transform axes (orange color scheme to match animated character)
+            const float axisLen = 0.3f;
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ axisLen, 0.0f, 0.0f }, magicRot)), ORANGE);
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, axisLen, 0.0f }, magicRot)), Color{ 255, 200, 100, 255 });
+            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, axisLen }, magicRot)), Color{ 200, 100, 0, 255 });
+
+            // Draw small sphere at anchor point
+            DrawSphere(magicPos, 0.03f, ORANGE);
+
+            // Draw line from magic anchor to spine3 (vertical reference)
+            DrawLine3D(magicPos, spine3Pos, Color{ 255, 200, 100, 128 });
+
+            // Draw line from head to right hand (orientation reference)
+            DrawLine3D(headPos, rightHandPos, Color{ 255, 180, 100, 200 });
+        }
+    }
+
     // Draw Foot IK debug (virtual toe positions, FK foot positions before IK, full FK skeleton before IK)
     if (app->controlledCharacter.active &&
         app->config.drawFootIK &&
@@ -2907,8 +2986,8 @@ int main(int argc, char** argv)
     const Vector2 dpiScale = GetWindowScaleDPI();
     rlImGuiBeginInitImGui();
 
-    //ImGui::GetIO().FontGlobalScale = dpiScale.x;
-    ImGui::GetIO().FontGlobalScale = 2.0f;
+    ImGui::GetIO().FontGlobalScale = dpiScale.x;
+    //ImGui::GetIO().FontGlobalScale = 2.0f;
     ImGui::StyleColorsDark();
     rlImGuiEndInitImGui();
 

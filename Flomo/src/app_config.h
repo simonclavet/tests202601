@@ -27,7 +27,7 @@ static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMa
     {
         const FeatureType type = static_cast<FeatureType>(i);
         const char* name = FeatureTypeName(type);
-        config.features[i].weight = ParseFloatValue(jsonBuffer, name, config.features[i].weight);
+        config.featureTypeWeights[i] = ParseFloatValue(jsonBuffer, name, config.featureTypeWeights[i]);
     }
 
     // Parse pastTimeOffset
@@ -79,7 +79,7 @@ static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeature
     for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i)
     {
         const FeatureType type = static_cast<FeatureType>(i);
-        oss << "    \"" << FeatureTypeName(type) << "\": " << config.features[i].weight;
+        oss << "    \"" << FeatureTypeName(type) << "\": " << config.featureTypeWeights[i];
         if (i < static_cast<int>(FeatureType::COUNT) - 1) oss << ",";
         oss << "\n";
     }
@@ -186,6 +186,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawRootVelocities = ResolveBoolConfig(buffer, "drawRootVelocities", config.drawRootVelocities, argc, argv);
     config.drawToeVelocities = ResolveBoolConfig(buffer, "drawToeVelocities", config.drawToeVelocities, argc, argv);
     config.drawFootIK = ResolveBoolConfig(buffer, "drawFootIK", config.drawFootIK, argc, argv);
+    config.drawMagicAnchor = ResolveBoolConfig(buffer, "drawMagicAnchor", config.drawMagicAnchor, argc, argv);
     config.drawPastHistory = ResolveBoolConfig(buffer, "drawPastHistory", config.drawPastHistory, argc, argv);
 
     config.animationMode = static_cast<AnimationMode>(ResolveIntConfig(buffer, "animationMode", static_cast<int>(config.animationMode), argc, argv));
@@ -206,7 +207,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawPlayerInput = ResolveBoolConfig(buffer, "drawPlayerInput", false, argc, argv);
 
     // Initialize motion matching config with defaults first
-    MotionMatchingConfigInit(config.mmConfigEditor);
+    config.mmConfigEditor = {};
 
     // Then load from JSON (if available)
     if (buffer)
@@ -284,7 +285,8 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"drawRootVelocities\": %s,\n", config.drawRootVelocities ? "true" : "false");
     fprintf(file, "    \"drawToeVelocities\": %s,\n", config.drawToeVelocities ? "true" : "false");
     fprintf(file, "    \"drawFootIK\": %s,\n", config.drawFootIK ? "true" : "false");
-    fprintf(file, "  \"drawPastHistory\": %s,\n", config.drawPastHistory ? "true" : "false");
+    fprintf(file, "    \"drawMagicAnchor\": %s,\n", config.drawMagicAnchor ? "true" : "false");
+    fprintf(file, "    \"drawPastHistory\": %s,\n", config.drawPastHistory ? "true" : "false");
 
     fprintf(file, "    \"animationMode\": %d,\n", static_cast<int>(config.animationMode));
     fprintf(file, "    \"defaultBlendTime\": %.4f,\n", config.defaultBlendTime);

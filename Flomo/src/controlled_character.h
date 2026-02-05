@@ -83,6 +83,16 @@ static void ControlledCharacterInit(
         cc->cursors[i].targetWeight = 0.0f;
     }
 
+    // Magic anchor root motion state
+    cc->magicWorldPosition = Vector3{ 2.0f, 0.0f, 0.0f };  // Same starting position as worldPosition
+    cc->magicWorldRotation = QuaternionIdentity();
+    cc->magicAnchorInitialized = false;
+    cc->smoothedMagicVelocity = Vector3Zero();
+    cc->smoothedMagicYawRate = 0.0f;
+    cc->lookaheadDragMagicVelocity = Vector3Zero();
+    cc->lookaheadDragMagicYawRate = 0.0f;
+    cc->lookaheadMagicVelocityInitialized = false;
+
     // Sample initial pose to get starting root state
     TransformDataSampleFrame(&cc->xformData, skeleton, 0, scale);
     cc->prevRootPosition = cc->xformData.localPositions[0];
@@ -182,7 +192,14 @@ static void SpawnBlendCursor(
         nullptr,  // outLookaheadRootYawRate
         &cursor->sampledLookaheadHipsHeight,
         &cursor->sampledHipRotationYawFree,
-        &cursor->sampledLookaheadHipRotationYawFree);
+        &cursor->sampledLookaheadHipRotationYawFree,
+        nullptr,  // outMagicVelocity
+        nullptr,  // outMagicYawRate
+        nullptr,  // outLookaheadMagicVelocity
+        nullptr,  // outLookaheadMagicYawRate
+        &cursor->sampledHipPositionInMagicSpace,
+        &cursor->sampledHipRotationInMagicSpace,
+        &cursor->sampledLookaheadHipRotationInMagicSpace);
 
     cursor->prevLocalRootPos = rootPos;
     cursor->prevLocalRootRot6d = rootRot6d;
@@ -368,6 +385,13 @@ static void ControlledCharacterUpdate(
         float sampledLookaheadHipsHeight;
         Rot6d sampledHipRotationYawFree;
         Rot6d sampledLookaheadHipRotationYawFree;
+        Vector3 sampledMagicVelocity;
+        float sampledMagicYawRate;
+        Vector3 sampledLookaheadMagicVelocity;
+        float sampledLookaheadMagicYawRate;
+        Vector3 sampledHipPositionInMagicSpace;
+        Rot6d sampledHipRotationInMagicSpace;
+        Rot6d sampledLookaheadHipRotationInMagicSpace;
         SamplePoseAndMotion(
             db,
             cur.animIndex,
@@ -385,7 +409,14 @@ static void ControlledCharacterUpdate(
             &sampledLookaheadRootYawRate,
             &sampledLookaheadHipsHeight,
             &sampledHipRotationYawFree,
-            &sampledLookaheadHipRotationYawFree);
+            &sampledLookaheadHipRotationYawFree,
+            &sampledMagicVelocity,
+            &sampledMagicYawRate,
+            &sampledLookaheadMagicVelocity,
+            &sampledLookaheadMagicYawRate,
+            &sampledHipPositionInMagicSpace,
+            &sampledHipRotationInMagicSpace,
+            &sampledLookaheadHipRotationInMagicSpace);
 
         // Store sampled values in cursor
         cur.sampledRootVelocityRootSpace = sampledRootVelRootSpace;
@@ -395,6 +426,13 @@ static void ControlledCharacterUpdate(
         cur.sampledLookaheadHipsHeight = sampledLookaheadHipsHeight;
         cur.sampledHipRotationYawFree = sampledHipRotationYawFree;
         cur.sampledLookaheadHipRotationYawFree = sampledLookaheadHipRotationYawFree;
+        cur.sampledMagicVelocity = sampledMagicVelocity;
+        cur.sampledMagicYawRate = sampledMagicYawRate;
+        cur.sampledLookaheadMagicVelocity = sampledLookaheadMagicVelocity;
+        cur.sampledLookaheadMagicYawRate = sampledLookaheadMagicYawRate;
+        cur.sampledHipPositionInMagicSpace = sampledHipPositionInMagicSpace;
+        cur.sampledHipRotationInMagicSpace = sampledHipRotationInMagicSpace;
+        cur.sampledLookaheadHipRotationInMagicSpace = sampledLookaheadHipRotationInMagicSpace;
 
         // Sample toe velocities from database (already in root space)
         Vector3 toeVelRootSpace[SIDES_COUNT];
@@ -517,12 +555,16 @@ static void ControlledCharacterUpdate(
     cc->lastBlendedDeltaWorld = finalWorldDelta;
     cc->lastBlendedDeltaYaw = finalYawDelta;
 
-    // Apply root motion (with optional velocity-based smoothing)
-    if (cc->cursorBlendMode == CursorBlendMode::VelBlending)
+
+
+
+    // --------- Apply root motion: Magic Anchor OR Hip-based ---------
+    if (true)
     {
-        // Compute blended acceleration from cursor velocities (velocities already blended in main loop)
-        Vector3 blendedAcceleration = Vector3Zero();
-        float blendedYawAccel = 0.0f;
+        // ===== MAGIC ANCHOR ROOT MOTION =====
+        // Blend magic velocities from cursors (instead of hip velocities)
+        Vector3 blendedMagicVelocity = Vector3Zero();
+        float blendedMagicYawRate = 0.0f;
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
@@ -531,95 +573,270 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
-            // compute and accumulate weighted acceleration
-            const Vector3 acc = Vector3Scale(Vector3Subtract(cur.rootVelocity, cur.prevRootVelocity), 1.0f / dt);
-            const float yawAcc = (cur.rootYawRate - cur.prevRootYawRate) / dt;
-            blendedAcceleration = Vector3Add(blendedAcceleration, Vector3Scale(acc, w));
-            blendedYawAccel += yawAcc * w;
+            // Transform magic velocity from magic space to world space
+            const Vector3 magicVelWorld = Vector3RotateByQuaternion(
+                cur.sampledMagicVelocity, cc->magicWorldRotation);
+
+            blendedMagicVelocity = Vector3Add(blendedMagicVelocity, Vector3Scale(magicVelWorld, w));
+            blendedMagicYawRate += cur.sampledMagicYawRate * w;
         }
 
-        // Normalize the already-blended velocity from main loop
-        const Vector3 blendedVelNormalized = Vector3Scale(blendedVelocity, 1.0f / totalRootWeight);
-        const float blendedYawRateNormalized = blendedYawRate / totalRootWeight;
-        blendedVelocity = blendedVelNormalized;
-        blendedYawRate = blendedYawRateNormalized;
+        // Normalize
+        const Vector3 finalMagicVelocity = Vector3Scale(blendedMagicVelocity, 1.0f / totalRootWeight);
+        const float finalMagicYawRate = blendedMagicYawRate / totalRootWeight;
 
-        // Initialize on first frame
-        if (!cc->rootMotionInitialized)
+        // For lookahead dragging mode, blend lookahead magic velocities
+        Vector3 blendedLookaheadMagicVelocity = Vector3Zero();
+        float blendedLookaheadMagicYawRate = 0.0f;
+        if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
         {
-            cc->smoothedRootVelocity = blendedVelocity;
-            cc->smoothedRootYawRate = blendedYawRate;
-            cc->rootMotionInitialized = true;
+            for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+            {
+                const BlendCursor& cur = cc->cursors[ci];
+                if (!cur.active) continue;
+                const float w = cur.normalizedWeight;
+                if (w <= 1e-6f) continue;
+
+                const Vector3 lookaheadMagicVelWorld = Vector3RotateByQuaternion(
+                    cur.sampledLookaheadMagicVelocity, cc->magicWorldRotation);
+
+                blendedLookaheadMagicVelocity = Vector3Add(blendedLookaheadMagicVelocity,
+                    Vector3Scale(lookaheadMagicVelWorld, w));
+                blendedLookaheadMagicYawRate += cur.sampledLookaheadMagicYawRate * w;
+            }
+            blendedLookaheadMagicVelocity = Vector3Scale(blendedLookaheadMagicVelocity, 1.0f / totalRootWeight);
+            blendedLookaheadMagicYawRate /= totalRootWeight;
         }
 
-        // Step 1: advance smoothed velocity using blended acceleration
-        cc->smoothedRootVelocity = Vector3Add(cc->smoothedRootVelocity, Vector3Scale(blendedAcceleration, dt));
-        cc->smoothedRootYawRate += blendedYawAccel * dt;
-
-        // Step 2: lerp towards blended target velocity
-        const float blendTime = cc->blendPosReturnTime;
-        if (blendTime > 1e-6f)
+        // Initialize magic anchor on first frame
+        if (!cc->magicAnchorInitialized)
         {
-            const float alpha = 1.0f - powf(0.5f, dt / blendTime);
-            cc->smoothedRootVelocity = Vector3Lerp(cc->smoothedRootVelocity, blendedVelocity, alpha);
-            cc->smoothedRootYawRate = Lerp(cc->smoothedRootYawRate, blendedYawRate, alpha);
+            cc->smoothedMagicVelocity = finalMagicVelocity;
+            cc->smoothedMagicYawRate = finalMagicYawRate;
+            cc->magicAnchorInitialized = true;
+        }
+
+        // Apply magic root motion based on blend mode
+        //if (cc->cursorBlendMode == CursorBlendMode::VelBlending)
+        //{
+        //    // VelBlending mode (simplified - no per-cursor acceleration tracking yet)
+        //    // Just lerp smoothed velocity towards target
+        //    const float blendTime = cc->blendPosReturnTime;
+        //    if (blendTime > 1e-6f)
+        //    {
+        //        const float alpha = 1.0f - powf(0.5f, dt / blendTime);
+        //        cc->smoothedMagicVelocity = Vector3Lerp(cc->smoothedMagicVelocity, finalMagicVelocity, alpha);
+        //        cc->smoothedMagicYawRate = Lerp(cc->smoothedMagicYawRate, finalMagicYawRate, alpha);
+        //    }
+        //    else
+        //    {
+        //        cc->smoothedMagicVelocity = finalMagicVelocity;
+        //        cc->smoothedMagicYawRate = finalMagicYawRate;
+        //    }
+
+        //    const Vector3 smoothedMagicDelta = Vector3Scale(cc->smoothedMagicVelocity, dt);
+        //    const float smoothedMagicYawDelta = cc->smoothedMagicYawRate * dt;
+
+        //    cc->magicWorldPosition = Vector3Add(cc->magicWorldPosition, smoothedMagicDelta);
+        //    const Quaternion magicYawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, smoothedMagicYawDelta);
+        //    cc->magicWorldRotation = QuaternionNormalize(QuaternionMultiply(magicYawQ, cc->magicWorldRotation));
+        //}
+        //else 
+        // Apply magic root motion based on blend mode
+        if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+        {
+            if (!cc->lookaheadMagicVelocityInitialized)
+            {
+                cc->lookaheadDragMagicVelocity = finalMagicVelocity;
+                cc->lookaheadDragMagicYawRate = finalMagicYawRate;
+                cc->lookaheadMagicVelocityInitialized = true;
+            }
+
+            const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+            const float alpha = dt / lookaheadTime;
+            cc->lookaheadDragMagicVelocity = Vector3Lerp(cc->lookaheadDragMagicVelocity, blendedLookaheadMagicVelocity, alpha);
+            cc->lookaheadDragMagicYawRate = Lerp(cc->lookaheadDragMagicYawRate, blendedLookaheadMagicYawRate, alpha);
+
+            const Vector3 magicDragDelta = Vector3Scale(cc->lookaheadDragMagicVelocity, dt);
+            const float magicDragYawDelta = cc->lookaheadDragMagicYawRate * dt;
+
+            cc->magicWorldPosition = Vector3Add(cc->magicWorldPosition, magicDragDelta);
+            const Quaternion magicYawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, magicDragYawDelta);
+            cc->magicWorldRotation = QuaternionMultiply(magicYawQ, cc->magicWorldRotation);
+
+            // CRITICAL FIX: Keep only Y component to prevent pitch/roll accumulation
+            cc->magicWorldRotation = QuaternionYComponent(cc->magicWorldRotation);
+
+            cc->smoothedMagicVelocity = cc->lookaheadDragMagicVelocity;
+            cc->smoothedMagicYawRate = cc->lookaheadDragMagicYawRate;
         }
         else
         {
-            cc->smoothedRootVelocity = blendedVelocity;
-            cc->smoothedRootYawRate = blendedYawRate;
+            // Basic mode
+            const Vector3 finalMagicDelta = Vector3Scale(finalMagicVelocity, dt);
+            const float finalMagicYawDelta = finalMagicYawRate * dt;
+
+            cc->magicWorldPosition = Vector3Add(cc->magicWorldPosition, finalMagicDelta);
+            const Quaternion magicYawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalMagicYawDelta);
+            cc->magicWorldRotation = QuaternionMultiply(magicYawQ, cc->magicWorldRotation);
+
+            // CRITICAL FIX: Keep only Y component to prevent pitch/roll accumulation
+            cc->magicWorldRotation = QuaternionYComponent(cc->magicWorldRotation);
+
+            cc->smoothedMagicVelocity = finalMagicVelocity;
+            cc->smoothedMagicYawRate = finalMagicYawRate;
         }
 
-        // Apply smoothed velocity
-        const Vector3 smoothedDelta = Vector3Scale(cc->smoothedRootVelocity, dt);
-        const float smoothedYawDelta = cc->smoothedRootYawRate * dt;
+        // Place skeleton (hip) relative to magic anchor
+        Vector3 blendedHipPosInMagicSpace = Vector3Zero();
+        Rot6d blendedHipRotInMagicSpace = Rot6dZero();
 
-        cc->worldPosition = Vector3Add(cc->worldPosition, smoothedDelta);
-        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, smoothedYawDelta);
-        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
-    }
-    else if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
-    {
-        // Lookahead dragging: lerp running velocity towards extrapolated future velocity
-        // Initialize on first frame
-        if (!cc->lookaheadVelocityInitialized)
+        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
-            cc->lookaheadDragVelocity = finalVelocity;
-            cc->lookaheadDragYawRate = finalYawRate;
-            cc->lookaheadVelocityInitialized = true;
+            const BlendCursor& cur = cc->cursors[ci];
+            if (!cur.active) continue;
+            const float w = cur.normalizedWeight;
+            if (w <= 1e-6f) continue;
+
+            blendedHipPosInMagicSpace = Vector3Add(blendedHipPosInMagicSpace,
+                Vector3Scale(cur.sampledHipPositionInMagicSpace, w));
+            Rot6dScaledAdd(w, cur.sampledHipRotationInMagicSpace, blendedHipRotInMagicSpace);
         }
+        Rot6dNormalize(blendedHipRotInMagicSpace);
 
-        // Lerp towards lookahead target with alpha = dt / lookaheadTime
-        const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
-        const float alpha = dt / lookaheadTime;
-        cc->lookaheadDragVelocity = Vector3Lerp(cc->lookaheadDragVelocity, blendedLookaheadVelocity, alpha);
-        cc->lookaheadDragYawRate = Lerp(cc->lookaheadDragYawRate, blendedLookaheadYawRate, alpha);
+        // Transform hip position from magic space to world space
+        // IMPORTANT: magicWorldRotation must be PURE YAW (no pitch/roll) for Y to pass through unchanged
+        const Vector3 hipOffsetWorld = Vector3RotateByQuaternion(
+            blendedHipPosInMagicSpace, cc->magicWorldRotation);
+        cc->worldPosition = Vector3Add(cc->magicWorldPosition, hipOffsetWorld);
 
-        // Apply the running velocity
-        const Vector3 dragDelta = Vector3Scale(cc->lookaheadDragVelocity, dt);
-        const float dragYawDelta = cc->lookaheadDragYawRate * dt;
+        // Transform hip rotation from magic space to world space
+        Quaternion hipRotRelativeToMagic;
+        Rot6dToQuaternion(blendedHipRotInMagicSpace, hipRotRelativeToMagic);
 
-        cc->worldPosition = Vector3Add(cc->worldPosition, dragDelta);
-        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, dragYawDelta);
-        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+        // Set worldRotation to full hip rotation (magic yaw + hip tilt/roll)
+        cc->worldRotation = QuaternionMultiply(cc->magicWorldRotation, hipRotRelativeToMagic);
 
-        // Update smoothed velocity for visualization
-        cc->smoothedRootVelocity = cc->lookaheadDragVelocity;
-        cc->smoothedRootYawRate = cc->lookaheadDragYawRate;
+        // Update smoothedRootVelocity for compatibility
+        cc->smoothedRootVelocity = cc->smoothedMagicVelocity;
+        cc->smoothedRootYawRate = cc->smoothedMagicYawRate;
     }
-    else
-    {
-        // Basic mode: direct application of blended velocity
-        cc->worldPosition = Vector3Add(cc->worldPosition, finalWorldDelta);
-        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalYawDelta);
-        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+    //else
 
-        // Update smoothedRootVelocity for visualization
-        cc->smoothedRootVelocity = finalVelocity;
-        cc->smoothedRootYawRate = finalYawRate;
-    }
 
-    // --- Rot6d blending using normalized weights (no double-cover issues, simple weighted average then normalize) ---
+
+    //{
+
+
+
+
+
+
+
+    //    // Apply root motion (with optional velocity-based smoothing)
+    //    if (cc->cursorBlendMode == CursorBlendMode::VelBlending)
+    //    {
+    //        // Compute blended acceleration from cursor velocities (velocities already blended in main loop)
+    //        Vector3 blendedAcceleration = Vector3Zero();
+    //        float blendedYawAccel = 0.0f;
+
+    //        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+    //        {
+    //            const BlendCursor& cur = cc->cursors[ci];
+    //            if (!cur.active) continue;
+    //            const float w = cur.normalizedWeight;
+    //            if (w <= 1e-6f) continue;
+
+    //            // compute and accumulate weighted acceleration
+    //            const Vector3 acc = Vector3Scale(Vector3Subtract(cur.rootVelocity, cur.prevRootVelocity), 1.0f / dt);
+    //            const float yawAcc = (cur.rootYawRate - cur.prevRootYawRate) / dt;
+    //            blendedAcceleration = Vector3Add(blendedAcceleration, Vector3Scale(acc, w));
+    //            blendedYawAccel += yawAcc * w;
+    //        }
+
+    //        // Normalize the already-blended velocity from main loop
+    //        const Vector3 blendedVelNormalized = Vector3Scale(blendedVelocity, 1.0f / totalRootWeight);
+    //        const float blendedYawRateNormalized = blendedYawRate / totalRootWeight;
+    //        blendedVelocity = blendedVelNormalized;
+    //        blendedYawRate = blendedYawRateNormalized;
+
+    //        // Initialize on first frame
+    //        if (!cc->rootMotionInitialized)
+    //        {
+    //            cc->smoothedRootVelocity = blendedVelocity;
+    //            cc->smoothedRootYawRate = blendedYawRate;
+    //            cc->rootMotionInitialized = true;
+    //        }
+
+    //        // Step 1: advance smoothed velocity using blended acceleration
+    //        cc->smoothedRootVelocity = Vector3Add(cc->smoothedRootVelocity, Vector3Scale(blendedAcceleration, dt));
+    //        cc->smoothedRootYawRate += blendedYawAccel * dt;
+
+    //        // Step 2: lerp towards blended target velocity
+    //        const float blendTime = cc->blendPosReturnTime;
+    //        if (blendTime > 1e-6f)
+    //        {
+    //            const float alpha = 1.0f - powf(0.5f, dt / blendTime);
+    //            cc->smoothedRootVelocity = Vector3Lerp(cc->smoothedRootVelocity, blendedVelocity, alpha);
+    //            cc->smoothedRootYawRate = Lerp(cc->smoothedRootYawRate, blendedYawRate, alpha);
+    //        }
+    //        else
+    //        {
+    //            cc->smoothedRootVelocity = blendedVelocity;
+    //            cc->smoothedRootYawRate = blendedYawRate;
+    //        }
+
+    //        // Apply smoothed velocity
+    //        const Vector3 smoothedDelta = Vector3Scale(cc->smoothedRootVelocity, dt);
+    //        const float smoothedYawDelta = cc->smoothedRootYawRate * dt;
+
+    //        cc->worldPosition = Vector3Add(cc->worldPosition, smoothedDelta);
+    //        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, smoothedYawDelta);
+    //        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+    //    }
+    //    else if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+    //    {
+    //        // Lookahead dragging: lerp running velocity towards extrapolated future velocity
+    //        // Initialize on first frame
+    //        if (!cc->lookaheadVelocityInitialized)
+    //        {
+    //            cc->lookaheadDragVelocity = finalVelocity;
+    //            cc->lookaheadDragYawRate = finalYawRate;
+    //            cc->lookaheadVelocityInitialized = true;
+    //        }
+
+    //        // Lerp towards lookahead target with alpha = dt / lookaheadTime
+    //        const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+    //        const float alpha = dt / lookaheadTime;
+    //        cc->lookaheadDragVelocity = Vector3Lerp(cc->lookaheadDragVelocity, blendedLookaheadVelocity, alpha);
+    //        cc->lookaheadDragYawRate = Lerp(cc->lookaheadDragYawRate, blendedLookaheadYawRate, alpha);
+
+    //        // Apply the running velocity
+    //        const Vector3 dragDelta = Vector3Scale(cc->lookaheadDragVelocity, dt);
+    //        const float dragYawDelta = cc->lookaheadDragYawRate * dt;
+
+    //        cc->worldPosition = Vector3Add(cc->worldPosition, dragDelta);
+    //        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, dragYawDelta);
+    //        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+
+    //        // Update smoothed velocity for visualization
+    //        cc->smoothedRootVelocity = cc->lookaheadDragVelocity;
+    //        cc->smoothedRootYawRate = cc->lookaheadDragYawRate;
+    //    }
+    //    else
+    //    {
+    //        // Basic mode: direct application of blended velocity
+    //        cc->worldPosition = Vector3Add(cc->worldPosition, finalWorldDelta);
+    //        const Quaternion yawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalYawDelta);
+    //        cc->worldRotation = QuaternionNormalize(QuaternionMultiply(yawQ, cc->worldRotation));
+
+    //        // Update smoothedRootVelocity for visualization
+    //        cc->smoothedRootVelocity = finalVelocity;
+    //        cc->smoothedRootYawRate = finalYawRate;
+    //    }
+    //}
+
+    // --- Rot6d blending using normalized weights 
     {
         std::vector<Vector3> posAccum(jc, Vector3Zero());
         std::vector<Rot6d> rot6dAccum(jc, Rot6d{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });

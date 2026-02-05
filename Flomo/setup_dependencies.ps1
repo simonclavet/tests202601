@@ -177,6 +177,44 @@ Clone-IfMissing "raygui" "https://github.com/raysan5/raygui.git"
 Clone-IfMissing "imgui" "https://github.com/ocornut/imgui.git"
 Clone-IfMissing "rlImGui" "https://github.com/raylib-extras/rlImGui.git"
 
+
+# tiny-cuda-nn - fast neural networks for motion matching
+Write-Host ""
+Write-Host "Checking tiny-cuda-nn..." -ForegroundColor Cyan
+$tinyCudaNNDir = Join-Path $thirdpartyDir "tiny-cuda-nn"
+if (Test-Path $tinyCudaNNDir) {
+    Write-Host "[OK] tiny-cuda-nn already exists" -ForegroundColor Green
+} else {
+    Write-Host "[DOWNLOADING] tiny-cuda-nn (with submodules)" -ForegroundColor Yellow
+    git clone --recursive --depth 1 https://github.com/NVlabs/tiny-cuda-nn.git $tinyCudaNNDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to clone tiny-cuda-nn"
+    }
+    Write-Host "[OK] tiny-cuda-nn cloned" -ForegroundColor Green
+}
+
+# Verify tiny-cuda-nn submodules are initialized
+if (Test-Path $tinyCudaNNDir) {
+    Push-Location $tinyCudaNNDir
+    
+    # Check if submodules need initialization
+    $submoduleStatus = git submodule status 2>&1
+    if ($submoduleStatus -match "^-" -or $submoduleStatus -match "No submodule") {
+        Write-Host "[UPDATING] Initializing tiny-cuda-nn submodules..." -ForegroundColor Yellow
+        git submodule update --init --recursive --depth 1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[WARNING] Some submodules may have failed to initialize" -ForegroundColor Yellow
+        } else {
+            Write-Host "[OK] Submodules initialized" -ForegroundColor Green
+        }
+    }
+    
+    Pop-Location
+}
+
+
+
+
 # ufbx - just two files
 Write-Host ""
 Write-Host "Checking ufbx..." -ForegroundColor Cyan
