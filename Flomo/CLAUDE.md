@@ -49,7 +49,10 @@ flomo.exe -fbx2bvh input.fbx
 ```
 
 ## Code Style Preferences
-some of these conventions are not really respected everywhere in this code, but try to follow them as much as possible for any new - Prefer `int` as the main integer type (don't warn about size_t to int conversions)
+
+Here are some guidelines.
+Some of these conventions are not really respected everywhere in this code, but try to follow them as much as 
+possible for any new - Prefer `int` as the main integer type (don't warn about size_t to int conversions)
 - Use `float` for all floating-point values (add `f` suffix to literals: `1.0f`)
 - Be const-correct for pointer/reference parameters and local variables
 - C++20 designated initializers are OK
@@ -74,6 +77,10 @@ no need for private and public. Use structs only
 Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
 ask questions to the human if unsure about anything. Don't assume things, ask instead.
 be casual when conversing with the human. We want to have fun coding together. 
+
+When you are copilot and you don't modify code but tell me changes to do, please don't copy paste the whole function or file, 
+unless it is small. Instead tell me clearly what to change, with a bit of context before and after the new thing. 
+Don't put + and - diff markers. 
 
 ## Compiler Warnings Policy
 - Warnings as errors (`/WX`)

@@ -39,8 +39,9 @@ using namespace std;
 // Declare the CUDA functions
 extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
 extern "C" void cuda_check_error(const char* msg);
+extern "C" void test_tiny_cuda_nn();
 
-static void TestCudaAndLibtorch()
+static void TestCudaAndLibtorchAndTCN()
 {
     const int N = 1000000;  // 1 million elements
     vector<float> a(N, 1.0f);
@@ -86,6 +87,9 @@ static void TestCudaAndLibtorch()
     auto result = tensor * 2;
     cout << "Random tensor:\n" << tensor << endl;
     cout << "Tensor * 2:\n" << result << endl;
+
+    // Test tiny-cuda-nn (implemented in cuda_kernels.cu)
+    test_tiny_cuda_nn();
 }
 
 
@@ -2934,7 +2938,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
-    //TestCudaAndLibtorch();
+    TestCudaAndLibtorchAndTCN();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;

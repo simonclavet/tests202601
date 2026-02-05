@@ -232,7 +232,7 @@ struct AnimDatabase
     Array2D<Vector3> jointPositionsAnimSpace;       // positions in animation world space
     Array2D<Rot6d> jointRotationsAnimSpace;         // rotations in animation world space
 
-    // Per-frame joint velocities/accelerations in root space (heading-relative)
+    // Per-frame joint velocities/accelerations in root space (magic anchor space)
     Array2D<Vector3> jointVelocitiesRootSpace;      // velocities relative to character heading
     Array2D<Vector3> jointAccelerationsRootSpace;   // accelerations relative to character heading
 
@@ -524,10 +524,10 @@ struct ControlledCharacter {
 
     // Pose output (local space with root zeroed, then transformed to world)
     TransformData xformData;
-    TransformData xformTmp0;
-    TransformData xformTmp1;
-    TransformData xformTmp2;
-    TransformData xformTmp3;
+    //TransformData xformTmp0;
+    //TransformData xformTmp1;
+    //TransformData xformTmp2;
+    //TransformData xformTmp3;
 
     // Pre-IK FK state for debugging (saved before IK is applied)
     TransformData xformBeforeIK;

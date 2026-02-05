@@ -84,16 +84,12 @@ static void ComputeMotionFeatures(
         outFeatures.resize(db->featureDim, 0.0f);
     }
 
-    // Get hip position and yaw from pose
-    const int hipIdx = db->hipJointIndex;
-    if (hipIdx < 0 || hipIdx >= xform->jointCount) return;
+    // Use the already-computed magic anchor from controlled character (no need to recompute from arms)
+    const Vector3 magicPos = cc->magicWorldPosition;
+    const Quaternion magicWorldRot = cc->magicWorldRotation;
 
-    const Vector3 hipPos = xform->globalPositions[hipIdx];
-    const Quaternion hipRot = xform->globalRotations[hipIdx];
-
-    // Extract hip yaw and compute inverse for transforming to hip-local frame
-    const Quaternion hipYaw = QuaternionYComponent(hipRot);
-    const Quaternion invHipYaw = QuaternionInvert(hipYaw);
+    // Extract yaw from magic world rotation for transforming to magic-local frame
+    const Quaternion invMagicWorldRot = QuaternionInvert(magicWorldRot);
 
     // Get toe positions from pose
     const int leftToeIdx = db->toeIndices[SIDE_LEFT];
@@ -111,16 +107,16 @@ static void ComputeMotionFeatures(
         rightToePos = xform->globalPositions[rightToeIdx];
     }
 
-    // Compute toe positions in hip-local frame
-    const Vector3 hipToLeft = Vector3Subtract(leftToePos, hipPos);
-    const Vector3 localLeftPos = Vector3RotateByQuaternion(hipToLeft, invHipYaw);
+    // Compute toe positions in magic-local frame
+    const Vector3 magicToLeft = Vector3Subtract(leftToePos, magicPos);
+    const Vector3 localLeftPos = Vector3RotateByQuaternion(magicToLeft, invMagicWorldRot);
 
-    const Vector3 hipToRight = Vector3Subtract(rightToePos, hipPos);
-    const Vector3 localRightPos = Vector3RotateByQuaternion(hipToRight, invHipYaw);
+    const Vector3 magicToRight = Vector3Subtract(rightToePos, magicPos);
+    const Vector3 localRightPos = Vector3RotateByQuaternion(magicToRight, invMagicWorldRot);
 
-    // Compute toe velocities in hip-local frame
-    Vector3 localLeftVel = Vector3RotateByQuaternion(toeVelocity[SIDE_LEFT], invHipYaw);
-    Vector3 localRightVel = Vector3RotateByQuaternion(toeVelocity[SIDE_RIGHT], invHipYaw);
+    // Compute toe velocities in magic-local frame
+    Vector3 localLeftVel = Vector3RotateByQuaternion(toeVelocity[SIDE_LEFT], invMagicWorldRot);
+    Vector3 localRightVel = Vector3RotateByQuaternion(toeVelocity[SIDE_RIGHT], invMagicWorldRot);
 
     // Fill the feature vector in the same order as database features
     int fi = 0;
@@ -143,7 +139,7 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = localRightVel.z;
     }
 
-    // ToeDiff: (left - right) in hip frame
+    // ToeDiff: (left - right) in magic frame
     if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
     {
         outFeatures[fi++] = localLeftPos.x - localRightPos.x;
@@ -162,33 +158,33 @@ static void ComputeMotionFeatures(
         ComputeFutureVelocities(currentVelWorld, desiredVelWorld, maxAcceleration, cfg.futureTrajPointTimes, futureVelocities);
     }
 
-    // FutureVel: predicted velocity at future sample times (XZ components in root space)
+    // FutureVel: predicted velocity at future sample times (XZ components in magic space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
     {
         for (int p = 0; p < (int)futureVelocities.size(); ++p)
         {
-            // Transform to root space for feature output
-            const Vector3 futureVelRootSpace = Vector3RotateByQuaternion(futureVelocities[p], invHipYaw);
-            outFeatures[fi++] = futureVelRootSpace.x;
-            outFeatures[fi++] = futureVelRootSpace.z;
+            // Transform to magic space for feature output
+            const Vector3 futureVelMagicSpace = Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
+            outFeatures[fi++] = futureVelMagicSpace.x;
+            outFeatures[fi++] = futureVelMagicSpace.z;
         }
     }
 
-    // FutureVelClamped: predicted velocity clamped to max magnitude (XZ in root space)
+    // FutureVelClamped: predicted velocity clamped to max magnitude (XZ in magic space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped))
     {
         constexpr float MaxFutureVelClampedMag = 1.0f;
 
         for (int p = 0; p < (int)futureVelocities.size(); ++p)
         {
-            const Vector3 futureVelRootSpace = Vector3RotateByQuaternion(futureVelocities[p], invHipYaw);
+            const Vector3 futureVelMagicSpace = Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
 
             // Clamp to max magnitude
-            Vector3 clampedVel = futureVelRootSpace;
-            const float mag = Vector3Length(futureVelRootSpace);
+            Vector3 clampedVel = futureVelMagicSpace;
+            const float mag = Vector3Length(futureVelMagicSpace);
             if (mag > MaxFutureVelClampedMag)
             {
-                clampedVel = Vector3Scale(futureVelRootSpace, MaxFutureVelClampedMag / mag);
+                clampedVel = Vector3Scale(futureVelMagicSpace, MaxFutureVelClampedMag / mag);
             }
 
             outFeatures[fi++] = clampedVel.x;
@@ -206,7 +202,7 @@ static void ComputeMotionFeatures(
     }
 
 
-    // PastPosition: past hip position in current hip horizontal frame (XZ)
+    // PastPosition: past magic position in current magic horizontal frame (XZ)
     if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
     {
         Vector3 pastPosLocal = Vector3Zero();
@@ -233,17 +229,17 @@ static void ComputeMotionFeatures(
 
             if (bestIdx >= 0)
             {
-                const Vector3 pastHipPos = cc->positionHistory[bestIdx].position;
+                // Past position is stored as world magic anchor position
+                const Vector3 pastMagicPos = cc->positionHistory[bestIdx].position;
 
-                // Use current world hip position (from character world transform)
-                // cc->worldPosition is the root, hipPos is already in world space
-                const Vector3 currentWorldHipPos = hipPos;
+                // Current world magic position
+                const Vector3 currentWorldMagicPos = magicPos;
 
-                // Compute vector from current hip to past hip
-                const Vector3 hipToPastHip = Vector3Subtract(pastHipPos, currentWorldHipPos);
+                // Compute vector from current magic to past magic
+                const Vector3 magicToPastMagic = Vector3Subtract(pastMagicPos, currentWorldMagicPos);
 
-                // Transform to current hip horizontal frame
-                pastPosLocal = Vector3RotateByQuaternion(hipToPastHip, invHipYaw);
+                // Transform to current magic horizontal frame
+                pastPosLocal = Vector3RotateByQuaternion(magicToPastMagic, invMagicWorldRot);
             }
             // else: no history available yet, leave as zero
         }
@@ -255,7 +251,6 @@ static void ComputeMotionFeatures(
 
     assert(fi == db->featureDim);
 }
-
 // Compute squared L2 distance between two feature vectors
 static inline float ComputeFeatureDistance(
     const std::vector<float>& query,

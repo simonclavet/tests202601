@@ -97,6 +97,14 @@ target_link_libraries(Flomo PRIVATE
     c10_cuda
 )
 
+# Conditionally link tiny-cuda-nn
+if(USE_TINY_CUDA_NN)
+    target_link_libraries(Flomo PRIVATE
+        tiny-cuda-nn
+        curand
+    )
+endif()
+
 # Windows needs some extra system libraries
 if(WIN32)
     target_link_libraries(Flomo PRIVATE opengl32 gdi32 winmm)
@@ -107,7 +115,17 @@ target_compile_definitions(Flomo PRIVATE
     _CRT_SECURE_NO_WARNINGS
     SOURCE_ROOT_PATH="${CMAKE_SOURCE_DIR}"
     NOMINMAX
+    _USE_MATH_DEFINES
 )
+
+# tiny-cuda-nn specific definitions
+if(USE_TINY_CUDA_NN)
+    target_compile_definitions(Flomo PRIVATE
+        USE_TINY_CUDA_NN
+        TCNN_CMAKE_BUILD
+        FMT_USE_UTF8
+    )
+endif()
 
 # Visual Studio specific settings
 if(MSVC)

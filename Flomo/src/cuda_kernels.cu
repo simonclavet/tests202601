@@ -1,6 +1,10 @@
 #include <iostream>
 #include <cuda_runtime.h>
 
+#ifdef USE_TINY_CUDA_NN
+#include <tiny-cuda-nn/common.h>
+#endif
+
 // Simple CUDA kernel that adds two arrays
 __global__ void add_arrays(const float* a, const float* b, float* c, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -44,4 +48,16 @@ extern "C" void cuda_check_error(const char* msg) {
         std::cerr << "CUDA Error (" << msg << "): "
             << cudaGetErrorString(err) << std::endl;
     }
+}
+
+// Test tiny-cuda-nn availability
+extern "C" void test_tiny_cuda_nn() {
+#ifdef USE_TINY_CUDA_NN
+    std::cout << "\n--- tiny-cuda-nn test ---" << std::endl;
+    std::cout << "tiny-cuda-nn MIN_GPU_ARCH: " << TCNN_MIN_GPU_ARCH << std::endl;
+    std::cout << "tiny-cuda-nn is available and linked!" << std::endl;
+#else
+    std::cout << "\n--- tiny-cuda-nn test ---" << std::endl;
+    std::cout << "tiny-cuda-nn is DISABLED (USE_TINY_CUDA_NN not defined)" << std::endl;
+#endif
 }

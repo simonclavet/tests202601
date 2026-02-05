@@ -49,14 +49,14 @@ static void ControlledCharacterInit(
     // Initialize transform buffers
     TransformDataInit(&cc->xformData);
     TransformDataResize(&cc->xformData, skeleton);
-    TransformDataInit(&cc->xformTmp0);
-    TransformDataResize(&cc->xformTmp0, skeleton);
-    TransformDataInit(&cc->xformTmp1);
-    TransformDataResize(&cc->xformTmp1, skeleton);
-    TransformDataInit(&cc->xformTmp2);
-    TransformDataResize(&cc->xformTmp2, skeleton);
-    TransformDataInit(&cc->xformTmp3);
-    TransformDataResize(&cc->xformTmp3, skeleton);
+    //TransformDataInit(&cc->xformTmp0);
+    //TransformDataResize(&cc->xformTmp0, skeleton);
+    //TransformDataInit(&cc->xformTmp1);
+    //TransformDataResize(&cc->xformTmp1, skeleton);
+    //TransformDataInit(&cc->xformTmp2);
+    //TransformDataResize(&cc->xformTmp2, skeleton);
+    //TransformDataInit(&cc->xformTmp3);
+    //TransformDataResize(&cc->xformTmp3, skeleton);
 
     // Initialize pre-IK debug transform buffer
     TransformDataInit(&cc->xformBeforeIK);
@@ -475,11 +475,10 @@ static void ControlledCharacterUpdate(
         cur.prevLocalRootPos = sampledRootPos;
         cur.prevLocalRootRot6d = sampledRootRot6d;
 
-        // Strip yaw from root rotation BEFORE blending to avoid Rot6d singularity
-        // when blending anims facing opposite directions.
-        // Problem: Rot6d averaging of 0 and 180 yaw gives a zero-length vector.
-        // Solution: blend hip "tilt/roll relative to heading" instead of absolute rotation.
-        Rot6dRemoveYComponent(cur.localRotations6d[0], cur.localRotations6d[0]);
+        // NOTE: We no longer strip yaw from hip rotation here because:
+        // localRotations6d[0] is now stored relative to Magic anchor in the database,
+        // which means it's already yaw-free (Magic has the yaw, hip is relative to it).
+        // This avoids the Rot6d singularity when blending anims facing opposite directions.
 
         // deactivate tiny-weight cursors
         if (cur.weightSpring.x <= 1e-4f && cur.targetWeight <= 1e-4f)
@@ -562,8 +561,9 @@ static void ControlledCharacterUpdate(
     if (true)
     {
         // ===== MAGIC ANCHOR ROOT MOTION =====
-        // Blend magic velocities from cursors (instead of hip velocities)
-        Vector3 blendedMagicVelocity = Vector3Zero();
+        // Blend magic velocities from cursors in magic space (root space)
+        // All cursors' velocities are in the same local frame, so blend first, then transform
+        Vector3 blendedMagicVelocityMagicSpace = Vector3Zero();
         float blendedMagicYawRate = 0.0f;
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
@@ -573,23 +573,25 @@ static void ControlledCharacterUpdate(
             const float w = cur.normalizedWeight;
             if (w <= 1e-6f) continue;
 
-            // Transform magic velocity from magic space to world space
-            const Vector3 magicVelWorld = Vector3RotateByQuaternion(
-                cur.sampledMagicVelocity, cc->magicWorldRotation);
-
-            blendedMagicVelocity = Vector3Add(blendedMagicVelocity, Vector3Scale(magicVelWorld, w));
+            // Blend in magic space (root space)
+            blendedMagicVelocityMagicSpace = Vector3Add(blendedMagicVelocityMagicSpace,
+                Vector3Scale(cur.sampledMagicVelocity, w));
             blendedMagicYawRate += cur.sampledMagicYawRate * w;
         }
 
-        // Normalize
-        const Vector3 finalMagicVelocity = Vector3Scale(blendedMagicVelocity, 1.0f / totalRootWeight);
-        const float finalMagicYawRate = blendedMagicYawRate / totalRootWeight;
+        // Transform blended velocity from magic space to world space
+        const Vector3 blendedMagicVelocity = Vector3RotateByQuaternion(
+            blendedMagicVelocityMagicSpace, cc->magicWorldRotation);
 
-        // For lookahead dragging mode, blend lookahead magic velocities
+        // Normalize
+        //const Vector3 finalMagicVelocity = Vector3Scale(blendedMagicVelocity, 1.0f / totalRootWeight);
+
+        // For lookahead dragging mode, blend lookahead magic velocities in magic space first
         Vector3 blendedLookaheadMagicVelocity = Vector3Zero();
         float blendedLookaheadMagicYawRate = 0.0f;
         if (cc->cursorBlendMode == CursorBlendMode::LookaheadDragging)
         {
+            Vector3 blendedLookaheadMagicVelocityMagicSpace = Vector3Zero();
             for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
             {
                 const BlendCursor& cur = cc->cursors[ci];
@@ -597,22 +599,24 @@ static void ControlledCharacterUpdate(
                 const float w = cur.normalizedWeight;
                 if (w <= 1e-6f) continue;
 
-                const Vector3 lookaheadMagicVelWorld = Vector3RotateByQuaternion(
-                    cur.sampledLookaheadMagicVelocity, cc->magicWorldRotation);
-
-                blendedLookaheadMagicVelocity = Vector3Add(blendedLookaheadMagicVelocity,
-                    Vector3Scale(lookaheadMagicVelWorld, w));
+                // Blend in magic space (root space)
+                blendedLookaheadMagicVelocityMagicSpace = Vector3Add(blendedLookaheadMagicVelocityMagicSpace,
+                    Vector3Scale(cur.sampledLookaheadMagicVelocity, w));
                 blendedLookaheadMagicYawRate += cur.sampledLookaheadMagicYawRate * w;
             }
-            blendedLookaheadMagicVelocity = Vector3Scale(blendedLookaheadMagicVelocity, 1.0f / totalRootWeight);
+            blendedLookaheadMagicVelocityMagicSpace = Vector3Scale(blendedLookaheadMagicVelocityMagicSpace, 1.0f / totalRootWeight);
             blendedLookaheadMagicYawRate /= totalRootWeight;
+
+            // Transform blended velocity from magic space to world space
+            blendedLookaheadMagicVelocity = Vector3RotateByQuaternion(
+                blendedLookaheadMagicVelocityMagicSpace, cc->magicWorldRotation);
         }
 
         // Initialize magic anchor on first frame
         if (!cc->magicAnchorInitialized)
         {
-            cc->smoothedMagicVelocity = finalMagicVelocity;
-            cc->smoothedMagicYawRate = finalMagicYawRate;
+            cc->smoothedMagicVelocity = blendedMagicVelocity;
+            cc->smoothedMagicYawRate = blendedMagicYawRate;
             cc->magicAnchorInitialized = true;
         }
 
@@ -647,8 +651,8 @@ static void ControlledCharacterUpdate(
         {
             if (!cc->lookaheadMagicVelocityInitialized)
             {
-                cc->lookaheadDragMagicVelocity = finalMagicVelocity;
-                cc->lookaheadDragMagicYawRate = finalMagicYawRate;
+                cc->lookaheadDragMagicVelocity = blendedMagicVelocity;
+                cc->lookaheadDragMagicYawRate = blendedMagicYawRate;
                 cc->lookaheadMagicVelocityInitialized = true;
             }
 
@@ -673,8 +677,8 @@ static void ControlledCharacterUpdate(
         else
         {
             // Basic mode
-            const Vector3 finalMagicDelta = Vector3Scale(finalMagicVelocity, dt);
-            const float finalMagicYawDelta = finalMagicYawRate * dt;
+            const Vector3 finalMagicDelta = Vector3Scale(blendedMagicVelocity, dt);
+            const float finalMagicYawDelta = blendedMagicYawRate * dt;
 
             cc->magicWorldPosition = Vector3Add(cc->magicWorldPosition, finalMagicDelta);
             const Quaternion magicYawQ = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, finalMagicYawDelta);
@@ -683,39 +687,18 @@ static void ControlledCharacterUpdate(
             // CRITICAL FIX: Keep only Y component to prevent pitch/roll accumulation
             cc->magicWorldRotation = QuaternionYComponent(cc->magicWorldRotation);
 
-            cc->smoothedMagicVelocity = finalMagicVelocity;
-            cc->smoothedMagicYawRate = finalMagicYawRate;
+            cc->smoothedMagicVelocity = blendedMagicVelocity;
+            cc->smoothedMagicYawRate = blendedMagicYawRate;
         }
 
-        // Place skeleton (hip) relative to magic anchor
-        Vector3 blendedHipPosInMagicSpace = Vector3Zero();
-        Rot6d blendedHipRotInMagicSpace = Rot6dZero();
-
-        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
-        {
-            const BlendCursor& cur = cc->cursors[ci];
-            if (!cur.active) continue;
-            const float w = cur.normalizedWeight;
-            if (w <= 1e-6f) continue;
-
-            blendedHipPosInMagicSpace = Vector3Add(blendedHipPosInMagicSpace,
-                Vector3Scale(cur.sampledHipPositionInMagicSpace, w));
-            Rot6dScaledAdd(w, cur.sampledHipRotationInMagicSpace, blendedHipRotInMagicSpace);
-        }
-        Rot6dNormalize(blendedHipRotInMagicSpace);
-
-        // Transform hip position from magic space to world space
-        // IMPORTANT: magicWorldRotation must be PURE YAW (no pitch/roll) for Y to pass through unchanged
-        const Vector3 hipOffsetWorld = Vector3RotateByQuaternion(
-            blendedHipPosInMagicSpace, cc->magicWorldRotation);
-        cc->worldPosition = Vector3Add(cc->magicWorldPosition, hipOffsetWorld);
-
-        // Transform hip rotation from magic space to world space
-        Quaternion hipRotRelativeToMagic;
-        Rot6dToQuaternion(blendedHipRotInMagicSpace, hipRotRelativeToMagic);
-
-        // Set worldRotation to full hip rotation (magic yaw + hip tilt/roll)
-        cc->worldRotation = QuaternionMultiply(cc->magicWorldRotation, hipRotRelativeToMagic);
+        // Hip is now "just another bone" - localPositions[0] and localRotations[0] contain
+        // the hip transform relative to Magic anchor (from blending the database values).
+        //
+        // worldPosition/worldRotation just need to be set to the Magic anchor's world transform.
+        // FK will handle hip offset/rotation via localPositions[0]/localRotations[0].
+        // We no longer need to zero localPositions[0].xz since that offset is part of the pose.
+        cc->worldPosition = cc->magicWorldPosition;
+        cc->worldRotation = cc->magicWorldRotation;
 
         // Update smoothedRootVelocity for compatibility
         cc->smoothedRootVelocity = cc->smoothedMagicVelocity;
@@ -914,9 +897,7 @@ static void ControlledCharacterUpdate(
             {
                 Rot6dToQuaternion(blendedRot6d[j], cc->xformBasicBlend.localRotations[j]);
             }
-            // Zero out root XZ translation
-            cc->xformBasicBlend.localPositions[0].x = 0.0f;
-            cc->xformBasicBlend.localPositions[0].z = 0.0f;
+            // NOTE: No longer zeroing root XZ - hip position is relative to Magic anchor
             // FK
             TransformDataForwardKinematics(&cc->xformBasicBlend);
             // Transform to world space
@@ -1135,10 +1116,10 @@ static void ControlledCharacterUpdate(
     cc->prevRootPosition = currentRootPos;
     cc->prevRootRotation = currentRootRot;
 
-    // Zero out root translation XZ for rendering
-    cc->xformData.localPositions[0].x = 0.0f;
-    cc->xformData.localPositions[0].z = 0.0f;
-    // Note: Y rotation was already stripped from localRotations6d[0] before blending
+    // NOTE: We no longer zero localPositions[0].xz because:
+    // - Hip is now stored relative to Magic anchor in the database
+    // - worldPosition = magicWorldPosition (at Y=0)
+    // - The hip's XZ offset from Magic is part of the pose, not root motion
 
     // Forward kinematics (local space)
     TransformDataForwardKinematics(&cc->xformData);
@@ -1165,10 +1146,7 @@ static void ControlledCharacterUpdate(
             Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
         }
 
-        // Zero out root XZ translation
-        // Note: Y rotation was already stripped from localRotations6d[0] earlier
-        cur.globalPositions[0].x = 0.0f;
-        cur.globalPositions[0].z = 0.0f;
+        // NOTE: No longer zeroing root XZ - hip position is relative to Magic anchor
 
         // Forward kinematics
         for (int j = 1; j < jc; ++j)
