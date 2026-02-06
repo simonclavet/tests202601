@@ -618,7 +618,7 @@ void Rot6dFromMatrix(const Matrix& mat, Rot6d& outRot)
     outRot.bx = mat.m4; outRot.by = mat.m5; outRot.bz = mat.m6;
 }
 
-void Rot6dLerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
+Rot6d Rot6dLerp(const Rot6d& start, const Rot6d& end, float t)
 {
     const float invT = 1.0f - t;
 
@@ -645,13 +645,23 @@ void Rot6dLerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
     // Normalize b-column
     const float invLenB = FastInvSqrt(rbx * rbx + rby * rby + rbz * rbz);
 
-    // Write all results at once (safe for aliasing)
-    out.ax = ax;
-    out.ay = ay;
-    out.az = az;
-    out.bx = rbx * invLenB;
-    out.by = rby * invLenB;
-    out.bz = rbz * invLenB;
+    return Rot6d{ ax, ay, az, rbx * invLenB, rby * invLenB, rbz * invLenB };
+}
+
+// Frame interpolation helpers - given pointer to arr[f0], lerp with arr[f0+1]
+static inline Vector3 LerpFrames(const Vector3* base, float alpha)
+{
+    return Vector3Lerp(base[0], base[1], alpha);
+}
+
+static inline float LerpFrames(const float* base, float alpha)
+{
+    return Lerp(base[0], base[1], alpha);
+}
+
+static inline Rot6d LerpFrames(const Rot6d* base, float alpha)
+{
+    return Rot6dLerp(base[0], base[1], alpha);
 }
 
 // Rot6d scaled addition: inout = a*x + inout (like BLAS axpy)

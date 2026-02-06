@@ -25,7 +25,6 @@ static inline const char* AnimationModeName(AnimationMode mode)
 enum class CursorBlendMode : int
 {
     Basic = 0,           // direct weighted average of cursor rotations
-    VelBlending,         // velocity-driven blending with lerp to target
     LookaheadDragging,   // lerp towards extrapolated future pose
     COUNT
 };
@@ -35,7 +34,7 @@ static inline const char* CursorBlendModeName(CursorBlendMode mode)
     switch (mode)
     {
     case CursorBlendMode::Basic: return "Basic";
-    case CursorBlendMode::VelBlending: return "Vel Blending";
+
     case CursorBlendMode::LookaheadDragging: return "Lookahead Dragging";
     default: return "Unknown";
     }
@@ -47,10 +46,11 @@ enum class FeatureType : int
     ToePos = 0,          // left+right toe positions (X,Z) => 4 dims
     ToeVel,              // left+right toe velocities (X,Z) => 4 dims
     ToeDiff,             // left-right difference (X,Z) => 2 dims
-    FutureVel,        // future root velocity (XZ) at sample points => 2 * points
+    FutureVel,           // future root velocity (XZ) at sample points => 2 * points
     FutureVelClamped,    // future root velocity clamped to max magnitude (XZ) => 2 * points
     FutureSpeed,         // future root speed (scalar) at sample points => 1 * points
     PastPosition,        // past hip position (XZ) in current hip horizontal frame => 2 dims
+    AimDirection,        // aim direction (head→rightHand) at trajectory times => 2 * points
 
     COUNT                // Must be last - used for array sizing
 };
@@ -67,6 +67,43 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::FutureVelClamped: return "Future Vel Clamped";
     case FeatureType::FutureSpeed: return "Future Speed";
     case FeatureType::PastPosition: return "Past Position";
+    case FeatureType::AimDirection: return "Aim Direction";
+    default: return "Unknown";
+    }
+}
+
+// Blend root mode for position (which point to use as character root for blending)
+enum class BlendRootModePosition : int
+{
+    Hips = 0,
+    CenterOfMass,
+    COUNT
+};
+
+static inline const char* BlendRootModePositionName(BlendRootModePosition mode)
+{
+    switch (mode)
+    {
+    case BlendRootModePosition::Hips: return "Hips";
+    case BlendRootModePosition::CenterOfMass: return "Center of Mass";
+    default: return "Unknown";
+    }
+}
+
+// Blend root mode for rotation (how to compute character facing direction)
+enum class BlendRootModeRotation : int
+{
+    Hips = 0,
+    HeadToRightHand,
+    COUNT
+};
+
+static inline const char* BlendRootModeRotationName(BlendRootModeRotation mode)
+{
+    switch (mode)
+    {
+    case BlendRootModeRotation::Hips: return "Hips";
+    case BlendRootModeRotation::HeadToRightHand: return "Head to Right Hand";
     default: return "Unknown";
     }
 }
@@ -172,9 +209,11 @@ struct AppConfig {
     bool drawPlayerInput = false;
 
     // Motion Matching Configuration, version that is editable: those are copied to AnimDatabase on build
-    MotionMatchingFeaturesConfig mmConfigEditor; 
+    MotionMatchingFeaturesConfig mmConfigEditor;
     float poseDragLookaheadTimeEditor = 0.1f;  // lookahead time for pose dragging (seconds)
     float lookaheadExtrapolationMult = 1.0f;   // multiplier for extrapolation factor (1.0 = exact, >1 = overshoot)
+    BlendRootModePosition blendRootModePositionEditor = BlendRootModePosition::Hips;
+    BlendRootModeRotation blendRootModeRotationEditor = BlendRootModeRotation::Hips;
 
 
     // Validity
@@ -182,10 +221,11 @@ struct AppConfig {
 };
 
 
-struct PlayerControlInput 
+struct PlayerControlInput
 {
     Vector3 desiredVelocity = Vector3Zero();  // Desired velocity in world space (XZ plane)
-    float maxSpeed = 2.0f;                     // Maximum movement speed (m/s)
+    float maxSpeed = 2.0f;                    // Maximum movement speed (m/s)
+    Vector3 desiredAimDirection = { 0.0f, 0.0f, 1.0f };  // Desired aim direction (world space XZ, unit length)
 };
 
 
@@ -202,6 +242,10 @@ struct AnimDatabase
 
     // Pose drag lookahead time (seconds) - used for precomputing lookahead poses
     float poseDragLookaheadTime = 0.1f;
+
+    // Blend root mode settings (copied from editor on rebuild)
+    BlendRootModePosition blendRootModePosition = BlendRootModePosition::Hips;
+    BlendRootModeRotation blendRootModeRotation = BlendRootModeRotation::Hips;
 
     // References to all loaded animations
     int animCount = -1;
@@ -472,13 +516,11 @@ struct BlendCursor {
     float lastDeltaYaw;          // Yaw delta this frame (radians)
 
     // Root motion velocity tracking (for acceleration-based blending)
-    Vector3 rootVelocity = Vector3Zero();    // current root velocity (world space)
+    Vector3 rootVelocityWorldForDisplayOnly = Vector3Zero();    // current root velocity (world space)
     float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
-    Vector3 prevRootVelocity = Vector3Zero(); // previous frame's velocity
-    float prevRootYawRate = 0.0f;            // previous frame's yaw rate
 
     // Toe velocities for foot IK (world space, transformed from root space)
-    Vector3 toeVelocityWorld[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
+    Vector3 toeVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
 };
 
 
@@ -510,9 +552,7 @@ struct ControlledCharacter {
     int animIndex;             // Which loaded animation to play from
     float animTime;            // Current playback time in that animation
 
-    // For computing root motion deltas between frames
-    Vector3 prevRootPosition;
-    Quaternion prevRootRotation;
+
 
     // Random switch timer (used by RandomSwitch mode)
     float switchTimer;
@@ -524,10 +564,7 @@ struct ControlledCharacter {
 
     // Pose output (local space with root zeroed, then transformed to world)
     TransformData xformData;
-    //TransformData xformTmp0;
-    //TransformData xformTmp1;
-    //TransformData xformTmp2;
-    //TransformData xformTmp3;
+
 
     // Pre-IK FK state for debugging (saved before IK is applied)
     TransformData xformBeforeIK;
@@ -563,9 +600,7 @@ struct ControlledCharacter {
     CursorBlendMode cursorBlendMode = CursorBlendMode::Basic;
     float blendPosReturnTime = 0.1f;       // time for velblending to lerp towards target
 
-    // VelBlending state
-    std::vector<Rot6d> velBlendedRotations6d;       // [jointCount] - smoothed rotations
-    bool velBlendInitialized = false;
+
 
     // LookaheadDragging state
     std::vector<Rot6d> lookaheadDragPose6d;         // running pose state for lookahead dragging
@@ -579,15 +614,12 @@ struct ControlledCharacter {
     Rot6d lookaheadDragHipRotationYawFree = Rot6dIdentity();
     bool lookaheadDragHipRotationInitialized = false;
 
-    // Lookahead root motion velocity state
-    Vector3 lookaheadDragVelocity = Vector3Zero();   // running velocity state for lookahead dragging (world space)
-    float lookaheadDragYawRate = 0.0f;               // running yaw rate for lookahead dragging (rad/s)
-    bool lookaheadVelocityInitialized = false;
+
 
     // Smoothed root motion state
     Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
     float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
-    bool rootMotionInitialized = false;
+
 
     // Magic anchor system - alternative reference frame for blending
     Vector3 magicWorldPosition = Vector3Zero();    // Magic anchor position in world

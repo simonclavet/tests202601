@@ -913,11 +913,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             }
             ImGui::EndCombo();
         }
-        if (config->cursorBlendMode == CursorBlendMode::VelBlending)
-        {
-            ImGui::SliderFloat("Return Blend Time", &config->blendPosReturnTime, 0.01f, 1.0f, "%.2f s");
-        }
-        else if (config->cursorBlendMode == CursorBlendMode::LookaheadDragging)
+        if (config->cursorBlendMode == CursorBlendMode::LookaheadDragging)
         {
             ImGui::SetNextItemWidth(80);
             if (ImGui::InputFloat("Lookahead Time", &config->poseDragLookaheadTimeEditor, 0.0f, 0.0f, "%.3f"))
@@ -1047,6 +1043,46 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             configChanged = true;
         }
 
+        ImGui::Separator();
+
+        // Blend Root Mode Position
+        ImGui::Text("Root Position Mode:");
+        ImGui::SameLine(180);
+        if (ImGui::BeginCombo("##rootPosMode", BlendRootModePositionName(config->blendRootModePositionEditor)))
+        {
+            for (int i = 0; i < static_cast<int>(BlendRootModePosition::COUNT); ++i)
+            {
+                const BlendRootModePosition mode = static_cast<BlendRootModePosition>(i);
+                const bool isSelected = (config->blendRootModePositionEditor == mode);
+                if (ImGui::Selectable(BlendRootModePositionName(mode), isSelected))
+                {
+                    config->blendRootModePositionEditor = mode;
+                    configChanged = true;
+                }
+                if (isSelected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        // Blend Root Mode Rotation
+        ImGui::Text("Root Rotation Mode:");
+        ImGui::SameLine(180);
+        if (ImGui::BeginCombo("##rootRotMode", BlendRootModeRotationName(config->blendRootModeRotationEditor)))
+        {
+            for (int i = 0; i < static_cast<int>(BlendRootModeRotation::COUNT); ++i)
+            {
+                const BlendRootModeRotation mode = static_cast<BlendRootModeRotation>(i);
+                const bool isSelected = (config->blendRootModeRotationEditor == mode);
+                if (ImGui::Selectable(BlendRootModeRotationName(mode), isSelected))
+                {
+                    config->blendRootModeRotationEditor = mode;
+                    configChanged = true;
+                }
+                if (isSelected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
         if (configChanged)
         {
             // Mark for rebuild (don't rebuild on every keypress)
@@ -1164,6 +1200,9 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
             ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
+
+            app->animDatabase.featuresConfig = app->config.mmConfigEditor;
+            app->animDatabase.poseDragLookaheadTime = app->config.poseDragLookaheadTimeEditor;
 
             // Rebuild animation database
             AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
@@ -1591,7 +1630,39 @@ static void ApplicationUpdate(void* voidApplicationState)
             Vector3Scale(forward, inputDir.y));
 
         input.desiredVelocity = Vector3Scale(worldDir, input.maxSpeed);
-    
+
+        // Aim direction from right stick (or camera direction when zero)
+        Vector2 aimInput = Vector2Zero();
+        if (IsGamepadAvailable(0))
+        {
+            const float rightX = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_X);
+            const float rightY = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_Y);
+
+            const float deadzone = 0.15f;
+            if (fabsf(rightX) > deadzone || fabsf(rightY) > deadzone)
+            {
+                aimInput.x = rightX;
+                aimInput.y = -rightY;  // invert Y
+            }
+        }
+
+        if (Vector2Length(aimInput) > 0.01f)
+        {
+            // Right stick has input: use it for aim direction (camera-relative)
+            const Vector3 aimWorldDir = Vector3Add(
+                Vector3Scale(right, aimInput.x),
+                Vector3Scale(forward, aimInput.y));
+            const float aimLen = Vector3Length(aimWorldDir);
+            if (aimLen > 1e-6f)
+            {
+                input.desiredAimDirection = Vector3Scale(aimWorldDir, 1.0f / aimLen);
+            }
+        }
+        else
+        {
+            // No right stick input: use camera forward direction (horizontal)
+            input.desiredAimDirection = forward;
+        }
     }
 
 
@@ -2089,7 +2160,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             // draw from character's world position (all cursors share same world pos)
             const Vector3 startPos = Vector3Add(cc.worldPosition, Vector3{ 0.0f, yOffset * (ci + 1), 0.0f });
-            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cur.rootVelocity, velScale));
+            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cur.rootVelocityWorldForDisplayOnly, velScale));
 
             const Color col = cursorColors[ci];
             DrawLine3D(startPos, endPos, col);
@@ -2421,6 +2492,28 @@ static void ApplicationUpdate(void* voidApplicationState)
             DrawLine3D(endPos, arrowTip1, PURPLE);
             DrawLine3D(endPos, arrowTip2, PURPLE);
             DrawSphere(endPos, 0.03f, PURPLE);
+        }
+
+        // Draw aim direction arrow (orange, from magic anchor)
+        {
+            const Vector3 aimStart = Vector3{
+                app->controlledCharacter.magicWorldPosition.x,
+                1.5f,  // draw at head height
+                app->controlledCharacter.magicWorldPosition.z
+            };
+            const Vector3 aimEnd = Vector3Add(aimStart, input.desiredAimDirection);
+
+            DrawLine3D(aimStart, aimEnd, ORANGE);
+
+            // Draw arrowhead
+            const Vector3 aimDir = input.desiredAimDirection;
+            const Vector3 aimRight = Vector3{ -aimDir.z, 0.0f, aimDir.x };
+            const float arrowSize = 0.1f;
+            const Vector3 aimTip1 = Vector3Add(aimEnd, Vector3Scale(Vector3Subtract(Vector3Scale(aimDir, -1.0f), aimRight), arrowSize));
+            const Vector3 aimTip2 = Vector3Add(aimEnd, Vector3Scale(Vector3Add(Vector3Scale(aimDir, -1.0f), aimRight), arrowSize));
+            DrawLine3D(aimEnd, aimTip1, ORANGE);
+            DrawLine3D(aimEnd, aimTip2, ORANGE);
+            DrawSphere(aimEnd, 0.025f, ORANGE);
         }
     }
 
@@ -3154,6 +3247,9 @@ int main(int argc, char** argv)
         CapsuleDataUpdateForCharacters(&app.capsuleData, &app.characterData);
         ScrubberSettingsRecomputeLimits(&app.scrubberSettings, &app.characterData);
         ScrubberSettingsInitMaxs(&app.scrubberSettings, &app.characterData);
+
+        app.animDatabase.featuresConfig = app.config.mmConfigEditor;
+        app.animDatabase.poseDragLookaheadTime = app.config.poseDragLookaheadTimeEditor;
 
         // Build animation database and initialize controlled character
         AnimDatabaseRebuild(&app.animDatabase, &app.characterData);

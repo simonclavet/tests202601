@@ -249,6 +249,24 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = pastPosLocal.z;
     }
 
+    // AimDirection: desired aim direction at future trajectory times (in magic-local frame)
+    // Same desired aim is used for all time points (user confirmed)
+    if (cfg.IsFeatureEnabled(FeatureType::AimDirection))
+    {
+        // Get desired aim from player input (world space, already unit length)
+        const Vector3 desiredAimWorld = input->desiredAimDirection;
+
+        // Transform to magic-local frame
+        const Vector3 desiredAimLocal = Vector3RotateByQuaternion(desiredAimWorld, invMagicWorldRot);
+
+        // Store the same aim direction for each trajectory time point
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            outFeatures[fi++] = desiredAimLocal.x;
+            outFeatures[fi++] = desiredAimLocal.z;
+        }
+    }
+
     assert(fi == db->featureDim);
 }
 // Compute squared L2 distance between two feature vectors

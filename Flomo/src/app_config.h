@@ -215,6 +215,11 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
         MotionMatchingConfigFromJson(buffer, config.mmConfigEditor);
     }
 
+    // Blend root mode settings
+    config.blendRootModePositionEditor = static_cast<BlendRootModePosition>(
+        ResolveIntConfig(buffer, "blendRootModePosition", static_cast<int>(config.blendRootModePositionEditor), argc, argv));
+    config.blendRootModeRotationEditor = static_cast<BlendRootModeRotation>(
+        ResolveIntConfig(buffer, "blendRootModeRotation", static_cast<int>(config.blendRootModeRotationEditor), argc, argv));
 
     // Validate window values
     if (config.windowX >= 0 && config.windowY >= 0 &&
@@ -308,6 +313,8 @@ static inline void SaveAppConfig(const AppConfig& config)
     std::string mmConfigJson = MotionMatchingConfigToJson(config.mmConfigEditor);
     fprintf(file, "  \"motionMatchingConfig\": %s,\n", mmConfigJson.c_str());
     fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", config.poseDragLookaheadTimeEditor);
+    fprintf(file, "    \"blendRootModePosition\": %d,\n", static_cast<int>(config.blendRootModePositionEditor));
+    fprintf(file, "    \"blendRootModeRotation\": %d\n", static_cast<int>(config.blendRootModeRotationEditor));
 
     fprintf(file, "}\n");
 
