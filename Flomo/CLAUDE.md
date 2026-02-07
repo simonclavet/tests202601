@@ -56,25 +56,29 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - Use `float` for all floating-point values (add `f` suffix to literals: `1.0f`)
 - Be const-correct for pointer/reference parameters and local variables
 - C++20 designated initializers are OK
-- Keep code in single files when practical
-code you write.
-When possible initialize variables directly when defining them in the struct definition instead of in the init function or constructor.
-Function names are CamelCase, variable and member names are camelCase. constexpr for CONSTANTS
-don't use auto unless absolutely necessary.
-don't use lambdas
-be const correct for functions and function parameters (except simple parameter values). 
-be const correct for local variable: if a variable is not modified after initialization, make it const.
-don't create unused variables
-When an argument is modified as the result, prefix the argument with /*out*/ if it is not obvious.
-never modify non-const value arguments of functions.
-don't use pairs and tuples, make small structs instead
-don't use smart pointers
-don't use complicated oop concepts like inheritance and polymorphism, unless absolutely necessary
-don't use exceptions, use assertions defensively. Don't use the keyword noexcept, catch, try, unless absolutely necessary
-use linebreaks before opening braces for functions and control blocks, always use braces for if/for/while, except when it is verysimple single-line statements
-when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
-no need for private and public. Use structs only
-Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
+- Keep code in single files when practical code you write.
+- When possible initialize variables directly when defining them in the struct definition instead of in the init function or constructor.
+- Function names are CamelCase, variable and member names are camelCase. constexpr for CONSTANTS
+- Don't use auto unless absolutely necessary.
+- Don't use lambdas
+- Be const correct for functions and function parameters (except simple parameter values). 
+- bBe const correct for local variable: if a variable is not modified after initialization, make it const.
+- Don't create unused variables
+- When an argument is modified as the result, prefix the argument with /*out*/ or /*inout*/ if it is not obvious.
+- Never modify non-const value arguments of functions.
+- don't use pairs and tuples, make small structs instead
+- don't use smart pointers
+- don't use complicated oop concepts like inheritance and polymorphism, unless absolutely necessary
+- don't use exceptions, use assertions defensively. Don't use the keyword noexcept, catch, try, unless absolutely necessary
+- use linebreaks before opening braces for functions and control blocks, always use braces for if/for/while, except when it is verysimple single-line statements
+- when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
+- no need for private and public. Use structs only, unless when we really want to.
+- I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
+- And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important
+things, that is called only once from an other important function that does important things.
+Important and complicated things should not be hidden, they should be there, in plain sight,
+showing what they are doing. 
+- Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
 ask questions to the human if unsure about anything. Don't assume things, ask instead.
 be casual when conversing with the human. We want to have fun coding together. 
 

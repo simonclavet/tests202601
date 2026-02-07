@@ -50,6 +50,7 @@ extern "C" void cuda_check_error(const char* msg) {
     }
 }
 
+
 // Test tiny-cuda-nn availability
 extern "C" void test_tiny_cuda_nn() {
 #ifdef USE_TINY_CUDA_NN

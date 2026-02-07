@@ -73,7 +73,7 @@ static void ComputeMotionFeatures(
     if (cc == nullptr) return;
 
     const TransformData* xform = &cc->xformBeforeIK;
-    const Vector3* toeVelocity = cc->toeVelocityPreIK;
+    const Vector3* toeVelocity = cc->toeBlendedVelocityWorld;
     const PlayerControlInput* input = &cc->playerInput;
 
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
@@ -85,8 +85,8 @@ static void ComputeMotionFeatures(
     }
 
     // Use the already-computed magic anchor from controlled character (no need to recompute from arms)
-    const Vector3 magicPos = cc->magicWorldPosition;
-    const Quaternion magicWorldRot = cc->magicWorldRotation;
+    const Vector3 magicPos = cc->worldPosition;
+    const Quaternion magicWorldRot = cc->worldRotation;
 
     // Extract yaw from magic world rotation for transforming to magic-local frame
     const Quaternion invMagicWorldRot = QuaternionInvert(magicWorldRot);

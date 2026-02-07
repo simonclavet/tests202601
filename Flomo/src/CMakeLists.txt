@@ -99,10 +99,18 @@ target_link_libraries(Flomo PRIVATE
 
 # Conditionally link tiny-cuda-nn
 if(USE_TINY_CUDA_NN)
-    target_link_libraries(Flomo PRIVATE
-        tiny-cuda-nn
-        curand
-    )
+    # Link the library but prevent its includes from polluting our build
+    target_link_libraries(Flomo PRIVATE tiny-cuda-nn curand)
+
+    # Get tinycudann's include directories and mark them as SYSTEM to isolate them
+    get_target_property(TCNN_INCLUDES tiny-cuda-nn INTERFACE_INCLUDE_DIRECTORIES)
+    if(TCNN_INCLUDES)
+        target_include_directories(Flomo SYSTEM PRIVATE ${TCNN_INCLUDES})
+        # Remove them from being auto-added by the link
+        set_target_properties(tiny-cuda-nn PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES ""
+        )
+    endif()
 endif()
 
 # Windows needs some extra system libraries

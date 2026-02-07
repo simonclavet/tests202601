@@ -264,3 +264,6 @@ if (Test-Path $releaseDir) {
 Write-Host ""
 Write-Host "All dependencies ready!" -ForegroundColor Green
 Write-Host "Run configure.bat to generate the Visual Studio solution." -ForegroundColor Cyan
+
+# Return to Flomo directory
+Set-Location $scriptDir

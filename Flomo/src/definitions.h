@@ -287,6 +287,7 @@ struct AnimDatabase
 
     // lookahead pose for inertial dragging
     Array2D<Rot6d> lookaheadLocalRotations;         // [motionFrameCount x jointCount]
+    Array2D<Vector3> lookaheadLocalPositions;       // [motionFrameCount x jointCount]
 
     // Root motion velocities in root space (heading-relative, XZ only)
     // Velocity at frame f is transformed by inverse of root yaw at frame f
@@ -330,7 +331,7 @@ struct AnimDatabase
     // Magic anchor transforms per frame (position = spine3 on ground, yaw = head→rightHand direction)
     std::vector<Vector3> magicPosition;           // [motionFrameCount] - (spine3.x, 0, spine3.z)
     std::vector<float> magicYaw;                  // [motionFrameCount] - yaw from head→rightHand
-    std::vector<Vector3> magicVelocity;           // [motionFrameCount] - XZ velocity in magic space
+    std::vector<Vector3> magicVelocityRootSpace;           // [motionFrameCount] - XZ velocity in magic space
     std::vector<float> magicYawRate;              // [motionFrameCount] - yaw rate (rad/s)
     std::vector<Vector3> lookaheadMagicVelocity;  // [motionFrameCount] - extrapolated
     std::vector<float> lookaheadMagicYawRate;     // [motionFrameCount] - extrapolated
@@ -338,7 +339,6 @@ struct AnimDatabase
     // Hip transform relative to Magic anchor (for placing skeleton when using Magic root motion)
     std::vector<Vector3> hipPositionInMagicSpace;        // [motionFrameCount] - hip offset from magic, in magic-heading space
     std::vector<Rot6d> hipRotationInMagicSpace;          // [motionFrameCount] - full hip rotation relative to magic yaw
-    std::vector<Rot6d> lookaheadHipRotationInMagicSpace; // [motionFrameCount] - extrapolated for lookahead dragging
     std::vector<std::string> featureNames;
     std::vector<FeatureType> featureTypes;      // which FeatureType each feature dimension belongs to
 
@@ -368,6 +368,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointRotations.clear();
     db->localJointAngularVelocities.clear();
     db->lookaheadLocalRotations.clear();
+    db->lookaheadLocalPositions.clear();
     db->rootMotionVelocitiesRootSpace.clear();
     db->rootMotionYawRates.clear();
     db->lookaheadRootMotionVelocitiesRootSpace.clear();
@@ -377,7 +378,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->lookaheadHipRotationYawFree.clear();
     db->magicPosition.clear();
     db->magicYaw.clear();
-    db->magicVelocity.clear();
+    db->magicVelocityRootSpace.clear();
     db->magicYawRate.clear();
     db->lookaheadMagicVelocity.clear();
     db->lookaheadMagicYawRate.clear();
@@ -472,6 +473,7 @@ struct BlendCursor {
     std::vector<Rot6d> localRotations6d;
     std::vector<Vector3> localAngularVelocities;
     std::vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
+    std::vector<Vector3> lookaheadLocalPositions;  // extrapolated positions for lookahead dragging
 
     // Sampled root motion velocities from database (root space = heading-relative)
     Vector3 sampledRootVelocityRootSpace = Vector3Zero();  // XZ velocity in root space
@@ -482,22 +484,22 @@ struct BlendCursor {
     float sampledLookaheadRootYawRate = 0.0f;                       // lookahead yaw rate (rad/s)
 
     // Sampled Magic anchor velocities (alternative reference frame)
-    Vector3 sampledMagicVelocity = Vector3Zero();          // XZ velocity in magic space
-    float sampledMagicYawRate = 0.0f;                      // yaw rate (rad/s)
-    Vector3 sampledLookaheadMagicVelocity = Vector3Zero(); // lookahead XZ velocity
-    float sampledLookaheadMagicYawRate = 0.0f;             // lookahead yaw rate (rad/s)
+    //Vector3 sampledMagicVelocity = Vector3Zero();          // XZ velocity in magic space
+    //float sampledMagicYawRate = 0.0f;                      // yaw rate (rad/s)
+    //Vector3 sampledLookaheadMagicVelocity = Vector3Zero(); // lookahead XZ velocity
+    //float sampledLookaheadMagicYawRate = 0.0f;             // lookahead yaw rate (rad/s)
 
     // Sampled hip transform relative to Magic anchor (for skeleton placement)
-    Vector3 sampledHipPositionInMagicSpace = Vector3Zero();          // hip offset from magic anchor
-    Rot6d sampledHipRotationInMagicSpace = Rot6dIdentity();          // hip rotation relative to magic yaw
-    Rot6d sampledLookaheadHipRotationInMagicSpace = Rot6dIdentity(); // lookahead for dragging
+    //Vector3 sampledHipPositionInMagicSpace = Vector3Zero();          // hip offset from magic anchor
+    //Rot6d sampledHipRotationInMagicSpace = Rot6dIdentity();          // hip rotation relative to magic yaw
+    //Rot6d sampledLookaheadHipRotationInMagicSpace = Rot6dIdentity(); // lookahead for dragging
 
     // Sampled lookahead hips height (extrapolated Y position)
-    float sampledLookaheadHipsHeight = 0.0f;
+    //float sampledLookaheadHipsHeight = 0.0f;
 
     // Sampled hip rotations (yaw-free, for dragging)
-    Rot6d sampledHipRotationYawFree = Rot6dIdentity();           // current frame
-    Rot6d sampledLookaheadHipRotationYawFree = Rot6dIdentity();  // lookahead (extrapolated)
+    //Rot6d sampledHipRotationYawFree = Rot6dIdentity();           // current frame
+    //Rot6d sampledLookaheadHipRotationYawFree = Rot6dIdentity();  // lookahead (extrapolated)
 
     // Sampled lookahead toe positions (root space, for predictive foot IK)
     Vector3 sampledLookaheadToePosRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
@@ -519,8 +521,8 @@ struct BlendCursor {
     Vector3 rootVelocityWorldForDisplayOnly = Vector3Zero();    // current root velocity (world space)
     float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
 
-    // Toe velocities for foot IK (world space, transformed from root space)
-    Vector3 toeVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
+    // Toe velocities for foot IK
+    //Vector3 toeVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
 };
 
 
@@ -603,7 +605,8 @@ struct ControlledCharacter {
 
 
     // LookaheadDragging state
-    std::vector<Rot6d> lookaheadDragPose6d;         // running pose state for lookahead dragging
+    std::vector<Rot6d> lookaheadDragLocalRotations6d;         // running pose state for lookahead dragging
+    std::vector<Vector3> lookaheadDragLocalPositions; // running position state for lookahead dragging
     bool lookaheadDragInitialized = false;
 
     // Lookahead hips height dragging state
@@ -616,9 +619,9 @@ struct ControlledCharacter {
 
 
 
-    // Smoothed root motion state
-    Vector3 smoothedRootVelocity = Vector3Zero();  // smoothed linear velocity (world space XZ)
-    float smoothedRootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
+    // root motion state
+    Vector3 rootVelocityWorld = Vector3Zero();  // smoothed linear velocity (world space XZ)
+    float rootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
 
 
     // Magic anchor system - alternative reference frame for blending
@@ -631,10 +634,9 @@ struct ControlledCharacter {
     float smoothedMagicYawRate = 0.0f;
 
     // Lookahead dragging for magic anchor
-    Vector3 lookaheadDragMagicVelocity = Vector3Zero();
-    float lookaheadDragMagicYawRate = 0.0f;
-    bool lookaheadMagicVelocityInitialized = false;
-
+    Vector3 lookaheadDragRootVelocityRootSpace = Vector3Zero();
+    float lookaheadDragYawRate = 0.0f;
+    
 
 
     // Motion matching feature velocity (updated independently from actual velocity)
@@ -645,7 +647,9 @@ struct ControlledCharacter {
     // Toe velocity tracking
     Vector3 prevToeGlobalPosPreIK[SIDES_COUNT];   // previous frame positions (before IK)
     Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
-    Vector3 toeBlendedVelocity[SIDES_COUNT];      // blended from cursor global toe velocities
+    Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities
+    Vector3 toeBlendedPositionWorld[SIDES_COUNT];      // blended from cursor toe positions
+    Vector3 toeBlendedLookaheadPositionWorld[SIDES_COUNT];      // blended from cursor toe lookahead positions
     bool toeTrackingPreIKInitialized = false;
 
     Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)
@@ -654,7 +658,8 @@ struct ControlledCharacter {
 
     // Virtual toe positions - move with blended velocity, used for IK targets
     Vector3 virtualToePos[SIDES_COUNT];                 // constrained (speed-clamped) for IK
-    Vector3 lookaheadDragToePos[SIDES_COUNT];           // unconstrained, drags toward lookahead target
+    Vector3 lookaheadDragToePosRootSpace[SIDES_COUNT];  // unconstrained, drags toward lookahead target (in root space)
+    Vector3 lookaheadDragToePosWorld[SIDES_COUNT];      // same as above, but in world space (cached for debug/unlock)
     bool lookaheadDragToePosInitialized = false;
 
     // Virtual toe locking system

@@ -101,6 +101,14 @@ static inline float WrapAngleToPi(float angle)
     return angle;
 }
 
+// Lerp between two angles (in radians) taking the shortest path around the circle
+// This correctly handles wrapping (e.g., lerping from -175° to 175° goes through 180°, not through 0°)
+static inline float LerpAngle(float angleA, float angleB, float t)
+{
+    const float delta = WrapAngleToPi(angleB - angleA);
+    return angleA + delta * t;
+}
+
 // This is a safe version of QuaternionBetween which returns a 180 deg rotation
 // at the singularity where vectors are facing exactly in opposite directions
 static inline Quaternion QuaternionBetween(Vector3 p, Vector3 q)

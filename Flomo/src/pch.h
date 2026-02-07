@@ -4,7 +4,6 @@
 #pragma once
 
 // Standard C headers
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -34,7 +33,7 @@
 #pragma warning(disable: 4251)  // DLL interface issues
 #pragma warning(disable: 4275)  // non-DLL-interface
 #pragma warning(disable: 4996)  // deprecation warnings
-#pragma warning(disable: 4702)  // unreachable code (from irange.h)
+#pragma warning(disable: 4702)  // unreachable code (from ireach.h)
 
 #include <torch/torch.h>
 
@@ -51,3 +50,4 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <assert.h>

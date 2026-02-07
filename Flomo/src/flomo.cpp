@@ -1,10 +1,13 @@
-
 // These must stay here (implementation headers with #define macros)
 //#define RAYGUI_WINDOWBOX_STATUSBAR_HEIGHT 24
 //#define GUI_WINDOW_FILE_DIALOG_IMPLEMENTATION
 //#include "gui_window_file_dialog.h"
 //#define RAYGUI_IMPLEMENTATION
 //#include "raygui.h"
+// 
+// Dear ImGui with raylib backend
+#include "imgui.h"
+#include "rlImGui.h"
 
 #include "math_utils.h"
 #include "utils.h"
@@ -30,68 +33,65 @@
 #include "leg_ik.h"
 #include "controlled_character.h"
 
-// Dear ImGui with raylib backend
-#include "imgui.h"
-#include "rlImGui.h"
 
 using namespace std;
 
 // Declare the CUDA functions
-extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
-extern "C" void cuda_check_error(const char* msg);
-extern "C" void test_tiny_cuda_nn();
+//extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
+//extern "C" void cuda_check_error(const char* msg);
+//extern "C" void test_tiny_cuda_nn();
 
-static void TestCudaAndLibtorchAndTCN()
-{
-    const int N = 1000000;  // 1 million elements
-    vector<float> a(N, 1.0f);
-    vector<float> b(N, 2.0f);
-    vector<float> c(N, 0.0f);
-
-    cout << "Running CUDA addition..." << endl;
-
-    auto start = chrono::high_resolution_clock::now();
-
-    run_cuda_addition(a.data(), b.data(), c.data(), N);
-    cuda_check_error("main execution");
-
-    auto end = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
-
-    bool correct = true;
-    for (int i = 0; i < 10; i++) {
-        if (c[i] != 3.0f) {
-            correct = false;
-            break;
-        }
-    }
-
-    cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << endl;
-    cout << "Time: " << duration.count() << " microseconds" << endl;
-    cout << "First 5 results: ";
-    for (int i = 0; i < 5; i++) {
-        cout << c[i] << " ";
-    }
-    cout << endl;
-
-    torch::Device device(torch::kCPU);
-    if (torch::cuda::is_available()) {
-        device = torch::Device(torch::kCUDA);
-        cout << "LibTorch: Using CUDA device" << endl;
-    }
-    else {
-        cout << "LibTorch: Using CPU device" << endl;
-    }
-
-    torch::Tensor tensor = torch::rand({ 3, 3 }).to(device);
-    auto result = tensor * 2;
-    cout << "Random tensor:\n" << tensor << endl;
-    cout << "Tensor * 2:\n" << result << endl;
-
-    // Test tiny-cuda-nn (implemented in cuda_kernels.cu)
-    test_tiny_cuda_nn();
-}
-
+//static void TestCudaAndLibtorchAndTCN()
+//{
+//    const int N = 1000000;  // 1 million elements
+//    vector<float> a(N, 1.0f);
+//    vector<float> b(N, 2.0f);
+//    vector<float> c(N, 0.0f);
+//
+//    cout << "Running CUDA addition..." << endl;
+//
+//    auto start = chrono::high_resolution_clock::now();
+//
+//    run_cuda_addition(a.data(), b.data(), c.data(), N);
+//    cuda_check_error("main execution");
+//
+//    auto end = chrono::high_resolution_clock::now();
+//    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+//
+//    bool correct = true;
+//    for (int i = 0; i < 10; i++) {
+//        if (c[i] != 3.0f) {
+//            correct = false;
+//            break;
+//        }
+//    }
+//
+//    cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << endl;
+//    cout << "Time: " << duration.count() << " microseconds" << endl;
+//    cout << "First 5 results: ";
+//    for (int i = 0; i < 5; i++) {
+//        cout << c[i] << " ";
+//    }
+//    cout << endl;
+//
+//    torch::Device device(torch::kCPU);
+//    if (torch::cuda::is_available()) {
+//        device = torch::Device(torch::kCUDA);
+//        cout << "LibTorch: Using CUDA device" << endl;
+//    }
+//    else {
+//        cout << "LibTorch: Using CPU device" << endl;
+//    }
+//
+//    torch::Tensor tensor = torch::rand({ 3, 3 }).to(device);
+//    auto result = tensor * 2;
+//    cout << "Random tensor:\n" << tensor << endl;
+//    cout << "Tensor * 2:\n" << result << endl;
+//
+//    // Test tiny-cuda-nn (implemented in cuda_kernels.cu)
+//    test_tiny_cuda_nn();
+//}
+//
 
 
 //----------------------------------------------------------------------------------
@@ -1279,6 +1279,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Compute effective dt based on debug timescale
     const float rawDt = GetFrameTime();
+    const float clampedRawDt = Clamp(rawDt, 0.0f, 0.1f); // Prevent extreme spikes when debugging
     float effectiveDt = 0.0f;
     if (!imguiWantsKeyboard)
     {
@@ -1327,7 +1328,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             if (numpadMultiplyHeld)
             {
                 // Holding * while paused: advance at half the debug timescale
-                effectiveDt = rawDt * app->debugTimescale * 0.5f;
+                effectiveDt = clampedRawDt * app->debugTimescale * 0.5f;
             }
             else
             {
@@ -1336,7 +1337,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
         else
         {
-            effectiveDt = rawDt * app->debugTimescale;
+            effectiveDt = clampedRawDt * app->debugTimescale;
         }
     }
 
@@ -2179,7 +2180,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         // also draw the smoothed velocity in white
         {
             const Vector3 startPos = Vector3Add(cc.worldPosition, Vector3{ 0.0f, yOffset * 0.5f, 0.0f });
-            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cc.smoothedRootVelocity, velScale));
+            const Vector3 endPos = Vector3Add(startPos, Vector3Scale(cc.rootVelocityWorld, velScale));
             DrawLine3D(startPos, endPos, WHITE);
             DrawSphere(endPos, 0.025f, WHITE);
         }
@@ -2205,47 +2206,36 @@ static void ApplicationUpdate(void* voidApplicationState)
             DrawSphere(actualEnd, 0.015f, YELLOW);
 
             // Blended velocity (cyan) - weighted average from cursors
-            const Vector3 blendedEnd = Vector3Add(toePos, Vector3Scale(cc.toeBlendedVelocity[side], velScale));
+            const Vector3 blendedEnd = Vector3Add(toePos, Vector3Scale(cc.toeBlendedVelocityWorld[side], velScale));
             DrawLine3D(toePos, blendedEnd, SKYBLUE);
             DrawSphere(blendedEnd, 0.015f, SKYBLUE);
         }
     }
 
-    // Draw Magic anchor (alternative reference frame: spine3 projected + head→hand yaw)
+    // Draw Magic anchor (from controlled character's world transform)
     if (app->controlledCharacter.active && app->config.drawMagicAnchor && app->animDatabase.valid)
     {
         const ControlledCharacter& cc = app->controlledCharacter;
         const AnimDatabase& db = app->animDatabase;
 
-        if (db.spine3Index >= 0 && db.headIndex >= 0 && db.handIndices[SIDE_RIGHT] >= 0)
+        // Use the character's world position and rotation directly
+        const Vector3 magicPos = Vector3{ cc.worldPosition.x, 0.02f, cc.worldPosition.z };  // slight offset to avoid z-fighting
+        const Quaternion magicRot = cc.worldRotation;
+
+        // Draw transform axes (magenta-ish color scheme)
+        const float axisLen = 0.3f;
+        DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ axisLen, 0.0f, 0.0f }, magicRot)), MAGENTA);
+        DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, axisLen, 0.0f }, magicRot)), Color{ 255, 100, 255, 255 });
+        DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, axisLen }, magicRot)), Color{ 200, 0, 200, 255 });
+
+        // Draw small sphere at anchor point
+        DrawSphere(magicPos, 0.03f, MAGENTA);
+
+        // Draw line from magic anchor to spine3 (vertical reference)
+        if (db.spine3Index >= 0)
         {
-            // Get joint positions from current pose
             const Vector3 spine3Pos = cc.xformData.globalPositions[db.spine3Index];
-            const Vector3 headPos = cc.xformData.globalPositions[db.headIndex];
-            const Vector3 rightHandPos = cc.xformData.globalPositions[db.handIndices[SIDE_RIGHT]];
-
-            // Magic position = spine3 projected onto ground
-            const Vector3 magicPos = Vector3{ spine3Pos.x, 0.02f, spine3Pos.z };  // slight offset to avoid z-fighting
-
-            // Magic yaw = direction from head to right hand (projected to XZ)
-            const Vector3 headToHand = Vector3Subtract(rightHandPos, headPos);
-            const float magicYaw = atan2f(headToHand.x, headToHand.z);
-            const Quaternion magicRot = QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, magicYaw);
-
-            // Draw transform axes (magenta-ish color scheme)
-            const float axisLen = 0.3f;
-            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ axisLen, 0.0f, 0.0f }, magicRot)), MAGENTA);
-            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, axisLen, 0.0f }, magicRot)), Color{ 255, 100, 255, 255 });
-            DrawLine3D(magicPos, Vector3Add(magicPos, Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, axisLen }, magicRot)), Color{ 200, 0, 200, 255 });
-
-            // Draw small sphere at anchor point
-            DrawSphere(magicPos, 0.03f, MAGENTA);
-
-            // Draw line from magic anchor to spine3 (vertical reference)
             DrawLine3D(magicPos, spine3Pos, Color{ 255, 100, 255, 128 });
-
-            // Draw line from head to right hand (orientation reference)
-            DrawLine3D(headPos, rightHandPos, Color{ 255, 150, 255, 200 });
         }
     }
 
@@ -2355,12 +2345,12 @@ static void ApplicationUpdate(void* voidApplicationState)
                     const unsigned char fadeAlpha = (unsigned char)(unlockProgress * 200.0f + 55.0f);
                     const Color clampColor = Color{ 255, (unsigned char)(unlockProgress * 128.0f), 0, fadeAlpha };
 
-                    DrawSphereWires(cc.lookaheadDragToePos[side], clampRadius, 8, 8, clampColor);
+                    DrawSphereWires(cc.lookaheadDragToePosWorld[side], clampRadius, 8, 8, clampColor);
                 }
             }
 
             // Intermediate virtual toe (cyan) - unconstrained natural motion
-            DrawSphere(cc.lookaheadDragToePos[side], 0.022f, LIME);
+            DrawSphere(cc.lookaheadDragToePosWorld[side], 0.022f, LIME);
 
             // Final virtual toe (magenta) - constrained, this is the IK target
             DrawSphere(cc.virtualToePos[side], 0.025f, MAGENTA);
@@ -2368,7 +2358,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             // Draw line showing constraint between intermediate and final
             if (app->config.enableTimedUnlocking && cc.virtualToeUnlockTimer[side] >= 0.0f)
             {
-                DrawLine3D(cc.lookaheadDragToePos[side], cc.virtualToePos[side], Color{ 255, 128, 255, 180 });
+                DrawLine3D(cc.lookaheadDragToePosWorld[side], cc.virtualToePos[side], Color{ 255, 128, 255, 180 });
             }
 
             // FK toe position BEFORE IK (yellow) - where the toe was before correction
@@ -2497,9 +2487,9 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Draw aim direction arrow (orange, from magic anchor)
         {
             const Vector3 aimStart = Vector3{
-                app->controlledCharacter.magicWorldPosition.x,
+                app->controlledCharacter.worldPosition.x,
                 1.5f,  // draw at head height
-                app->controlledCharacter.magicWorldPosition.z
+                app->controlledCharacter.worldPosition.z
             };
             const Vector3 aimEnd = Vector3Add(aimStart, input.desiredAimDirection);
 
@@ -3031,7 +3021,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
-    TestCudaAndLibtorchAndTCN();
+    //TestCudaAndLibtorchAndTCN();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;

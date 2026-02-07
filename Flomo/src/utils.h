@@ -4,7 +4,7 @@
 #include "raymath.h"
 #include "raylib.h"
 
-#include "assert.h"
+//#include "assert.h"
 #include <cstdlib>
 #include <iostream>
 #include <span> 

@@ -32,8 +32,30 @@ cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_CONFIGURATION_TYPES="Debug;RelWi
 
 cd ..
 
+echo.
 echo Configuration succeeded!
-echo To test: start build\Flomo.sln
-echo Then try building both Debug and Release configurations
+echo.
+echo =====================
+echo Build Options:
+echo =====================
+echo.
+echo 1. Build from command line (RelWithDebInfo - recommended):
+echo    cmake --build build --config RelWithDebInfo
+echo.
+echo 2. Build from command line (Debug):
+echo    cmake --build build --config Debug
+echo.
+echo 3. Or open Visual Studio solution:
+echo    start build\Flomo.sln
+echo.
+echo =====================
+echo Run the program:
+echo =====================
+echo.
+echo After building, run directly:
+echo    build\src\RelWithDebInfo\flomo.exe
+echo or:
+echo    build\src\Debug\flomo.exe
+echo.
 
 pause
