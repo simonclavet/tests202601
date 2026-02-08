@@ -211,7 +211,6 @@ struct AppConfig {
     // Motion Matching Configuration, version that is editable: those are copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
     float poseDragLookaheadTimeEditor = 0.1f;  // lookahead time for pose dragging (seconds)
-    float lookaheadExtrapolationMult = 1.0f;   // multiplier for extrapolation factor (1.0 = exact, >1 = overshoot)
     BlendRootModePosition blendRootModePositionEditor = BlendRootModePosition::Hips;
     BlendRootModeRotation blendRootModeRotationEditor = BlendRootModeRotation::Hips;
 
@@ -283,7 +282,6 @@ struct AnimDatabase
     // Joint-local transforms (relative to parent joint, for blending)
     Array2D<Vector3> localJointPositions;           // local positions [motionFrameCount x jointCount]
     Array2D<Rot6d> localJointRotations;             // local rotations [motionFrameCount x jointCount]
-    Array2D<Vector3> localJointAngularVelocities;   // local angular velocities [motionFrameCount x jointCount]
 
     // lookahead pose for inertial dragging
     Array2D<Rot6d> lookaheadLocalRotations;         // [motionFrameCount x jointCount]
@@ -298,12 +296,7 @@ struct AnimDatabase
     std::vector<Vector3> lookaheadRootMotionVelocitiesRootSpace;  // [motionFrameCount] - extrapolated XZ velocity
     std::vector<float> lookaheadRootMotionYawRates;               // [motionFrameCount] - extrapolated yaw rate (rad/s)
 
-    // Lookahead hips height (extrapolated Y position of hip joint)
-    std::vector<float> lookaheadHipsHeights;  // [motionFrameCount]
 
-    // Yaw-free hip rotation as a separate track (avoids Euler gimbal lock issues)
-    std::vector<Rot6d> hipRotationYawFree;           // [motionFrameCount] - yaw stripped
-    std::vector<Rot6d> lookaheadHipRotationYawFree;  // [motionFrameCount] - extrapolated
 
     // Toe positions in root space (relative to hip on ground, heading-aligned)
     std::vector<Vector3> toePositionsRootSpace[SIDES_COUNT];           // [motionFrameCount]
@@ -326,6 +319,7 @@ struct AnimDatabase
 
     // Magic anchor system - alternative reference frame for blending
     int spine3Index = -1;              // upper spine for Magic position
+    int spine1Index = -1;              // lower spine for Magic position
     int headIndex = -1;                // head for Magic orientation
 
     // Magic anchor transforms per frame (position = spine3 on ground, yaw = head→rightHand direction)
@@ -366,16 +360,12 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->jointAccelerationsRootSpace.clear();
     db->localJointPositions.clear();
     db->localJointRotations.clear();
-    db->localJointAngularVelocities.clear();
     db->lookaheadLocalRotations.clear();
     db->lookaheadLocalPositions.clear();
     db->rootMotionVelocitiesRootSpace.clear();
     db->rootMotionYawRates.clear();
     db->lookaheadRootMotionVelocitiesRootSpace.clear();
     db->lookaheadRootMotionYawRates.clear();
-    db->lookaheadHipsHeights.clear();
-    db->hipRotationYawFree.clear();
-    db->lookaheadHipRotationYawFree.clear();
     db->magicPosition.clear();
     db->magicYaw.clear();
     db->magicVelocityRootSpace.clear();
@@ -464,6 +454,8 @@ struct BlendCursor {
     float animTime = 0.0f;                      // playback time in that clip
     DoubleSpringDamperState weightSpring = {};  // spring state for weight blending (x = current weight)
     float normalizedWeight = 0.0f;              // weight / totalWeight (sums to 1 across active cursors)
+    DoubleSpringDamperState fastWeightSpring = {}; // faster spring for yaw rate
+    float fastNormalizedWeight = 0.0f;          // fastWeight / totalFastWeight
     float targetWeight = 0.0f;                  // desired weight
     float blendTime = 0.3f;                     // halflife for double spring damper
     bool active = false;                        // is cursor in use
@@ -471,7 +463,6 @@ struct BlendCursor {
     // Local-space pose stored per cursor for blending (size = jointCount)
     std::vector<Vector3> localPositions;
     std::vector<Rot6d> localRotations6d;
-    std::vector<Vector3> localAngularVelocities;
     std::vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
     std::vector<Vector3> lookaheadLocalPositions;  // extrapolated positions for lookahead dragging
 
@@ -482,24 +473,6 @@ struct BlendCursor {
     // Sampled lookahead root motion velocities (extrapolated, also root space)
     Vector3 sampledLookaheadRootVelocityRootSpace = Vector3Zero();  // lookahead XZ velocity
     float sampledLookaheadRootYawRate = 0.0f;                       // lookahead yaw rate (rad/s)
-
-    // Sampled Magic anchor velocities (alternative reference frame)
-    //Vector3 sampledMagicVelocity = Vector3Zero();          // XZ velocity in magic space
-    //float sampledMagicYawRate = 0.0f;                      // yaw rate (rad/s)
-    //Vector3 sampledLookaheadMagicVelocity = Vector3Zero(); // lookahead XZ velocity
-    //float sampledLookaheadMagicYawRate = 0.0f;             // lookahead yaw rate (rad/s)
-
-    // Sampled hip transform relative to Magic anchor (for skeleton placement)
-    //Vector3 sampledHipPositionInMagicSpace = Vector3Zero();          // hip offset from magic anchor
-    //Rot6d sampledHipRotationInMagicSpace = Rot6dIdentity();          // hip rotation relative to magic yaw
-    //Rot6d sampledLookaheadHipRotationInMagicSpace = Rot6dIdentity(); // lookahead for dragging
-
-    // Sampled lookahead hips height (extrapolated Y position)
-    //float sampledLookaheadHipsHeight = 0.0f;
-
-    // Sampled hip rotations (yaw-free, for dragging)
-    //Rot6d sampledHipRotationYawFree = Rot6dIdentity();           // current frame
-    //Rot6d sampledLookaheadHipRotationYawFree = Rot6dIdentity();  // lookahead (extrapolated)
 
     // Sampled lookahead toe positions (root space, for predictive foot IK)
     Vector3 sampledLookaheadToePosRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
@@ -513,16 +486,9 @@ struct BlendCursor {
     Vector3 prevLocalRootPos;
     Rot6d prevLocalRootRot6d = Rot6dIdentity();
 
-    // Debug: last computed deltas (for visualization)
-    Vector3 lastDeltaWorld;      // XZ world-space position delta this frame
-    float lastDeltaYaw;          // Yaw delta this frame (radians)
-
     // Root motion velocity tracking (for acceleration-based blending)
     Vector3 rootVelocityWorldForDisplayOnly = Vector3Zero();    // current root velocity (world space)
     float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
-
-    // Toe velocities for foot IK
-    //Vector3 toeVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
 };
 
 
@@ -594,10 +560,6 @@ struct ControlledCharacter {
     static constexpr int MAX_BLEND_CURSORS = 10;
     BlendCursor cursors[MAX_BLEND_CURSORS];
 
-    // Debug: last blended root motion delta (for visualization)
-    Vector3 lastBlendedDeltaWorld;
-    float lastBlendedDeltaYaw;
-
     // Cursor blend mode and state
     CursorBlendMode cursorBlendMode = CursorBlendMode::Basic;
     float blendPosReturnTime = 0.1f;       // time for velblending to lerp towards target
@@ -609,47 +571,23 @@ struct ControlledCharacter {
     std::vector<Vector3> lookaheadDragLocalPositions; // running position state for lookahead dragging
     bool lookaheadDragInitialized = false;
 
-    // Lookahead hips height dragging state
-    float lookaheadDragHipsHeight = 0.0f;           // running hips height for lookahead dragging
-    bool lookaheadDragHipsHeightInitialized = false;
-
-    // Lookahead hip rotation dragging state (yaw-free Rot6d track)
-    Rot6d lookaheadDragHipRotationYawFree = Rot6dIdentity();
-    bool lookaheadDragHipRotationInitialized = false;
-
-
-
     // root motion state
     Vector3 rootVelocityWorld = Vector3Zero();  // smoothed linear velocity (world space XZ)
     float rootYawRate = 0.0f;              // smoothed angular velocity (radians/sec)
 
-
-    // Magic anchor system - alternative reference frame for blending
-    Vector3 magicWorldPosition = Vector3Zero();    // Magic anchor position in world
-    Quaternion magicWorldRotation = QuaternionIdentity();  // Magic anchor yaw (Y-only rotation)
-    bool magicAnchorInitialized = false;
-
-    // Blended magic velocities (similar to existing smoothedRootVelocity)
-    Vector3 smoothedMagicVelocity = Vector3Zero();
-    float smoothedMagicYawRate = 0.0f;
-
     // Lookahead dragging for magic anchor
     Vector3 lookaheadDragRootVelocityRootSpace = Vector3Zero();
     float lookaheadDragYawRate = 0.0f;
-    
-
 
     // Motion matching feature velocity (updated independently from actual velocity)
     Vector3 virtualControlSmoothedVelocity = Vector3Zero();     // velocity used for motion matching features (world space XZ)
     bool virtualControlSmoothedVelocityInitialized = false;
-
 
     // Toe velocity tracking
     Vector3 prevToeGlobalPosPreIK[SIDES_COUNT];   // previous frame positions (before IK)
     Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
     Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities
     Vector3 toeBlendedPositionWorld[SIDES_COUNT];      // blended from cursor toe positions
-    Vector3 toeBlendedLookaheadPositionWorld[SIDES_COUNT];      // blended from cursor toe lookahead positions
     bool toeTrackingPreIKInitialized = false;
 
     Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)

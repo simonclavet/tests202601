@@ -105,14 +105,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         return;
     }
 
-    vector<string> jointNames;
-    jointNames.reserve((size_t)canonBvh->jointCount);
-    for (int j = 0; j < canonBvh->jointCount; ++j)
-    {
-        // BVHJointData::name is now string
-        jointNames.push_back(canonBvh->joints[j].name);
-    }
-
     // Reset indices
     db->hipJointIndex = -1;
     for (int side : sides)
@@ -148,8 +140,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     const vector<string> rightHandCandidates = { "righthand", "right_hand", "r_hand", "hand.r", "hand_r" };
     const vector<vector<string>> handCandidates = { leftHandCandidates, rightHandCandidates };
 
-    // Spine3 and head candidates for Magic anchor
     const vector<string> spine3Candidates = { "spine3", "spine2", "chest", "upperchest", "upper_chest" };
+    const vector<string> spine1Candidates = { "spine1" };
     const vector<string> headCandidates = { "head" };
 
     // Use helper to find hip
@@ -240,6 +232,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     // Find spine3 and head for Magic anchor
     db->spine3Index = FindJointIndexByNames(canonBvh, spine3Candidates);
+    db->spine1Index = FindJointIndexByNames(canonBvh, spine1Candidates);
     db->headIndex = FindJointIndexByNames(canonBvh, headCandidates);
 
     if (db->spine3Index < 0)
@@ -265,7 +258,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->jointAccelerationsRootSpace.resize(db->motionFrameCount, db->jointCount);
     db->localJointPositions.resize(db->motionFrameCount, db->jointCount);
     db->localJointRotations.resize(db->motionFrameCount, db->jointCount);
-    db->localJointAngularVelocities.resize(db->motionFrameCount, db->jointCount);
     db->lookaheadLocalRotations.resize(db->motionFrameCount, db->jointCount);
     db->lookaheadLocalPositions.resize(db->motionFrameCount, db->jointCount);
 
@@ -318,9 +310,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
 
-            // Magic position = spine3 projected to ground
-            const Vector3 spine3Pos = posRow[db->spine3Index];
-            db->magicPosition[f] = Vector3{ spine3Pos.x, 0.0f, spine3Pos.z };
+            // Magic position = spine projected to ground
+            const Vector3 spinePos = posRow[db->spine1Index];
+            db->magicPosition[f] = Vector3{ spinePos.x, 0.0f, spinePos.z };
 
             // Magic yaw = direction from head to right hand projected onto XZ plane
             const Vector3 headPos = posRow[db->headIndex];
@@ -416,42 +408,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
     }
 
-    // Compute local angular velocities for each joint at each frame
-    // Angular velocity at frame i is defined at midpoint between frame i and i+1
-    // For last frame of each clip, copy from previous frame
-    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
-    {
-        const int clipStart = db->clipStartFrame[c];
-        const int clipEnd = db->clipEndFrame[c];
-        const float frameTime = db->animFrameTime[c];
 
-        for (int f = clipStart; f < clipEnd; ++f)
-        {
-            const bool isLastFrame = (f == clipEnd - 1);
-            const int nextF = isLastFrame ? f : (f + 1);
-            const int prevF = isLastFrame ? (f - 1) : f;
-
-            span<Vector3> angVelRow = db->localJointAngularVelocities.row_view(f);
-
-            // handle edge case: single-frame clip
-            if (clipEnd - clipStart <= 1)
-            {
-                for (int j = 0; j < db->jointCount; ++j)
-                {
-                    angVelRow[j] = Vector3Zero();
-                }
-                continue;
-            }
-
-            span<const Rot6d> rot0Row = db->localJointRotations.row_view(prevF);
-            span<const Rot6d> rot1Row = db->localJointRotations.row_view(nextF);
-
-            for (int j = 0; j < db->jointCount; ++j)
-            {
-                Rot6dGetVelocity(rot0Row[j], rot1Row[j], frameTime, angVelRow[j]);
-            }
-        }
-    }
 
     // Compute lookahead poses: pose[f] + n * (pose[f+1] - pose[f]) = n*pose[f+1] - (n-1)*pose[f]
     // where n = lookaheadTime / frameTime (extrapolates lookaheadTime seconds ahead)
@@ -668,101 +625,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->lookaheadRootMotionYawRates[f] = db->lookaheadMagicYawRate[f];
     }
 
-    // Compute lookahead hips heights (extrapolated Y position of hip joint)
-    // lookahead = (1-n)*curr + n*next where n = lookaheadTime / frameTime
-    db->lookaheadHipsHeights.resize(db->motionFrameCount);
 
-    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
-    {
-        const int clipStart = db->clipStartFrame[c];
-        const int clipEnd = db->clipEndFrame[c];
-        const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
-        const float nextWeight = n;
-        const float currWeight = 1.0f - n;
-
-        const int hipIdx = 0;  // root/hip is joint 0
-
-        for (int f = clipStart; f < clipEnd; ++f)
-        {
-            const bool isLastFrame = (f == clipEnd - 1);
-
-            if (isLastFrame || clipEnd - clipStart <= 1)
-            {
-                // no next frame to extrapolate from, just use current
-                std::span<const Vector3> currPos = db->localJointPositions.row_view(f);
-                db->lookaheadHipsHeights[f] = currPos[hipIdx].y;
-            }
-            else
-            {
-                // extrapolate: lookahead = (1-n)*curr + n*next
-                std::span<const Vector3> currPos = db->localJointPositions.row_view(f);
-                std::span<const Vector3> nextPos = db->localJointPositions.row_view(f + 1);
-
-                const float currHeight = currPos[hipIdx].y;
-                const float nextHeight = nextPos[hipIdx].y;
-
-                db->lookaheadHipsHeights[f] = currWeight * currHeight + nextWeight * nextHeight;
-            }
-        }
-    }
 
     TraceLog(LOG_INFO, "AnimDatabase: built motion DB with %d frames and %d joints",
         db->motionFrameCount, db->jointCount);
 
-    // Compute yaw-free hip rotation track (separate from the full rotation, for clean dragging)
-    db->hipRotationYawFree.resize(db->motionFrameCount);
-    db->lookaheadHipRotationYawFree.resize(db->motionFrameCount);
 
-    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
-    {
-        const int clipStart = db->clipStartFrame[c];
-        const int clipEnd = db->clipEndFrame[c];
-        const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
-        const float nextWeight = n;
-        const float currWeight = 1.0f - n;
-
-        const int hipIdx = 0;  // root/hip is joint 0
-
-        for (int f = clipStart; f < clipEnd; ++f)
-        {
-            const bool isLastFrame = (f == clipEnd - 1);
-
-            // Get hip rotation and strip yaw
-            span<const Rot6d> rotRow = db->localJointRotations.row_view(f);
-            Rot6d hipNoYaw;
-            Rot6dRemoveYComponent(rotRow[hipIdx], hipNoYaw);
-            db->hipRotationYawFree[f] = hipNoYaw;
-
-            if (isLastFrame || clipEnd - clipStart <= 1)
-            {
-                // no next frame to extrapolate from, just use current
-                db->lookaheadHipRotationYawFree[f] = hipNoYaw;
-            }
-            else
-            {
-                // Get next frame's yaw-free hip rotation
-                span<const Rot6d> nextRotRow = db->localJointRotations.row_view(f + 1);
-                Rot6d nextHipNoYaw;
-                Rot6dRemoveYComponent(nextRotRow[hipIdx], nextHipNoYaw);
-
-                // Extrapolate using Rot6d lerp: lookahead = (1-n)*curr + n*next
-                // We blend the raw Rot6d values then normalize
-                Rot6d lookahead;
-                lookahead.ax = currWeight * hipNoYaw.ax + nextWeight * nextHipNoYaw.ax;
-                lookahead.ay = currWeight * hipNoYaw.ay + nextWeight * nextHipNoYaw.ay;
-                lookahead.az = currWeight * hipNoYaw.az + nextWeight * nextHipNoYaw.az;
-                lookahead.bx = currWeight * hipNoYaw.bx + nextWeight * nextHipNoYaw.bx;
-                lookahead.by = currWeight * hipNoYaw.by + nextWeight * nextHipNoYaw.by;
-                lookahead.bz = currWeight * hipNoYaw.bz + nextWeight * nextHipNoYaw.bz;
-                Rot6dNormalize(lookahead);
-                db->lookaheadHipRotationYawFree[f] = lookahead;
-            }
-        }
-    }
-
-    TraceLog(LOG_INFO, "AnimDatabase: computed yaw-free hip rotation track");
     TraceLog(LOG_INFO, "AnimDatabase: computed Magic anchor tracks");
 
     // Compute hip transform relative to Magic anchor (for placing skeleton when using Magic root motion)
@@ -1419,34 +1287,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
 }
 
-// Convert global frame index to (animIndex, localFrame)
-static void AnimDatabaseGlobalToLocal(const AnimDatabase* db, int globalFrame, int* animIndex, int* localFrame)
-{
-    for (int i = 0; i < db->animCount; i++)
-    {
-        if (globalFrame < db->animStartFrame[i] + db->animFrameCount[i])
-        {
-            *animIndex = i;
-            *localFrame = globalFrame - db->animStartFrame[i];
-            return;
-        }
-    }
-    // Clamp to last frame
-    *animIndex = db->animCount - 1;
-    *localFrame = db->animFrameCount[*animIndex] - 1;
-}
 
-// Get a random (animIndex, time) from the database
-static void AnimDatabaseRandomTime(const AnimDatabase* db, int* animIndex, float* time)
-{
-    if (db->animCount == 0) return;
 
-    *animIndex = rand() % db->animCount;
-    const int frameCount = db->animFrameCount[*animIndex];
-    const float frameTime = db->animFrameTime[*animIndex];
-    const int randomFrame = rand() % frameCount;
-    *time = randomFrame * frameTime;
-}
+
 
 // Computes interpolation frame indices and alpha for animation sampling
 static inline void GetInterFrameAlpha(

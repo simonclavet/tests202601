@@ -65,7 +65,6 @@ static void ControlledCharacterInit(
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
         cc->cursors[i].localPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].localRotations6d.resize(cc->xformData.jointCount);
-        cc->cursors[i].localAngularVelocities.resize(cc->xformData.jointCount);
         cc->cursors[i].lookaheadRotations6d.resize(cc->xformData.jointCount);
         cc->cursors[i].lookaheadLocalPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].globalPositions.resize(cc->xformData.jointCount);
@@ -75,13 +74,12 @@ static void ControlledCharacterInit(
 
         cc->cursors[i].active = false;
         cc->cursors[i].weightSpring = {};  // zero all spring state
+        cc->cursors[i].fastWeightSpring = {};
         cc->cursors[i].targetWeight = 0.0f;
+        cc->cursors[i].fastNormalizedWeight = 0.0f;
     }
 
     // Magic anchor root motion state
-    cc->magicAnchorInitialized = false;
-    cc->smoothedMagicVelocity = Vector3Zero();
-    cc->smoothedMagicYawRate = 0.0f;
     cc->lookaheadDragRootVelocityRootSpace = Vector3Zero();
     cc->lookaheadDragYawRate = 0.0f;
     //cc->lookaheadMagicVelocityInitialized = false;
@@ -132,7 +130,6 @@ static BlendCursor* FindAvailableCursor(ControlledCharacter* cc)
 // Fades out existing cursors and spawns the new one
 static void SpawnBlendCursor(
     ControlledCharacter* cc,
-    const AnimDatabase* db,
     int animIndex,
     float animTime,
     float blendTime,
@@ -155,11 +152,14 @@ static void SpawnBlendCursor(
     cursor->animIndex = animIndex;
     cursor->animTime = animTime;
     cursor->weightSpring = {};
+    cursor->fastWeightSpring = {};
 
     if (immediate)
     {
         cursor->weightSpring.x = 1.0f;
         cursor->weightSpring.xi = 1.0f;
+        cursor->fastWeightSpring.x = 1.0f;
+        cursor->fastWeightSpring.xi = 1.0f;
     }
 
     cursor->targetWeight = 1.0f;
@@ -226,7 +226,7 @@ static void ControlledCharacterUpdate(
         const float newMaxTime = (newBvh->frameCount - 1) * newBvh->frameTime;
         const float startTime = ((float)rand() / (float)RAND_MAX) * newMaxTime;
         cc->lookaheadDragInitialized = false;
-        SpawnBlendCursor(cc, db, newAnim, startTime, config.defaultBlendTime, true);
+        SpawnBlendCursor(cc, newAnim, startTime, config.defaultBlendTime, true);
         cc->switchTimer = config.switchInterval;
     }
     else if (cc->animMode == AnimationMode::RandomSwitch)
@@ -239,7 +239,7 @@ static void ControlledCharacterUpdate(
             const float newMaxTime = (newBvh->frameCount - 1) * newBvh->frameTime;
             const float startTime = ((float)rand() / (float)RAND_MAX) * newMaxTime;
 
-            SpawnBlendCursor(cc, db, newAnim, startTime, config.defaultBlendTime, false);
+            SpawnBlendCursor(cc, newAnim, startTime, config.defaultBlendTime, false);
             cc->switchTimer = config.switchInterval;
         }
     }
@@ -294,20 +294,12 @@ static void ControlledCharacterUpdate(
 
                     if (!tooCloseToExisting)
                     {
-                        SpawnBlendCursor(cc, db, clipIdx, targetTime, config.defaultBlendTime, false);
+                        SpawnBlendCursor(cc, clipIdx, targetTime, config.defaultBlendTime, false);
                     }
                 }
             }
         }
     }
-
-    // --- Advance main anim time (kept for legacy semantics if needed) ---
-    //cc->animTime += dt;
-    //const float currentMaxTime = (bvh->frameCount - 1) * bvh->frameTime;
-    //if (cc->animTime >= currentMaxTime)
-    //{
-    //    cc->animTime = fmodf(cc->animTime, currentMaxTime);
-    //}
 
     // --- Update motion matching feature velocity (independent from actual velocity) ---
     // This velocity is used for FutureVel features and updated using maxAcceleration
@@ -342,6 +334,7 @@ static void ControlledCharacterUpdate(
     // advance cursor times, update weights, compute total weight and normalize weights
     {
         float totalCursorWeight = 0.0f;
+        float totalFastCursorWeight = 0.0f;
 
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
@@ -369,20 +362,27 @@ static void ControlledCharacterUpdate(
 
             // Update weight via spring integrator
             DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
+            // Update fast weight via spring integrator (hardcoded 0.05s blend time)
+            DoubleSpringDamper(cur.fastWeightSpring, cur.targetWeight, 0.05f, dt);
 
-            // Clamp the output weight to [0, 1]
+            // Clamp the output weights to [0, 1]
             cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
+            cur.fastWeightSpring.x = ClampZeroOne(cur.fastWeightSpring.x);
 
             const float wgt = cur.weightSpring.x;
             if (wgt > 1e-6f)
             {
-                //blendedVelocity = Vector3Add(blendedVelocity, Vector3Scale(cur.rootVelocity, wgt));
-                //blendedYawRate += cur.rootYawRate * wgt;
                 totalCursorWeight += wgt;
             }
 
+            const float fastWgt = cur.fastWeightSpring.x;
+            if (fastWgt > 1e-6f)
+            {
+                totalFastCursorWeight += fastWgt;
+            }
+
             // deactivate tiny-weight cursors
-            if (cur.weightSpring.x <= 1e-4f && cur.targetWeight <= 1e-4f)
+            if (cur.weightSpring.x <= 1e-4f && cur.fastWeightSpring.x <= 1e-4f && cur.targetWeight <= 1e-4f)
             {
                 cur.active = false;
                 cur.animIndex = -1;
@@ -402,12 +402,14 @@ static void ControlledCharacterUpdate(
             if (!cur.active)
             {
                 cur.normalizedWeight = 0.0f;
+                cur.fastNormalizedWeight = 0.0f;
                 continue;
             }
             cur.normalizedWeight = cur.weightSpring.x / totalCursorWeight;
+            cur.fastNormalizedWeight = (totalFastCursorWeight > 1e-6f) ? (cur.fastWeightSpring.x / totalFastCursorWeight) : 0.0f;
 
             // deactivate tiny normalized weight cursors
-            if (cur.normalizedWeight <= 1e-4f && cur.targetWeight <= 1e-4f)
+            if (cur.normalizedWeight <= 1e-4f && cur.fastNormalizedWeight <= 1e-4f && cur.targetWeight <= 1e-4f)
             {
                 cur.active = false;
                 cur.animIndex = -1;
@@ -459,14 +461,6 @@ static void ControlledCharacterUpdate(
             cur.localRotations6d[j] = Rot6dLerp(rotRow0[j], rotRow1[j], interFrameAlpha);
         }
 
-        // Sample angular velocities
-        //std::span<const Vector3> angVelRow0 = db->localJointAngularVelocities.row_view(baseFrame);
-        //std::span<const Vector3> angVelRow1 = db->localJointAngularVelocities.row_view(baseFrame + 1);
-        //for (int j = 0; j < jc; ++j)
-        //{
-        //    cur.localAngularVelocities[j] = Vector3Lerp(angVelRow0[j], angVelRow1[j], interFrameAlpha);
-        //}
-
         // Sample lookahead rotations and positions (for lookahead dragging)
         std::span<const Rot6d> lookaheadRotRow0 = db->lookaheadLocalRotations.row_view(baseFrame);
         std::span<const Rot6d> lookaheadRotRow1 = db->lookaheadLocalRotations.row_view(baseFrame + 1);
@@ -489,10 +483,10 @@ static void ControlledCharacterUpdate(
         blendedLookaheadRootVelocityRootSpace = Vector3Add(blendedLookaheadRootVelocityRootSpace, Vector3Scale(cur.sampledLookaheadRootVelocityRootSpace, w));
 
         cur.sampledRootYawRate = LerpFrames(&db->rootMotionYawRates[baseFrame], interFrameAlpha);
-        blendedYawRate += cur.sampledRootYawRate * w;
+        blendedYawRate += cur.sampledRootYawRate * cur.fastNormalizedWeight;
 
         cur.sampledLookaheadRootYawRate = LerpFrames(&db->lookaheadRootMotionYawRates[baseFrame], interFrameAlpha);
-        blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * w;
+        blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * cur.fastNormalizedWeight;
 
         // For display only: world-space velocity (not used for blending)
         cur.rootVelocityWorldForDisplayOnly = Vector3RotateByQuaternion(cur.sampledRootVelocityRootSpace, cc->worldRotation);
@@ -518,35 +512,6 @@ static void ControlledCharacterUpdate(
             const Vector3 cursorToeVelRootSpace = Vector3Lerp(jointVelRow0[toeIdx], jointVelRow1[toeIdx], vInterFrameAlpha);
             toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(cursorToeVelRootSpace, w));
         }
-
-
-        //// Update weight via spring integrator
-        //DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
-
-        //// Clamp the output weight to [0, 1]
-        //cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
-
-        // Transform root velocity from root space to world space
-        // Root space is heading-relative, just rotate by character's worldRotation
-        //cur.rootYawRate = cur.sampledRootYawRate;
-
-        //const float wgt = cur.weightSpring.x;
-        //if (wgt > 1e-6f)
-        //{
-        //    //blendedVelocity = Vector3Add(blendedVelocity, Vector3Scale(cur.rootVelocity, wgt));
-        //    //blendedYawRate += cur.rootYawRate * wgt;
-        //    totalRootWeight += wgt;
-        //}
-
-        // Store current root state for next frame (still needed for some features)
-        //cur.prevLocalRootPos = sampledRootPos;
-        //cur.prevLocalRootRot6d = sampledRootRot6d;
-
-        // NOTE: We no longer strip yaw from hip rotation here because:
-        // localRotations6d[0] is now stored relative to Magic anchor in the database,
-        // which means it's already yaw-free (Magic has the yaw, hip is relative to it).
-        // This avoids the Rot6d singularity when blending anims facing opposite directions.
-
     }
 
 
@@ -557,10 +522,6 @@ static void ControlledCharacterUpdate(
         // toes position in world space from blended toe positions in root space
         cc->toeBlendedPositionWorld[side] = Vector3Add(
             Vector3RotateByQuaternion(toeBlendedPositionRootSpace[side], cc->worldRotation),
-            cc->worldPosition);
-        // toes lookahead position in world space from blended lookahead toe positions in root space
-        cc->toeBlendedLookaheadPositionWorld[side] = Vector3Add(
-            Vector3RotateByQuaternion(toeBlendedLookaheadPositionRootSpace[side], cc->worldRotation),
             cc->worldPosition);
     }
     
@@ -606,8 +567,6 @@ static void ControlledCharacterUpdate(
     }
 
     // normalize blended Rot6d to get target rotations
-    //std::vector<Rot6d> blendedRot6d(jc);
-    //std::vector<Rot6d> blendedLookaheadRot6d(jc);
     for (int j = 0; j < jc; ++j)
     {
         // normalize current rotations
@@ -615,19 +574,6 @@ static void ControlledCharacterUpdate(
         const float lenA = sqrtf(blended.ax * blended.ax + blended.ay * blended.ay + blended.az * blended.az);
         assert(lenA > 1e-6f);
         Rot6dNormalize(blendedLocalRotations[j]);
-            
-        // normalize lookahead rotations
-        //Rot6d lookahead = blendedLookaheadLocalRotations[j];
-        //const float lenLA = sqrtf(lookahead.ax * lookahead.ax + lookahead.ay * lookahead.ay + lookahead.az * lookahead.az);
-        //if (lenLA > 1e-6f)
-        //{
-        //    Rot6dNormalize(lookahead);
-        //    blendedLookaheadRot6d[j] = lookahead;
-        //}
-        //else
-        //{
-        //    blendedLookaheadRot6d[j] = Rot6dIdentity();
-        //}
     }
 
     // Save basic blend pose (before lookahead modifications) for debug visualization
@@ -685,27 +631,11 @@ static void ControlledCharacterUpdate(
             cc->lookaheadDragInitialized = true;
         }
 
-        //if (!cc->lookaheadDragHipRotationInitialized)
-        //{
-        //    // Initialize hip drag state from current blended yaw-free rotation (from database)
-        //    cc->lookaheadDragHipRotationYawFree = blendedHipYawFree;
-        //    cc->lookaheadDragHipRotationInitialized = true;
-        //}
-
         // lookaheadTime >= dt ensures alpha <= 1 (no overshoot)
         const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
         // ratio of how much we go toward lookahead target 
         const float lookaheadProjectionAlpha = dt / lookaheadTime;
         assert(lookaheadProjectionAlpha <= 1.0f);
-
-        // Apply extrapolation multiplier: effectiveTarget = blended + (lookahead - blended) * mult
-        //const float extrapMult = config.lookaheadExtrapolationMult;
-
-        // Hip: drag using the dedicated yaw-free tracks (both from database)
-        //{
-        //    const Rot6d effectiveHipTarget = Rot6dLerp(blendedHipYawFree, blendedLookaheadHipYawFree, extrapMult);
-        //    cc->lookaheadDragHipRotationYawFree = Rot6dLerp(cc->lookaheadDragHipRotationYawFree, effectiveHipTarget, alpha);
-        //}
 
         // lerp toward extrapolated targets for all joints (rotations and positions)
         for (int j = 0; j < jc; ++j)
@@ -734,43 +664,23 @@ static void ControlledCharacterUpdate(
             cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
         }
 
-        // Lookahead hips height dragging
-        // Blend lookahead heights from cursors
-        //float blendedLookaheadHipsHeight = 0.0f;
-        //for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
-        //{
-        //    const BlendCursor& cur = cc->cursors[ci];
-        //    if (!cur.active) continue;
-        //    const float w = cur.normalizedWeight;
-        //    if (w <= 1e-6f) continue;
-
-        //    blendedLookaheadHipsHeight += cur.sampledLookaheadHipsHeight * w;
-        //}
-
-        // Initialize hips height dragging state
-        //if (!cc->lookaheadDragHipsHeightInitialized)
-        //{
-        //    // Start from current blended height (not lookahead)
-        //    cc->lookaheadDragHipsHeight = posAccum[0].y;
-        //    cc->lookaheadDragHipsHeightInitialized = true;
-        //}
-
-        //// Apply extrapolation multiplier then drag towards target (reuses alpha from above)
-        //const float blendedHeight = posAccum[0].y;
-        //const float effectiveHeightTarget = blendedHeight + (blendedLookaheadHipsHeight - blendedHeight) * extrapMult;
-        //cc->lookaheadDragHipsHeight = Lerp(cc->lookaheadDragHipsHeight, effectiveHeightTarget, alpha);
-
-        // Apply dragged height to hip Y position
-        //cc->xformData.localPositions[0].y = cc->lookaheadDragHipsHeight;
-
-        // Lerp in root space (not world space) so target doesn't rotate with character
         cc->lookaheadDragRootVelocityRootSpace = Vector3Lerp(
             cc->lookaheadDragRootVelocityRootSpace,
             blendedLookaheadRootVelocityRootSpace, lookaheadProjectionAlpha);
 
-        cc->lookaheadDragYawRate = Lerp(
-            cc->lookaheadDragYawRate,
-            blendedLookaheadYawRate, lookaheadProjectionAlpha);
+        // lookahead is too slow for yaw rate, so we just directly set it to the blended yaw rate. 
+        // This fixes turnonspot and turnstart precision
+        constexpr bool doLookaheadForYawRate = false;
+        if (doLookaheadForYawRate) 
+        {
+            cc->lookaheadDragYawRate = Lerp(
+                cc->lookaheadDragYawRate,
+                blendedLookaheadYawRate, lookaheadProjectionAlpha);
+        }
+        else
+        {
+            cc->lookaheadDragYawRate = blendedYawRate;
+        }
 
         // Transform lerped velocity from root space to world space
         cc->rootVelocityWorld = Vector3RotateByQuaternion(cc->lookaheadDragRootVelocityRootSpace, cc->worldRotation);
@@ -811,19 +721,6 @@ static void ControlledCharacterUpdate(
 
     // Keep only Y component to prevent pitch/roll accumulation
     cc->worldRotation = QuaternionYComponent(cc->worldRotation);
-
-
-    // --- After blending local pose, update prev-root bookkeeping ---
-    //const Vector3 currentRootPos = cc->xformData.localPositions[0];
-    //const Quaternion currentRootRot = cc->xformData.localRotations[0];
-
-    //cc->prevRootPosition = currentRootPos;
-    //cc->prevRootRotation = currentRootRot;
-
-    // NOTE: We no longer zero localPositions[0].xz because:
-    // - Hip is now stored relative to Magic anchor in the database
-    // - worldPosition = magicWorldPosition (at Y=0)
-    // - The hip's XZ offset from Magic is part of the pose, not root motion
 
     // Forward kinematics (local space)
     TransformDataForwardKinematics(&cc->xformData);
@@ -904,54 +801,6 @@ static void ControlledCharacterUpdate(
 
     for (int side : sides)
     {
-        //const int toeIdx = db->toeIndices[side];
-        //if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount)
-        //{
-        //    if (!cc->lookaheadDragToePosInitialized)
-        //    {
-        //        TraceLog(LOG_WARNING, "Virtual toe: can't find %s toe joint (idx=%d, jointCount=%d)",
-        //            StringFromSide(side), toeIdx, cc->xformData.jointCount);
-        //    }
-        //    continue;
-        //}
-
-        // Blend lookahead toe positions and hip position from cursors
-        //Vector3 blendedLookaheadToePosRootSpace = Vector3Zero();
-        //Vector3 blendedHipPosWorld = Vector3Zero();
-        //Vector3 blendedToePos = Vector3Zero();
-        //const int hipIdx = db->hipJointIndex;
-
-        //for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
-        //{
-        //    const BlendCursor& cur = cc->cursors[ci];
-        //    if (!cur.active) continue;
-        //    const float w = cur.normalizedWeight;
-        //    if (w <= 1e-6f) continue;
-
-        //    //blendedLookaheadToePosRootSpace = Vector3Add(
-        //    //    blendedLookaheadToePosRootSpace,
-        //    //    Vector3Scale(cur.sampledLookaheadToePosRootSpace[side], w));
-
-        //    // Get hip world position for root space -> world space transform
-        //    if (hipIdx >= 0 && hipIdx < (int)cur.globalPositions.size())
-        //    {
-        //        blendedHipPosWorld = Vector3Add(blendedHipPosWorld, Vector3Scale(cur.globalPositions[hipIdx], w));
-        //    }
-
-        //    // Get toe position for speed clamp reference
-        //    if (toeIdx < (int)cur.globalPositions.size())
-        //    {
-        //        blendedToePos = Vector3Add(blendedToePos, Vector3Scale(cur.globalPositions[toeIdx], w));
-        //    }
-        //}
-
-        // Transform lookahead toe from root space to world space
-        // Root space is relative to ground-projected hip (hipPos.x, 0, hipPos.z), heading-aligned
-        // So: rotate by worldRotation, then add blended hip world position (ground-projected)
-        //const Vector3 blendedLookaheadToePosWorld = Vector3Add(
-        //    Vector3RotateByQuaternion(cc->blendedLookaheadToePosRootSpace, cc->worldRotation),
-        //    Vector3{ blendedHipPosWorld.x, 0.0f, blendedHipPosWorld.z });
-
         if (!cc->lookaheadDragToePosInitialized)
         {
             cc->lookaheadDragToePosRootSpace[side] = toeBlendedPositionRootSpace[side];
@@ -997,8 +846,8 @@ static void ControlledCharacterUpdate(
                     const float lowSpeed = 0.5f;
                     const float highSpeed = 2.0f;
                     const float howFast = ClampedInvLerp(lowSpeed, highSpeed, blendedSpeedXZ);
-                    const float lowMult = 1.3f;
-                    const float highMult = 1.8f;
+                    const float lowMult = 1.2f;
+                    const float highMult = 1.4f;
                     const float speedMultiplier = SmoothLerp(lowMult, highMult, howFast);
                     const float maxSpeed = blendedSpeedXZ * speedMultiplier;
                     const float maxDistXZ = maxSpeed * dt;
@@ -1082,7 +931,7 @@ static void ControlledCharacterUpdate(
         if ((worldTime - cc->lastHistorySampleTime) >= HISTORY_SAMPLE_INTERVAL)
         {
             // Add new history point at the back
-            HistoryPoint newPoint;
+            HistoryPoint newPoint;  
             newPoint.position = cc->worldPosition;
             newPoint.timestamp = worldTime;
             cc->positionHistory.push_back(newPoint);

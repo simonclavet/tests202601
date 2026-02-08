@@ -51,6 +51,10 @@ flomo.exe -fbx2bvh input.fbx
 ## Code Style Preferences
 
 Here are some guidelines.
+
+Use the file AiPlan.md as a scratch pad for the current plan. Append to it as needed, so you keep a memory of
+what you are doing and why, and what you have done.
+
 Some of these conventions are not really respected everywhere in this code, but try to follow them as much as 
 possible for any new - Prefer `int` as the main integer type (don't warn about size_t to int conversions)
 - Use `float` for all floating-point values (add `f` suffix to literals: `1.0f`)
@@ -85,6 +89,8 @@ be casual when conversing with the human. We want to have fun coding together.
 When you are copilot and you don't modify code but tell me changes to do, please don't copy paste the whole function or file, 
 unless it is small. Instead tell me clearly what to change, with a bit of context before and after the new thing. 
 Don't put + and - diff markers. 
+
+build often to make sure it builds, using the command:  cmake --build build --config Debug
 
 ## Compiler Warnings Policy
 - Warnings as errors (`/WX`)

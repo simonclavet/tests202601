@@ -37,61 +37,61 @@
 using namespace std;
 
 // Declare the CUDA functions
-//extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
-//extern "C" void cuda_check_error(const char* msg);
-//extern "C" void test_tiny_cuda_nn();
+extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
+extern "C" void cuda_check_error(const char* msg);
+extern "C" void test_tiny_cuda_nn();
 
-//static void TestCudaAndLibtorchAndTCN()
-//{
-//    const int N = 1000000;  // 1 million elements
-//    vector<float> a(N, 1.0f);
-//    vector<float> b(N, 2.0f);
-//    vector<float> c(N, 0.0f);
-//
-//    cout << "Running CUDA addition..." << endl;
-//
-//    auto start = chrono::high_resolution_clock::now();
-//
-//    run_cuda_addition(a.data(), b.data(), c.data(), N);
-//    cuda_check_error("main execution");
-//
-//    auto end = chrono::high_resolution_clock::now();
-//    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
-//
-//    bool correct = true;
-//    for (int i = 0; i < 10; i++) {
-//        if (c[i] != 3.0f) {
-//            correct = false;
-//            break;
-//        }
-//    }
-//
-//    cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << endl;
-//    cout << "Time: " << duration.count() << " microseconds" << endl;
-//    cout << "First 5 results: ";
-//    for (int i = 0; i < 5; i++) {
-//        cout << c[i] << " ";
-//    }
-//    cout << endl;
-//
-//    torch::Device device(torch::kCPU);
-//    if (torch::cuda::is_available()) {
-//        device = torch::Device(torch::kCUDA);
-//        cout << "LibTorch: Using CUDA device" << endl;
-//    }
-//    else {
-//        cout << "LibTorch: Using CPU device" << endl;
-//    }
-//
-//    torch::Tensor tensor = torch::rand({ 3, 3 }).to(device);
-//    auto result = tensor * 2;
-//    cout << "Random tensor:\n" << tensor << endl;
-//    cout << "Tensor * 2:\n" << result << endl;
-//
-//    // Test tiny-cuda-nn (implemented in cuda_kernels.cu)
-//    test_tiny_cuda_nn();
-//}
-//
+static void TestCudaAndLibtorchAndTCN()
+{
+    const int N = 1000000;  // 1 million elements
+    vector<float> a(N, 1.0f);
+    vector<float> b(N, 2.0f);
+    vector<float> c(N, 0.0f);
+
+    cout << "Running CUDA addition..." << endl;
+
+    auto start = chrono::high_resolution_clock::now();
+
+    run_cuda_addition(a.data(), b.data(), c.data(), N);
+    cuda_check_error("main execution");
+
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+
+    bool correct = true;
+    for (int i = 0; i < 10; i++) {
+        if (c[i] != 3.0f) {
+            correct = false;
+            break;
+        }
+    }
+
+    cout << "CUDA addition " << (correct ? "PASSED" : "FAILED") << endl;
+    cout << "Time: " << duration.count() << " microseconds" << endl;
+    cout << "First 5 results: ";
+    for (int i = 0; i < 5; i++) {
+        cout << c[i] << " ";
+    }
+    cout << endl;
+
+    torch::Device device(torch::kCPU);
+    if (torch::cuda::is_available()) {
+        device = torch::Device(torch::kCUDA);
+        cout << "LibTorch: Using CUDA device" << endl;
+    }
+    else {
+        cout << "LibTorch: Using CPU device" << endl;
+    }
+
+    torch::Tensor tensor = torch::rand({ 3, 3 }).to(device);
+    auto result = tensor * 2;
+    cout << "Random tensor:\n" << tensor << endl;
+    cout << "Tensor * 2:\n" << result << endl;
+
+    // Test tiny-cuda-nn (implemented in cuda_kernels.cu)
+    test_tiny_cuda_nn();
+}
+
 
 
 //----------------------------------------------------------------------------------
@@ -696,7 +696,6 @@ static inline void ImGuiCharacterData(
     CharacterData* characterData,
     CameraSystem* camera,
     ControlledCharacter* controlledCharacter,
-    ScrubberSettings* scrubberSettings,
     char* errMsg,
     int argc,
     char** argv)
@@ -921,14 +920,6 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
                 config->poseDragLookaheadTimeEditor = Clamp(config->poseDragLookaheadTimeEditor, 0.01f, 0.2f);
                 app->animDatabaseRebuildPending = true;
             }
-            ImGui::SetNextItemWidth(80);
-            if (ImGui::InputFloat("Extrap Mult", &config->lookaheadExtrapolationMult, 0.0f, 0.0f, "%.2f"))
-            {
-                config->lookaheadExtrapolationMult = Clamp(config->lookaheadExtrapolationMult, 0.5f, 2.0f);
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Extrapolation multiplier (1.0=exact, >1=overshoot to compensate lag)");
-            }
         }
 
         ImGui::Separator();
@@ -1097,6 +1088,8 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             {
                 db.featuresConfig = editedMMConfig;
                 db.poseDragLookaheadTime = config->poseDragLookaheadTimeEditor;
+                db.blendRootModePosition = config->blendRootModePositionEditor;
+                db.blendRootModeRotation = config->blendRootModeRotationEditor;
                 AnimDatabaseRebuild(&db, &app->characterData);
                 app->animDatabaseRebuildPending = false;
                 TraceLog(LOG_INFO, "Motion matching config updated");
@@ -1203,6 +1196,8 @@ static void ApplicationUpdate(void* voidApplicationState)
 
             app->animDatabase.featuresConfig = app->config.mmConfigEditor;
             app->animDatabase.poseDragLookaheadTime = app->config.poseDragLookaheadTimeEditor;
+            app->animDatabase.blendRootModePosition = app->config.blendRootModePositionEditor;
+            app->animDatabase.blendRootModeRotation = app->config.blendRootModeRotationEditor;
 
             // Rebuild animation database
             AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
@@ -1422,8 +1417,6 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Update Controlled Character (root motion playback)
 
-    const float dt = GetFrameTime();
-
     if (app->controlledCharacter.active && effectiveDt > 0.0f)
     {
         // sync settings from config
@@ -1539,7 +1532,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             (acceptInput && IsMouseButtonDown(2)) ? mouseDelta.x : 0.0f,  // MMB pans
             (acceptInput && IsMouseButtonDown(2)) ? mouseDelta.y : 0.0f,
             scrollInput,  // Scroll zooms
-            dt);
+            rawDt);
     }
     else if (app->camera.mode == FlomoCameraMode::UnrealEditor)
     {
@@ -1563,7 +1556,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             !imguiWantsKeyboard && IsKeyDown(KEY_Q),
             isActive,
             isPanning,
-            dt);
+            rawDt);
     }
     else if (app->camera.mode == FlomoCameraMode::LazyTurretFollower)
     {
@@ -1578,7 +1571,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.x : 0.0f,  // RMB rotates
             (acceptInput && IsMouseButtonDown(1)) ? mouseDelta.y : 0.0f,
             scrollInput,  // Scroll zooms
-            dt);
+            rawDt);
     }
 
     // Update Player Control Input (WASD relative to camera)
@@ -2574,130 +2567,6 @@ static void ApplicationUpdate(void* voidApplicationState)
 
 
 
-    //if (app->animDatabase.motionFrameCount > 0 && app->animDatabase.jointCount > 0)
-    //{
-    //    // How far into the future to visualize (seconds)
-    //    const float futureOffsetSeconds = 1.0f;
-
-    //    // For every loaded character (these are the entries in CharacterData)
-    //    for (int c = 0; c < app->characterData.count; ++c)
-    //    {
-    //        // Make sure this character has an associated clip in the motion DB
-    //        if (c < (int)app->animDatabase.clipStartFrame.size() &&
-    //            app->animDatabase.clipStartFrame[c] < app->animDatabase.clipEndFrame[c])
-    //        {
-    //            //const BVHData& bvh = app->characterData.bvhData[c];
-
-    //            // Compute future local frame index for this clip (nearest sampling)
-    //            const float clipFrameTime = app->animDatabase.animFrameTime[c];
-    //            const int clipFrameCount = app->animDatabase.animFrameCount[c];
-    //            const float futureTime = app->scrubberSettings.playTime + futureOffsetSeconds;
-
-    //            int localFrame = 0;
-    //            if (clipFrameTime > 0.0f)
-    //            {
-    //                localFrame = ClampInt((int)(futureTime / clipFrameTime + 0.5f), 0, clipFrameCount - 1);
-    //            }
-
-    //            // Map to motion-DB frame index (compacted DB)
-    //            const int motionFrameIndex = app->animDatabase.clipStartFrame[c] + localFrame;
-    //            if (motionFrameIndex < 0 || motionFrameIndex >= app->animDatabase.motionFrameCount)
-    //            {
-    //                continue; // out-of-range (shouldn't usually happen)
-    //            }
-
-    //            // Draw skeleton using positions from jointPositions
-    //            const int jointCount = app->animDatabase.jointCount;
-    //            const Color drawColor = app->characterData.colors[c];
-
-    //            for (int j = 0; j < jointCount; ++j)
-    //            {
-    //                const size_t idx = (size_t)motionFrameIndex * jointCount + j;
-    //                const Vector3 jp = app->animDatabase.jointPositionsAnimSpace[idx];
-
-    //                // If this joint is an end-site for this character, draw slightly different primitive
-    //                bool isEnd = false;
-    //                if (j < app->characterData.xformData[c].jointCount)
-    //                {
-    //                    isEnd = app->characterData.xformData[c].endSite[j];
-    //                }
-
-    //                if (!isEnd)
-    //                {
-    //                    DrawSphereWires(jp, 0.01f, 4, 6, drawColor);
-    //                }
-    //                else
-    //                {
-    //                    DrawCubeWiresV(jp, Vector3{ 0.02f, 0.02f, 0.02f }, Color{ 150, 150, 150, 255 });
-    //                }
-
-    //                // Draw line to parent when valid
-    //                int parent = -1;
-    //                if (j < app->characterData.xformData[c].jointCount)
-    //                {
-    //                    parent = app->characterData.xformData[c].parents[j];
-    //                }
-
-    //                if (parent != -1 && parent < jointCount)
-    //                {
-    //                    const size_t pidx = (size_t)motionFrameIndex * jointCount + parent;
-    //                    const Vector3 pjp = app->animDatabase.jointPositionsAnimSpace[pidx];
-    //                    DrawLine3D(jp, pjp, drawColor);
-    //                }
-    //            }
-    //        }
-    //    }
-    //}
-
-
-
-    // Draw small red spheres at the location of the bone named "LeftToeBase"
-    // for every loaded character and the controlled character (if active).
-    // This draws filled red spheres at the joint's global position.
-    //{
-    //    // Characters loaded from BVH/FBX files
-    //    for (int c = 0; c < app->characterData.count; ++c)
-    //    {
-    //        const BVHData& bvh = app->characterData.bvhData[c];
-    //        int leftToeIdx = -1;
-    //        for (int j = 0; j < bvh.jointCount; ++j)
-    //        {
-    //            if (bvh.joints[j].name != nullptr && strcmp(bvh.joints[j].name, "LeftToeBase") == 0)
-    //            {
-    //                leftToeIdx = j;
-    //                break;
-    //            }
-    //        }
-
-    //        if (leftToeIdx != -1 && leftToeIdx < app->characterData.xformData[c].jointCount)
-    //        {
-    //            const Vector3 pos = app->characterData.xformData[c].globalPositions[leftToeIdx];
-    //            DrawSphere(pos, 0.02f, RED);
-    //        }
-    //    }
-
-    //    // Controlled character (if active)
-    //    if (app->controlledCharacter.active && app->controlledCharacter.skeleton)
-    //    {
-    //        const BVHData* cbvh = app->controlledCharacter.skeleton;
-    //        int leftToeIdx = -1;
-    //        for (int j = 0; j < cbvh->jointCount; ++j)
-    //        {
-    //            if (cbvh->joints[j].name != nullptr && strcmp(cbvh->joints[j].name, "LeftToeBase") == 0)
-    //            {
-    //                leftToeIdx = j;
-    //                break;
-    //            }
-    //        }
-
-    //        if (leftToeIdx != -1 && leftToeIdx < app->controlledCharacter.xformData.jointCount)
-    //        {
-    //            const Vector3 pos = app->controlledCharacter.xformData.globalPositions[leftToeIdx];
-    //            DrawSphere(pos, 0.02f, RED);
-    //        }
-    //    }
-    //}
-
     // Rendering Done
 
     EndMode3D();
@@ -2745,7 +2614,6 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Characters
         ImGuiCharacterData(&app->characterData,
             &app->camera, &app->controlledCharacter,
-            &app->scrubberSettings,
             app->errMsg, app->argc, app->argv);
 
         // Color Picker
@@ -2924,12 +2792,12 @@ static void ApplicationUpdate(void* voidApplicationState)
                     : 0.0f;
                 ImGui::Text("  Time: %.2f / %.2f", cur.animTime, maxTime);
 
-                // Root motion delta info
-                const float deltaLen = Vector3Length(cur.lastDeltaWorld);
-                ImGui::Text("  dPos: (%.4f, %.4f) len=%.4f",
-                    cur.lastDeltaWorld.x, cur.lastDeltaWorld.z, deltaLen);
-                ImGui::Text("  dYaw: %.4f rad (%.2f deg)",
-                    cur.lastDeltaYaw, cur.lastDeltaYaw * RAD2DEG);
+                //// Root motion delta info
+                //const float deltaLen = Vector3Length(cur.lastDeltaWorld);
+                //ImGui::Text("  dPos: (%.4f, %.4f) len=%.4f",
+                //    cur.lastDeltaWorld.x, cur.lastDeltaWorld.z, deltaLen);
+                //ImGui::Text("  dYaw: %.4f rad (%.2f deg)",
+                //    cur.lastDeltaYaw, cur.lastDeltaYaw * RAD2DEG);
 
                 ImGui::PopID();
             }
@@ -2937,14 +2805,6 @@ static void ApplicationUpdate(void* voidApplicationState)
             // Blended result
             ImGui::Separator();
             ImGui::Text("Blended Result:");
-            const float blendedLen = Vector3Length(app->controlledCharacter.lastBlendedDeltaWorld);
-            ImGui::Text("  dPos: (%.4f, %.4f) len=%.4f",
-                app->controlledCharacter.lastBlendedDeltaWorld.x,
-                app->controlledCharacter.lastBlendedDeltaWorld.z,
-                blendedLen);
-            ImGui::Text("  dYaw: %.4f rad (%.2f deg)",
-                app->controlledCharacter.lastBlendedDeltaYaw,
-                app->controlledCharacter.lastBlendedDeltaYaw * RAD2DEG);
         }
         ImGui::End();
     }
@@ -3021,7 +2881,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
-    //TestCudaAndLibtorchAndTCN();
+    TestCudaAndLibtorchAndTCN();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;
@@ -3186,11 +3046,6 @@ int main(int argc, char** argv)
 
         // Auto-load a default scene on startup
         {
-            //vector<const char*> autoFiles = 
-            //{ 
-            //    "data\\lafan1_bvh\\dance1_subject2.bvh",
-            //    "data\\lafan1_bvh\\sprint1_subject4.bvh"
-            //};
             vector<const char*> autoFiles =
             {
                 "data\\timi\\xs_20251101_aleblanc_lantern_nav-002.fbx",
@@ -3240,6 +3095,8 @@ int main(int argc, char** argv)
 
         app.animDatabase.featuresConfig = app.config.mmConfigEditor;
         app.animDatabase.poseDragLookaheadTime = app.config.poseDragLookaheadTimeEditor;
+        app.animDatabase.blendRootModePosition = app.config.blendRootModePositionEditor;
+        app.animDatabase.blendRootModeRotation = app.config.blendRootModeRotationEditor;
 
         // Build animation database and initialize controlled character
         AnimDatabaseRebuild(&app.animDatabase, &app.characterData);

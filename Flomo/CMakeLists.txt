@@ -61,7 +61,7 @@ set(TORCH_INCLUDE_DIR_2 "${TORCH_RELEASE_PATH}/include/torch/csrc/api/include")
 # Optional: tiny-cuda-nn (set to ON to enable)
 # =============================================================================
 
-option(USE_TINY_CUDA_NN "Enable tiny-cuda-nn neural network library" OFF)
+option(USE_TINY_CUDA_NN "Enable tiny-cuda-nn neural network library" ON)
 
 if(USE_TINY_CUDA_NN)
     message(STATUS "tiny-cuda-nn: ENABLED")
