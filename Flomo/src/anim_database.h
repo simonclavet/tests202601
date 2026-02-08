@@ -309,16 +309,48 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         for (int f = clipStart; f < clipEnd; ++f)
         {
             span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
+            span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
 
             // Magic position = spine projected to ground
             const Vector3 spinePos = posRow[db->spine1Index];
             db->magicPosition[f] = Vector3{ spinePos.x, 0.0f, spinePos.z };
 
-            // Magic yaw = direction from head to right hand projected onto XZ plane
-            const Vector3 headPos = posRow[db->headIndex];
-            const Vector3 handPos = posRow[db->handIndices[SIDE_RIGHT]];
-            const Vector3 headToHand = Vector3Subtract(handPos, headPos);
-            db->magicYaw[f] = atan2f(headToHand.x, headToHand.z);
+            // Magic yaw depends on blend root mode rotation setting
+            switch (db->featuresConfig.blendRootModeRotation)
+            {
+            case BlendRootModeRotation::HeadToRightHand:
+            {
+                // Magic yaw = direction from head to right hand projected onto XZ plane
+                const Vector3 headPos = posRow[db->headIndex];
+                const Vector3 handPos = posRow[db->handIndices[SIDE_RIGHT]];
+                const Vector3 headToHand = Vector3Subtract(handPos, headPos);
+                db->magicYaw[f] = atan2f(headToHand.x, headToHand.z);
+                break;
+            }
+            case BlendRootModeRotation::Hips:
+            {
+                // Magic yaw = hip forward direction projected onto XZ plane
+                const Rot6d hipRot = rotRow[db->hipJointIndex];
+                // Rotate Z-axis (0,0,1) by hip rotation to get forward direction
+                const Vector3 hipForward = Vector3RotateByRot6d(Vector3{ 0.0f, 0.0f, 1.0f }, hipRot);
+                // Project to XZ plane and normalize
+                Vector3 hipForwardHorizontal = Vector3{ hipForward.x, 0.0f, hipForward.z };
+                const float len = Vector3Length(hipForwardHorizontal);
+                if (len > 1e-6f)
+                {
+                    hipForwardHorizontal = Vector3Scale(hipForwardHorizontal, 1.0f / len);
+                    db->magicYaw[f] = atan2f(hipForwardHorizontal.x, hipForwardHorizontal.z);
+                }
+                else
+                {
+                    db->magicYaw[f] = 0.0f;  // pathological case: hip pointing straight up/down
+                }
+                break;
+            }
+            default:
+                db->magicYaw[f] = 0.0f;
+                break;
+            }
         }
     }
 
@@ -417,7 +449,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipStart = db->clipStartFrame[c];
         const int clipEnd = db->clipEndFrame[c];
         const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
+        const float n = db->featuresConfig.poseDragLookaheadTime / frameTime;
         const float nextWeight = n;
         const float currWeight = 1.0f - n;
 
@@ -472,7 +504,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipStart = db->clipStartFrame[c];
         const int clipEnd = db->clipEndFrame[c];
         const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
+        const float n = db->featuresConfig.poseDragLookaheadTime / frameTime;
         const float nextWeight = n;
         const float currWeight = 1.0f - n;
 
@@ -513,6 +545,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     // Compute Magic anchor velocities and yaw rates FIRST
     // (magicPosition and magicYaw were already computed earlier for joint velocities)
+    db->magicVelocityAnimSpace.resize(db->motionFrameCount);
     db->magicVelocityRootSpace.resize(db->motionFrameCount);
     db->magicYawRate.resize(db->motionFrameCount);
 
@@ -532,11 +565,13 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {
                 if (f > clipStart)
                 {
+                    db->magicVelocityAnimSpace[f] = db->magicVelocityAnimSpace[f - 1];
                     db->magicVelocityRootSpace[f] = db->magicVelocityRootSpace[f - 1];
                     db->magicYawRate[f] = db->magicYawRate[f - 1];
                 }
                 else
                 {
+                    db->magicVelocityAnimSpace[f] = Vector3Zero();
                     db->magicVelocityRootSpace[f] = Vector3Zero();
                     db->magicYawRate[f] = 0.0f;
                 }
@@ -545,7 +580,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {
                 // Use already-computed magic positions (don't recompute from bones)
                 const Vector3 nextMagicPos = db->magicPosition[f + 1];
-                Vector3 velAnim = Vector3Scale(Vector3Subtract(nextMagicPos, db->magicPosition[f]), invFrameTime);
+                const Vector3 currMagicPos = db->magicPosition[f];
+                const Vector3 velAnim = Vector3Scale(Vector3Subtract(nextMagicPos, currMagicPos), invFrameTime);
+                db->magicVelocityAnimSpace[f] = velAnim;
 
                 // Transform to magic space (heading-relative)
                 // Rotate by -magicYaw to go from anim space to magic-local space
@@ -561,6 +598,42 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 // Use already-computed magic yaw (don't recompute from bones)
                 const float nextMagicYaw = db->magicYaw[f + 1];
                 db->magicYawRate[f] = WrapAngleToPi(nextMagicYaw - magicYaw) * invFrameTime;
+            }
+        }
+    }
+
+    // Compute Magic anchor accelerations
+    db->magicAccelerationAnimSpace.resize(db->motionFrameCount);
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+        const float invFrameTime = 1.0f / frameTime;
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            if (f > clipStart && f < clipEnd - 1)
+            {
+                // a_i = (v_i - v_{i-1}) / dt
+                // where v_i is velocity at i+0.5, v_{i-1} is velocity at i-0.5
+                db->magicAccelerationAnimSpace[f] = Vector3Scale(
+                    Vector3Subtract(db->magicVelocityAnimSpace[f], db->magicVelocityAnimSpace[f - 1]),
+                    invFrameTime);
+            }
+            else if (f == clipStart)
+            {
+                if (clipEnd - clipStart > 1)
+                    db->magicAccelerationAnimSpace[f] = db->magicAccelerationAnimSpace[f + 1];
+                else
+                    db->magicAccelerationAnimSpace[f] = Vector3Zero();
+            }
+            else // f == clipEnd - 1
+            {
+                if (clipEnd - clipStart > 1)
+                    db->magicAccelerationAnimSpace[f] = db->magicAccelerationAnimSpace[f - 1];
+                else
+                    db->magicAccelerationAnimSpace[f] = Vector3Zero();
             }
         }
     }
@@ -585,7 +658,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipStart = db->clipStartFrame[c];
         const int clipEnd = db->clipEndFrame[c];
         const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
+        const float n = db->featuresConfig.poseDragLookaheadTime / frameTime;
         const float nextWeight = n;
         const float currWeight = 1.0f - n;
 
@@ -684,7 +757,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipEnd = db->clipEndFrame[c];
         //const int hipIdx = db->hipJointIndex;
         const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
+        const float n = db->featuresConfig.poseDragLookaheadTime / frameTime;
         const float nextWeight = n;
         const float currWeight = 1.0f - n;
 
@@ -747,7 +820,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int clipStart = db->clipStartFrame[c];
         const int clipEnd = db->clipEndFrame[c];
         const float frameTime = db->animFrameTime[c];
-        const float n = db->poseDragLookaheadTime / frameTime;
+        const float n = db->featuresConfig.poseDragLookaheadTime / frameTime;
         const float nextWeight = n;
         const float currWeight = 1.0f - n;
 
@@ -813,6 +886,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed)) db->featureDim += (int)cfg.futureTrajPointTimes.size();
     if (cfg.IsFeatureEnabled(FeatureType::PastPosition)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::AimDirection)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe)) db->featureDim += 2;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAccel)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
 
     db->features.clear();
     db->featureNames.clear();
@@ -1191,6 +1266,116 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                     db->featureNames.push_back(string(nameBufZ));
                     db->featureTypes.push_back(FeatureType::AimDirection);
                     db->featureTypes.push_back(FeatureType::AimDirection);
+                }
+            }
+        }
+
+        // HEAD TO SLOWEST TOE: vector from head to a speed-weighted average of toe positions
+        if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe))
+        {
+            const int headIdx = db->headIndex;
+
+            // Get head and toe positions in magic space
+            const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
+            const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
+
+            // Compute local toe speeds using the same method as ToeVel
+            float leftSpeed = 0.0f;
+            float rightSpeed = 0.0f;
+
+            if (f > clipStart && dt > 0.0f)
+            {
+                span<const Vector3> posPrevRow = db->jointPositionsAnimSpace.row_view(f - 1);
+                const Vector3 velLeftWorld = Vector3Scale(Vector3Subtract(posRow[leftIdx], posPrevRow[leftIdx]), 1.0f / dt);
+                const Vector3 velRightWorld = Vector3Scale(Vector3Subtract(posRow[rightIdx], posPrevRow[rightIdx]), 1.0f / dt);
+                leftSpeed = Vector3Length(velLeftWorld);
+                rightSpeed = Vector3Length(velRightWorld);
+            }
+
+            // Weight logic: more speed on other foot -> more weight on this foot
+            float wLeft, wRight;
+            float totalSpeed = leftSpeed + rightSpeed;
+            if (totalSpeed < 1e-6f)
+            {
+                wLeft = 0.5f;
+                wRight = 0.5f;
+            }
+            else
+            {
+                wLeft = rightSpeed / totalSpeed;
+                wRight = leftSpeed / totalSpeed;
+            }
+
+            // P_slowest = wLeft*P_left + wRight*P_right
+            const Vector3 localSlowestToePos = Vector3Add(
+                Vector3Scale(localLeftPos, wLeft),
+                Vector3Scale(localRightPos, wRight));
+
+            const Vector3 headToSlowest = Vector3Subtract(localSlowestToePos, localHeadPos);
+
+            featRow[currentFeature++] = headToSlowest.x;
+            featRow[currentFeature++] = headToSlowest.z;
+
+            if (isFirstFrame)
+            {
+                db->featureNames.push_back(string("HeadToSlowestToeX"));
+                db->featureNames.push_back(string("HeadToSlowestToeZ"));
+                db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
+                db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
+            }
+        }
+
+        // FUTURE ACCELERATION: future root acceleration (XZ) at trajectory times, in current magic space
+        if (cfg.IsFeatureEnabled(FeatureType::FutureAccel))
+        {
+            const float frameTime = db->animFrameTime[clipIdx];
+
+            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+            {
+                const float futureTime = cfg.futureTrajPointTimes[p];
+                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
+                const int futureFrame = f + futureFrameOffset;
+
+                Vector3 futureAccelMagicSpace = Vector3Zero();
+
+                // Check if future frame is within the same clip
+                if (futureFrame >= clipStart && futureFrame < clipEnd)
+                {
+                    // Average acceleration over 5-frame window centered at futureFrame for smoothness
+                    Vector3 avgAccelAnimSpace = Vector3Zero();
+                    int count = 0;
+                    for (int offset = -2; offset <= 2; ++offset)
+                    {
+                        const int sampleFrame = futureFrame + offset;
+                        if (sampleFrame >= clipStart && sampleFrame < clipEnd)
+                        {
+                            avgAccelAnimSpace = Vector3Add(avgAccelAnimSpace, db->magicAccelerationAnimSpace[sampleFrame]);
+                            count++;
+                        }
+                    }
+                    if (count > 0)
+                    {
+                        avgAccelAnimSpace = Vector3Scale(avgAccelAnimSpace, 1.0f / (float)count);
+                    }
+                    avgAccelAnimSpace.y = 0.0f;  // XZ only
+
+                    // Transform to current magicSpace (relative to current frame's magic yaw)
+                    futureAccelMagicSpace = Vector3RotateByRot6d(avgAccelAnimSpace, invMagicYawRot);
+                }
+
+                featRow[currentFeature++] = futureAccelMagicSpace.x;
+                featRow[currentFeature++] = futureAccelMagicSpace.z;
+
+                if (isFirstFrame)
+                {
+                    char nameBufX[64];
+                    char nameBufZ[64];
+                    snprintf(nameBufX, sizeof(nameBufX), "FutureAccelX_%.2fs", futureTime);
+                    snprintf(nameBufZ, sizeof(nameBufZ), "FutureAccelZ_%.2fs", futureTime);
+                    db->featureNames.push_back(string(nameBufX));
+                    db->featureNames.push_back(string(nameBufZ));
+                    db->featureTypes.push_back(FeatureType::FutureAccel);
+                    db->featureTypes.push_back(FeatureType::FutureAccel);
                 }
             }
         }

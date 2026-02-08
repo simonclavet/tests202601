@@ -327,7 +327,8 @@ static void ControlledCharacterUpdate(
         {
             // Clamp to max achievable change
             const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
-            cc->virtualControlSmoothedVelocity = Vector3Add(cc->virtualControlSmoothedVelocity, Vector3Scale(velDeltaDir, maxDeltaVelMag));
+            cc->virtualControlSmoothedVelocity =
+                Vector3Add(cc->virtualControlSmoothedVelocity, Vector3Scale(velDeltaDir, maxDeltaVelMag));
         }
     }
 
@@ -632,7 +633,7 @@ static void ControlledCharacterUpdate(
         }
 
         // lookaheadTime >= dt ensures alpha <= 1 (no overshoot)
-        const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+        const float lookaheadTime = Max(dt, db->featuresConfig.poseDragLookaheadTime);
         // ratio of how much we go toward lookahead target 
         const float lookaheadProjectionAlpha = dt / lookaheadTime;
         assert(lookaheadProjectionAlpha <= 1.0f);
@@ -795,7 +796,7 @@ static void ControlledCharacterUpdate(
     // Update virtual toe positions using lookahead dragging
     // lookaheadDragToePos: drags toward blended lookahead target (unconstrained, for unlock detection)
     // virtualToePos: speed-clamped for IK (constrained)
-    const float lookaheadTime = Max(dt, db->poseDragLookaheadTime);
+    const float lookaheadTime = Max(dt, db->featuresConfig.poseDragLookaheadTime);
     const float toeAlpha = dt / lookaheadTime;
     assert(toeAlpha <= 1.0f);
 

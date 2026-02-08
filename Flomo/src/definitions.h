@@ -51,6 +51,8 @@ enum class FeatureType : int
     FutureSpeed,         // future root speed (scalar) at sample points => 1 * points
     PastPosition,        // past hip position (XZ) in current hip horizontal frame => 2 dims
     AimDirection,        // aim direction (head→rightHand) at trajectory times => 2 * points
+    HeadToSlowestToe,    // head to slowest foot vector (XZ) in root space => 2 dims
+    FutureAccel,         // future root acceleration (XZ) at trajectory times => 2 * points
 
     COUNT                // Must be last - used for array sizing
 };
@@ -68,6 +70,8 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::FutureSpeed: return "Future Speed";
     case FeatureType::PastPosition: return "Past Position";
     case FeatureType::AimDirection: return "Aim Direction";
+    case FeatureType::HeadToSlowestToe: return "Head To Slowest Toe";
+    case FeatureType::FutureAccel: return "Future Accel";
     default: return "Unknown";
     }
 }
@@ -113,6 +117,13 @@ struct MotionMatchingFeaturesConfig
     float featureTypeWeights[static_cast<int>(FeatureType::COUNT)];
     std::vector<float> futureTrajPointTimes = { 0.2f, 0.4f, 0.8f };
     float pastTimeOffset = 0.1f;
+
+    // Pose drag lookahead time (seconds) - used for precomputing lookahead poses
+    float poseDragLookaheadTime = 0.1f;
+
+    // Blend root mode settings
+    BlendRootModePosition blendRootModePosition = BlendRootModePosition::Hips;
+    BlendRootModeRotation blendRootModeRotation = BlendRootModeRotation::Hips;
 
     MotionMatchingFeaturesConfig()
     {
@@ -208,11 +219,8 @@ struct AppConfig {
     
     bool drawPlayerInput = false;
 
-    // Motion Matching Configuration, version that is editable: those are copied to AnimDatabase on build
+    // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
-    float poseDragLookaheadTimeEditor = 0.1f;  // lookahead time for pose dragging (seconds)
-    BlendRootModePosition blendRootModePositionEditor = BlendRootModePosition::Hips;
-    BlendRootModeRotation blendRootModeRotationEditor = BlendRootModeRotation::Hips;
 
 
     // Validity
@@ -236,15 +244,8 @@ struct PlayerControlInput
 // A unified view of all loaded animations, suitable for sampling by ControlledCharacter.
 struct AnimDatabase
 {
-    // Motion matching feature configuration
+    // Motion matching feature configuration (includes lookahead time and blend root modes)
     MotionMatchingFeaturesConfig featuresConfig;
-
-    // Pose drag lookahead time (seconds) - used for precomputing lookahead poses
-    float poseDragLookaheadTime = 0.1f;
-
-    // Blend root mode settings (copied from editor on rebuild)
-    BlendRootModePosition blendRootModePosition = BlendRootModePosition::Hips;
-    BlendRootModeRotation blendRootModeRotation = BlendRootModeRotation::Hips;
 
     // References to all loaded animations
     int animCount = -1;
@@ -325,6 +326,8 @@ struct AnimDatabase
     // Magic anchor transforms per frame (position = spine3 on ground, yaw = head→rightHand direction)
     std::vector<Vector3> magicPosition;           // [motionFrameCount] - (spine3.x, 0, spine3.z)
     std::vector<float> magicYaw;                  // [motionFrameCount] - yaw from head→rightHand
+    std::vector<Vector3> magicVelocityAnimSpace;  // [motionFrameCount] - velocity in animation world space
+    std::vector<Vector3> magicAccelerationAnimSpace; // [motionFrameCount] - acceleration in animation world space
     std::vector<Vector3> magicVelocityRootSpace;           // [motionFrameCount] - XZ velocity in magic space
     std::vector<float> magicYawRate;              // [motionFrameCount] - yaw rate (rad/s)
     std::vector<Vector3> lookaheadMagicVelocity;  // [motionFrameCount] - extrapolated
@@ -368,6 +371,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->lookaheadRootMotionYawRates.clear();
     db->magicPosition.clear();
     db->magicYaw.clear();
+    db->magicVelocityAnimSpace.clear();
+    db->magicAccelerationAnimSpace.clear();
     db->magicVelocityRootSpace.clear();
     db->magicYawRate.clear();
     db->lookaheadMagicVelocity.clear();

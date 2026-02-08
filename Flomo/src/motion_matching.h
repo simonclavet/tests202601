@@ -147,16 +147,13 @@ static void ComputeMotionFeatures(
     }
 
 
-    // Compute future velocities once if either FutureVel or FutureSpeed is enabled
-    std::vector<Vector3> futureVelocities;
-    if (cfg.IsFeatureEnabled(FeatureType::FutureVel) || cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
-    {
-        const Vector3 currentVelWorld = cc->virtualControlSmoothedVelocity;
-        const Vector3 desiredVelWorld = input->desiredVelocity;
-        const float maxAcceleration = 4.0f;
+    // Compute future velocities for velocity-based features (FutureVel, FutureSpeed, FutureVelClamped, FutureAccel)
+    const Vector3 currentVelWorld = cc->virtualControlSmoothedVelocity;
+    const Vector3 desiredVelWorld = input->desiredVelocity;
+    const float maxAcceleration = 4.0f;
 
-        ComputeFutureVelocities(currentVelWorld, desiredVelWorld, maxAcceleration, cfg.futureTrajPointTimes, futureVelocities);
-    }
+    std::vector<Vector3> futureVelocities;
+    ComputeFutureVelocities(currentVelWorld, desiredVelWorld, maxAcceleration, cfg.futureTrajPointTimes, futureVelocities);
 
     // FutureVel: predicted velocity at future sample times (XZ components in magic space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
@@ -264,6 +261,86 @@ static void ComputeMotionFeatures(
         {
             outFeatures[fi++] = desiredAimLocal.x;
             outFeatures[fi++] = desiredAimLocal.z;
+        }
+    }
+
+    // HeadToSlowestToe: vector from head to a speed-weighted average of toe positions (in magic space)
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe))
+    {
+        const int headIdx = db->headIndex;
+        Vector3 headPos = Vector3Zero();
+        if (headIdx >= 0 && headIdx < xform->jointCount)
+        {
+            headPos = xform->globalPositions[headIdx];
+        }
+
+        // Get positions in magic frame
+        const Vector3 magicToHead = Vector3Subtract(headPos, magicPos);
+        const Vector3 localHeadPos = Vector3RotateByQuaternion(magicToHead, invMagicWorldRot);
+
+        // Get toe speeds (using provided toeVelocity which is in world space)
+        const float leftSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
+        const float rightSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
+
+        float wLeft, wRight;
+        float totalSpeed = leftSpeed + rightSpeed;
+        if (totalSpeed < 1e-6f)
+        {
+            wLeft = 0.5f;
+            wRight = 0.5f;
+        }
+        else
+        {
+            wLeft = rightSpeed / totalSpeed;
+            wRight = leftSpeed / totalSpeed;
+        }
+
+        // P_slowest = wLeft*P_left + wRight*P_right (already in magic space)
+        const Vector3 localSlowestToePos = Vector3Add(
+            Vector3Scale(localLeftPos, wLeft),
+            Vector3Scale(localRightPos, wRight));
+
+        const Vector3 headToSlowest = Vector3Subtract(localSlowestToePos, localHeadPos);
+
+        outFeatures[fi++] = headToSlowest.x;
+        outFeatures[fi++] = headToSlowest.z;
+    }
+
+    // FutureAccel: predicted acceleration at future sample times (XZ in magic space)
+    // Uses constant acceleration model from ComputeFutureVelocities
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAccel))
+    {
+        // Compute the constant control acceleration
+        const Vector3 velDelta = Vector3Subtract(desiredVelWorld, currentVelWorld);
+        const float velDeltaMag = Vector3Length(velDelta);
+
+        Vector3 controlAccelWorld = Vector3Zero();
+        if (velDeltaMag > 1e-6f)
+        {
+            // Direction towards desired velocity
+            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
+            // Acceleration magnitude (capped at maxAcceleration)
+            controlAccelWorld = Vector3Scale(velDeltaDir, maxAcceleration);
+        }
+
+        // For each trajectory time, check if we're still accelerating or have reached desired
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            Vector3 futureAccelWorld = controlAccelWorld;
+
+            // Check if we would have reached desired velocity by this time
+            const float maxDeltaVelMag = maxAcceleration * futureTime;
+            if (velDeltaMag <= maxDeltaVelMag)
+            {
+                // Already at desired velocity, no more acceleration
+                futureAccelWorld = Vector3Zero();
+            }
+
+            // Transform to magic space for feature output
+            const Vector3 futureAccelMagicSpace = Vector3RotateByQuaternion(futureAccelWorld, invMagicWorldRot);
+            outFeatures[fi++] = futureAccelMagicSpace.x;
+            outFeatures[fi++] = futureAccelMagicSpace.z;
         }
     }
 

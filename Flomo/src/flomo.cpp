@@ -915,9 +915,9 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         if (config->cursorBlendMode == CursorBlendMode::LookaheadDragging)
         {
             ImGui::SetNextItemWidth(80);
-            if (ImGui::InputFloat("Lookahead Time", &config->poseDragLookaheadTimeEditor, 0.0f, 0.0f, "%.3f"))
+            if (ImGui::InputFloat("Lookahead Time", &config->mmConfigEditor.poseDragLookaheadTime, 0.0f, 0.0f, "%.3f"))
             {
-                config->poseDragLookaheadTimeEditor = Clamp(config->poseDragLookaheadTimeEditor, 0.01f, 0.2f);
+                config->mmConfigEditor.poseDragLookaheadTime = Clamp(config->mmConfigEditor.poseDragLookaheadTime, 0.01f, 0.2f);
                 app->animDatabaseRebuildPending = true;
             }
         }
@@ -1039,15 +1039,15 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         // Blend Root Mode Position
         ImGui::Text("Root Position Mode:");
         ImGui::SameLine(180);
-        if (ImGui::BeginCombo("##rootPosMode", BlendRootModePositionName(config->blendRootModePositionEditor)))
+        if (ImGui::BeginCombo("##rootPosMode", BlendRootModePositionName(config->mmConfigEditor.blendRootModePosition)))
         {
             for (int i = 0; i < static_cast<int>(BlendRootModePosition::COUNT); ++i)
             {
                 const BlendRootModePosition mode = static_cast<BlendRootModePosition>(i);
-                const bool isSelected = (config->blendRootModePositionEditor == mode);
+                const bool isSelected = (config->mmConfigEditor.blendRootModePosition == mode);
                 if (ImGui::Selectable(BlendRootModePositionName(mode), isSelected))
                 {
-                    config->blendRootModePositionEditor = mode;
+                    config->mmConfigEditor.blendRootModePosition = mode;
                     configChanged = true;
                 }
                 if (isSelected) ImGui::SetItemDefaultFocus();
@@ -1058,15 +1058,15 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
         // Blend Root Mode Rotation
         ImGui::Text("Root Rotation Mode:");
         ImGui::SameLine(180);
-        if (ImGui::BeginCombo("##rootRotMode", BlendRootModeRotationName(config->blendRootModeRotationEditor)))
+        if (ImGui::BeginCombo("##rootRotMode", BlendRootModeRotationName(config->mmConfigEditor.blendRootModeRotation)))
         {
             for (int i = 0; i < static_cast<int>(BlendRootModeRotation::COUNT); ++i)
             {
                 const BlendRootModeRotation mode = static_cast<BlendRootModeRotation>(i);
-                const bool isSelected = (config->blendRootModeRotationEditor == mode);
+                const bool isSelected = (config->mmConfigEditor.blendRootModeRotation == mode);
                 if (ImGui::Selectable(BlendRootModeRotationName(mode), isSelected))
                 {
-                    config->blendRootModeRotationEditor = mode;
+                    config->mmConfigEditor.blendRootModeRotation = mode;
                     configChanged = true;
                 }
                 if (isSelected) ImGui::SetItemDefaultFocus();
@@ -1086,10 +1086,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             ImGui::Separator();
             if (ImGui::Button("Rebuild Database"))
             {
-                db.featuresConfig = editedMMConfig;
-                db.poseDragLookaheadTime = config->poseDragLookaheadTimeEditor;
-                db.blendRootModePosition = config->blendRootModePositionEditor;
-                db.blendRootModeRotation = config->blendRootModeRotationEditor;
+                db.featuresConfig = editedMMConfig;  // Copy all config including lookahead time and blend root modes
                 AnimDatabaseRebuild(&db, &app->characterData);
                 app->animDatabaseRebuildPending = false;
                 TraceLog(LOG_INFO, "Motion matching config updated");
@@ -1106,7 +1103,7 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
     if (!controlledCharacter->active) return;
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(220, 130), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(220, 160), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Player Control"))
     {
         // Animation mode dropdown (stored in config for persistence)
@@ -1130,6 +1127,7 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
 
         PlayerControlInput& input = controlledCharacter->playerInput;
         ImGui::SliderFloat("Max Speed", &input.maxSpeed, 0.1f, 10.0f, "%.2f m/s");
+        ImGui::SliderFloat("Virtual Accel", &config->virtualControlMaxAcceleration, 0.1f, 20.0f, "%.2f m/s2");
 
         const float velMag = Vector3Length(input.desiredVelocity);
         ImGui::Text("Input: %.2f m/s", velMag);
@@ -1194,10 +1192,8 @@ static void ApplicationUpdate(void* voidApplicationState)
             ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
             ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
 
+            // Copy motion matching config (includes lookahead time and blend root modes)
             app->animDatabase.featuresConfig = app->config.mmConfigEditor;
-            app->animDatabase.poseDragLookaheadTime = app->config.poseDragLookaheadTimeEditor;
-            app->animDatabase.blendRootModePosition = app->config.blendRootModePositionEditor;
-            app->animDatabase.blendRootModeRotation = app->config.blendRootModeRotationEditor;
 
             // Rebuild animation database
             AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
@@ -1283,6 +1279,8 @@ static void ApplicationUpdate(void* voidApplicationState)
         const bool numpadPlusPressed = IsKeyPressed(KEY_KP_ADD);
         const bool numpadMultiplyPressed = IsKeyPressed(KEY_KP_MULTIPLY);
         const bool numpadMultiplyHeld = IsKeyDown(KEY_KP_MULTIPLY);
+        const bool numpadDividePressed = IsKeyPressed(KEY_KP_DIVIDE);
+        const bool numpadDivideHeld = IsKeyDown(KEY_KP_DIVIDE);
         const bool shiftHeld = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 
         if (numpadMinusPressed)
@@ -1316,6 +1314,11 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->debugPaused = true;
             TraceLog(LOG_INFO, "Paused (hold * to advance at half speed)");
         }
+        if (numpadDividePressed)
+        {
+            app->debugPaused = true;
+            TraceLog(LOG_INFO, "Paused (hold / to rewind at half speed)");
+        }
 
         // Compute effective dt
         if (app->debugPaused)
@@ -1324,6 +1327,11 @@ static void ApplicationUpdate(void* voidApplicationState)
             {
                 // Holding * while paused: advance at half the debug timescale
                 effectiveDt = clampedRawDt * app->debugTimescale * 0.5f;
+            }
+            else if (numpadDivideHeld)
+            {
+                // Holding / while paused: rewind at half the debug timescale (negative dt)
+                effectiveDt = -clampedRawDt * app->debugTimescale * 0.5f;
             }
             else
             {
@@ -2071,27 +2079,31 @@ static void ApplicationUpdate(void* voidApplicationState)
         {
             if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
 
-            // compute current motion frame index for this character
             const float frameTime = app->animDatabase.animFrameTime[c];
             const int clipStart = app->animDatabase.clipStartFrame[c];
             const int clipEnd = app->animDatabase.clipEndFrame[c];
             const int clipFrameCount = clipEnd - clipStart;
-            if (clipFrameCount <= 0 || frameTime <= 0.0f) continue;
-
-            int localFrame = (int)(app->scrubberSettings.playTime / frameTime);
-            localFrame = ClampInt(localFrame, 0, clipFrameCount - 1);
-            const int motionFrame = clipStart + localFrame;
+            if (clipFrameCount <= 1 || frameTime <= 0.0f) continue;
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
-            span<const Vector3> velRow = app->animDatabase.jointVelocitiesRootSpace.row_view(motionFrame);
+
+            // Sample velocities at midpoint for better accuracy
+            int vf0, vf1;
+            float vInterFrameAlpha;
+            GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime - frameTime * 0.5f, vf0, vf1, vInterFrameAlpha);
+            const int vBaseFrame = clipStart + vf0;
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
                 if (xform.endSite[j]) continue;  // skip end sites
 
+                // Lerp velocity between frames for smooth visualization
+                span<const Vector3> velRow = app->animDatabase.jointVelocitiesRootSpace.row_view(vBaseFrame);
+                const Vector3 vel = LerpFrames(&velRow[j], vInterFrameAlpha);
+
                 const Vector3 pos = xform.globalPositions[j];
-                const Vector3 endPos = Vector3Add(pos, Vector3Scale(velRow[j], velScale));
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(vel, velScale));
 
                 DrawLine3D(pos, endPos, BLUE);
             }
@@ -2111,25 +2123,96 @@ static void ApplicationUpdate(void* voidApplicationState)
             const int clipStart = app->animDatabase.clipStartFrame[c];
             const int clipEnd = app->animDatabase.clipEndFrame[c];
             const int clipFrameCount = clipEnd - clipStart;
-            if (clipFrameCount <= 0 || frameTime <= 0.0f) continue;
-
-            int localFrame = (int)(app->scrubberSettings.playTime / frameTime);
-            localFrame = ClampInt(localFrame, 0, clipFrameCount - 1);
-            const int motionFrame = clipStart + localFrame;
+            if (clipFrameCount <= 1 || frameTime <= 0.0f) continue;
 
             const int jointCount = app->animDatabase.jointCount;
             const TransformData& xform = app->characterData.xformData[c];
-            span<const Vector3> accRow = app->animDatabase.jointAccelerationsRootSpace.row_view(motionFrame);
+
+            // Sample accelerations at frame time
+            int f0, f1;
+            float interFrameAlpha;
+            GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime, f0, f1, interFrameAlpha);
+            const int baseFrame = clipStart + f0;
 
             for (int j = 0; j < jointCount && j < xform.jointCount; ++j)
             {
                 if (xform.endSite[j]) continue;  // skip end sites
 
+                // Lerp acceleration between frames for smooth visualization
+                span<const Vector3> accRow = app->animDatabase.jointAccelerationsRootSpace.row_view(baseFrame);
+                const Vector3 acc = LerpFrames(&accRow[j], interFrameAlpha);
+
                 const Vector3 pos = xform.globalPositions[j];
-                const Vector3 endPos = Vector3Add(pos, Vector3Scale(accRow[j], accScale));
+                const Vector3 endPos = Vector3Add(pos, Vector3Scale(acc, accScale));
 
                 DrawLine3D(pos, endPos, RED);
             }
+        }
+    }
+
+    // Draw magic velocity (when drawing velocities)
+    if (app->config.drawVelocities && app->animDatabase.valid)
+    {
+        const float velScale = 0.5f;
+
+        for (int c = 0; c < app->characterData.count; ++c)
+        {
+            if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
+
+            const float frameTime = app->animDatabase.animFrameTime[c];
+            const int clipStart = app->animDatabase.clipStartFrame[c];
+            const int clipEnd = app->animDatabase.clipEndFrame[c];
+            const int clipFrameCount = clipEnd - clipStart;
+            if (clipFrameCount <= 1 || frameTime <= 0.0f) continue;
+
+            // Sample position at current time
+            int f0, f1;
+            float interFrameAlpha;
+            GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime, f0, f1, interFrameAlpha);
+            const int baseFrame = clipStart + f0;
+            const Vector3 magicPos = LerpFrames(&app->animDatabase.magicPosition[baseFrame], interFrameAlpha);
+
+            // Sample velocity at midpoint for better accuracy
+            int vf0, vf1;
+            float vInterFrameAlpha;
+            GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime - frameTime * 0.5f, vf0, vf1, vInterFrameAlpha);
+            const int vBaseFrame = clipStart + vf0;
+            const Vector3 magicVel = LerpFrames(&app->animDatabase.magicVelocityAnimSpace[vBaseFrame], vInterFrameAlpha);
+
+            const Vector3 endPos = Vector3Add(magicPos, Vector3Scale(magicVel, velScale));
+
+            DrawLine3D(magicPos, endPos, PURPLE);
+            DrawSphere(endPos, 0.02f, PURPLE);
+        }
+    }
+
+    // Draw magic acceleration (when drawing accelerations)
+    if (app->config.drawAccelerations && app->animDatabase.valid)
+    {
+        const float accScale = 0.1f;
+
+        for (int c = 0; c < app->characterData.count; ++c)
+        {
+            if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
+
+            const float frameTime = app->animDatabase.animFrameTime[c];
+            const int clipStart = app->animDatabase.clipStartFrame[c];
+            const int clipEnd = app->animDatabase.clipEndFrame[c];
+            const int clipFrameCount = clipEnd - clipStart;
+            if (clipFrameCount <= 1 || frameTime <= 0.0f) continue;
+
+            // Sample position and acceleration at current time
+            int f0, f1;
+            float interFrameAlpha;
+            GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime, f0, f1, interFrameAlpha);
+            const int baseFrame = clipStart + f0;
+
+            const Vector3 magicPos = LerpFrames(&app->animDatabase.magicPosition[baseFrame], interFrameAlpha);
+            const Vector3 magicAcc = LerpFrames(&app->animDatabase.magicAccelerationAnimSpace[baseFrame], interFrameAlpha);
+            const Vector3 endPos = Vector3Add(magicPos, Vector3Scale(magicAcc, accScale));
+
+            DrawLine3D(magicPos, endPos, ORANGE);
+            DrawSphere(endPos, 0.02f, ORANGE);
         }
     }
 
@@ -2475,6 +2558,21 @@ static void ApplicationUpdate(void* voidApplicationState)
             DrawLine3D(endPos, arrowTip1, PURPLE);
             DrawLine3D(endPos, arrowTip2, PURPLE);
             DrawSphere(endPos, 0.03f, PURPLE);
+        }
+
+        // Draw smoothed virtual control velocity (pink)
+        const float smoothedVelMag = Vector3Length(app->controlledCharacter.virtualControlSmoothedVelocity);
+        if (smoothedVelMag > 0.01f)
+        {
+            const Vector3 startPos = Vector3{
+                app->controlledCharacter.worldPosition.x,
+                0.07f, // slightly higher than PURPLE arrow to avoid z-fighting
+                app->controlledCharacter.worldPosition.z
+            };
+            const Vector3 endPos = Vector3Add(startPos, app->controlledCharacter.virtualControlSmoothedVelocity);
+
+            DrawLine3D(startPos, endPos, PINK);
+            DrawSphere(endPos, 0.025f, PINK);
         }
 
         // Draw aim direction arrow (orange, from magic anchor)
@@ -3093,10 +3191,8 @@ int main(int argc, char** argv)
         ScrubberSettingsRecomputeLimits(&app.scrubberSettings, &app.characterData);
         ScrubberSettingsInitMaxs(&app.scrubberSettings, &app.characterData);
 
+        // Copy motion matching config (includes lookahead time and blend root modes)
         app.animDatabase.featuresConfig = app.config.mmConfigEditor;
-        app.animDatabase.poseDragLookaheadTime = app.config.poseDragLookaheadTimeEditor;
-        app.animDatabase.blendRootModePosition = app.config.blendRootModePositionEditor;
-        app.animDatabase.blendRootModeRotation = app.config.blendRootModeRotationEditor;
 
         // Build animation database and initialize controlled character
         AnimDatabaseRebuild(&app.animDatabase, &app.characterData);

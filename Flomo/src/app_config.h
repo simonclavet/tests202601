@@ -33,6 +33,15 @@ static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMa
     // Parse pastTimeOffset
     config.pastTimeOffset = ParseFloatValue(jsonBuffer, "pastTimeOffset", config.pastTimeOffset);
 
+    // Parse poseDragLookaheadTime
+    config.poseDragLookaheadTime = ParseFloatValue(jsonBuffer, "poseDragLookaheadTime", config.poseDragLookaheadTime);
+
+    // Parse blend root modes
+    config.blendRootModePosition = static_cast<BlendRootModePosition>(
+        ParseIntValue(jsonBuffer, "blendRootModePosition", static_cast<int>(config.blendRootModePosition)));
+    config.blendRootModeRotation = static_cast<BlendRootModeRotation>(
+        ParseIntValue(jsonBuffer, "blendRootModeRotation", static_cast<int>(config.blendRootModeRotation)));
+
     // Parse future trajectory times array
     // Look for "futureTrajPointTimes": [0.2, 0.4, 0.8]
     const char* arrayKey = "futureTrajPointTimes";
@@ -87,6 +96,10 @@ static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeature
     oss << "  },\n";
 
     oss << "  \"pastTimeOffset\": " << config.pastTimeOffset << ",\n";
+
+    oss << "  \"poseDragLookaheadTime\": " << config.poseDragLookaheadTime << ",\n";
+    oss << "  \"blendRootModePosition\": " << static_cast<int>(config.blendRootModePosition) << ",\n";
+    oss << "  \"blendRootModeRotation\": " << static_cast<int>(config.blendRootModeRotation) << ",\n";
 
     oss << "  \"futureTrajPointTimes\": [";
     for (size_t i = 0; i < config.futureTrajPointTimes.size(); ++i)
@@ -194,13 +207,12 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.switchInterval = ResolveFloatConfig(buffer, "switchInterval", config.switchInterval, argc, argv);
     config.mmSearchPeriod = ResolveFloatConfig(buffer, "mmSearchPeriod", config.mmSearchPeriod, argc, argv);
     config.virtualControlMaxAcceleration = ResolveFloatConfig(buffer, "virtualControlMaxAcceleration", config.virtualControlMaxAcceleration, argc, argv);
-    config.poseDragLookaheadTimeEditor = ResolveFloatConfig(buffer, "poseDragLookaheadTime", config.poseDragLookaheadTimeEditor, argc, argv);
 
     config.cursorBlendMode = static_cast<CursorBlendMode>(ResolveIntConfig(buffer, "cursorBlendMode", static_cast<int>(config.cursorBlendMode), argc, argv));
     config.blendPosReturnTime = ResolveFloatConfig(buffer, "blendPosReturnTime", config.blendPosReturnTime, argc, argv);
 
     config.enableFootIK = ResolveBoolConfig(buffer, "enableFootIK", config.enableFootIK, argc, argv);
-    
+
     config.enableTimedUnlocking = ResolveBoolConfig(buffer, "enableTimedUnlocking", config.enableTimedUnlocking, argc, argv);
     config.unlockDistance = ResolveFloatConfig(buffer, "unlockDistance", config.unlockDistance, argc, argv);
     config.unlockDuration = ResolveFloatConfig(buffer, "unlockDuration", config.unlockDuration, argc, argv);
@@ -209,17 +221,11 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     // Initialize motion matching config with defaults first
     config.mmConfigEditor = {};
 
-    // Then load from JSON (if available)
+    // Then load from JSON (if available) - includes lookahead time and blend root modes
     if (buffer)
     {
         MotionMatchingConfigFromJson(buffer, config.mmConfigEditor);
     }
-
-    // Blend root mode settings
-    config.blendRootModePositionEditor = static_cast<BlendRootModePosition>(
-        ResolveIntConfig(buffer, "blendRootModePosition", static_cast<int>(config.blendRootModePositionEditor), argc, argv));
-    config.blendRootModeRotationEditor = static_cast<BlendRootModeRotation>(
-        ResolveIntConfig(buffer, "blendRootModeRotation", static_cast<int>(config.blendRootModeRotationEditor), argc, argv));
 
     // Validate window values
     if (config.windowX >= 0 && config.windowY >= 0 &&
@@ -306,15 +312,12 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"enableTimedUnlocking\": %s,\n", config.enableTimedUnlocking ? "true" : "false");
     fprintf(file, "    \"unlockDistance\": %.4f,\n", config.unlockDistance);
     fprintf(file, "    \"unlockDuration\": %.4f,\n", config.unlockDuration);
-    fprintf(file, "    \"drawPlayerInput\": %s\n", config.drawPlayerInput ? "true" : "false");
+    fprintf(file, "    \"drawPlayerInput\": %s,\n", config.drawPlayerInput ? "true" : "false");
 
 
-    // Save motion matching config
+    // Save motion matching config (includes lookahead time and blend root modes)
     std::string mmConfigJson = MotionMatchingConfigToJson(config.mmConfigEditor);
-    fprintf(file, "  \"motionMatchingConfig\": %s,\n", mmConfigJson.c_str());
-    fprintf(file, "    \"poseDragLookaheadTime\": %.4f,\n", config.poseDragLookaheadTimeEditor);
-    fprintf(file, "    \"blendRootModePosition\": %d,\n", static_cast<int>(config.blendRootModePositionEditor));
-    fprintf(file, "    \"blendRootModeRotation\": %d\n", static_cast<int>(config.blendRootModeRotationEditor));
+    fprintf(file, "    \"motionMatchingConfig\": %s\n", mmConfigJson.c_str());
 
     fprintf(file, "}\n");
 

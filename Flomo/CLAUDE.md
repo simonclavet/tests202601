@@ -74,7 +74,8 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - don't use smart pointers
 - don't use complicated oop concepts like inheritance and polymorphism, unless absolutely necessary
 - don't use exceptions, use assertions defensively. Don't use the keyword noexcept, catch, try, unless absolutely necessary
-- use linebreaks before opening braces for functions and control blocks, always use braces for if/for/while, except when it is verysimple single-line statements
+- use linebreaks before opening braces for functions and control blocks
+- always use braces for if/for/while, except when it is verysimple single-line statements
 - when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
 - no need for private and public. Use structs only, unless when we really want to.
 - I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
