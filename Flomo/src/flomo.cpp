@@ -2177,11 +2177,11 @@ static void ApplicationUpdate(void* voidApplicationState)
             float vInterFrameAlpha;
             GetInterFrameAlpha(&app->animDatabase, c, app->scrubberSettings.playTime - frameTime * 0.5f, vf0, vf1, vInterFrameAlpha);
             const int vBaseFrame = clipStart + vf0;
-            const Vector3 magicVel = LerpFrames(&app->animDatabase.magicVelocityAnimSpace[vBaseFrame], vInterFrameAlpha);
+            const Vector3 magicVel = LerpFrames(&app->animDatabase.magicSmoothedVelocityAnimSpace[vBaseFrame], vInterFrameAlpha);
 
             const Vector3 endPos = Vector3Add(magicPos, Vector3Scale(magicVel, velScale));
 
-            DrawLine3D(magicPos, endPos, PURPLE);
+            DrawCylinderEx(magicPos, endPos, 0.01f, 0.01f, 6, PURPLE);
             DrawSphere(endPos, 0.02f, PURPLE);
         }
     }
@@ -2208,10 +2208,10 @@ static void ApplicationUpdate(void* voidApplicationState)
             const int baseFrame = clipStart + f0;
 
             const Vector3 magicPos = LerpFrames(&app->animDatabase.magicPosition[baseFrame], interFrameAlpha);
-            const Vector3 magicAcc = LerpFrames(&app->animDatabase.magicAccelerationAnimSpace[baseFrame], interFrameAlpha);
+            const Vector3 magicAcc = LerpFrames(&app->animDatabase.magicSmoothedAccelerationAnimSpace[baseFrame], interFrameAlpha);
             const Vector3 endPos = Vector3Add(magicPos, Vector3Scale(magicAcc, accScale));
 
-            DrawLine3D(magicPos, endPos, ORANGE);
+            DrawCylinderEx(magicPos, endPos, 0.01f, 0.01f, 6, ORANGE);
             DrawSphere(endPos, 0.02f, ORANGE);
         }
     }
@@ -2979,7 +2979,7 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
-    TestCudaAndLibtorchAndTCN();
+    //TestCudaAndLibtorchAndTCN();
     //testLegIk();
     //TestBallTree();
     //if (true) return 0;

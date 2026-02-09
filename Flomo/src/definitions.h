@@ -52,7 +52,7 @@ enum class FeatureType : int
     PastPosition,        // past hip position (XZ) in current hip horizontal frame => 2 dims
     AimDirection,        // aim direction (head→rightHand) at trajectory times => 2 * points
     HeadToSlowestToe,    // head to slowest foot vector (XZ) in root space => 2 dims
-    FutureAccel,         // future root acceleration (XZ) at trajectory times => 2 * points
+    FutureAccelClamped,  // future root acceleration clamped: dead zone below 1m/s2, capped at 3m/s2 => 2 * points
 
     COUNT                // Must be last - used for array sizing
 };
@@ -71,7 +71,7 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::PastPosition: return "Past Position";
     case FeatureType::AimDirection: return "Aim Direction";
     case FeatureType::HeadToSlowestToe: return "Head To Slowest Toe";
-    case FeatureType::FutureAccel: return "Future Accel";
+    case FeatureType::FutureAccelClamped: return "Future Accel Clamped";
     default: return "Unknown";
     }
 }
@@ -326,8 +326,8 @@ struct AnimDatabase
     // Magic anchor transforms per frame (position = spine3 on ground, yaw = head→rightHand direction)
     std::vector<Vector3> magicPosition;           // [motionFrameCount] - (spine3.x, 0, spine3.z)
     std::vector<float> magicYaw;                  // [motionFrameCount] - yaw from head→rightHand
-    std::vector<Vector3> magicVelocityAnimSpace;  // [motionFrameCount] - velocity in animation world space
-    std::vector<Vector3> magicAccelerationAnimSpace; // [motionFrameCount] - acceleration in animation world space
+    std::vector<Vector3> magicSmoothedVelocityAnimSpace;  // [motionFrameCount] - gaussian-smoothed velocity in animation world space
+    std::vector<Vector3> magicSmoothedAccelerationAnimSpace; // [motionFrameCount] - gaussian-smoothed acceleration in animation world space
     std::vector<Vector3> magicVelocityRootSpace;           // [motionFrameCount] - XZ velocity in magic space
     std::vector<float> magicYawRate;              // [motionFrameCount] - yaw rate (rad/s)
     std::vector<Vector3> lookaheadMagicVelocity;  // [motionFrameCount] - extrapolated
@@ -371,8 +371,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->lookaheadRootMotionYawRates.clear();
     db->magicPosition.clear();
     db->magicYaw.clear();
-    db->magicVelocityAnimSpace.clear();
-    db->magicAccelerationAnimSpace.clear();
+    db->magicSmoothedVelocityAnimSpace.clear();
+    db->magicSmoothedAccelerationAnimSpace.clear();
     db->magicVelocityRootSpace.clear();
     db->magicYawRate.clear();
     db->lookaheadMagicVelocity.clear();

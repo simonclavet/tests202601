@@ -147,7 +147,7 @@ static void ComputeMotionFeatures(
     }
 
 
-    // Compute future velocities for velocity-based features (FutureVel, FutureSpeed, FutureVelClamped, FutureAccel)
+    // Compute future velocities for velocity-based features (FutureVel, FutureSpeed, FutureVelClamped, FutureAccelClamped)
     const Vector3 currentVelWorld = cc->virtualControlSmoothedVelocity;
     const Vector3 desiredVelWorld = input->desiredVelocity;
     const float maxAcceleration = 4.0f;
@@ -306,10 +306,14 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = headToSlowest.z;
     }
 
-    // FutureAccel: predicted acceleration at future sample times (XZ in magic space)
-    // Uses constant acceleration model from ComputeFutureVelocities
-    if (cfg.IsFeatureEnabled(FeatureType::FutureAccel))
+    // FutureAccelClamped: predicted acceleration with dead zone and cap
+    // Same remapping as database: mag < 1 → 0, [1,3] → [0,3], > 3 → 3
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped))
     {
+        constexpr float accelDeadZone = 1.0f;
+        constexpr float accelMaxMag = 3.0f;
+        constexpr float accelRemapScale = accelMaxMag / (accelMaxMag - accelDeadZone);
+
         // Compute the constant control acceleration
         const Vector3 velDelta = Vector3Subtract(desiredVelWorld, currentVelWorld);
         const float velDeltaMag = Vector3Length(velDelta);
@@ -317,30 +321,39 @@ static void ComputeMotionFeatures(
         Vector3 controlAccelWorld = Vector3Zero();
         if (velDeltaMag > 1e-6f)
         {
-            // Direction towards desired velocity
             const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
-            // Acceleration magnitude (capped at maxAcceleration)
             controlAccelWorld = Vector3Scale(velDeltaDir, maxAcceleration);
         }
 
-        // For each trajectory time, check if we're still accelerating or have reached desired
         for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
         {
             const float futureTime = cfg.futureTrajPointTimes[p];
             Vector3 futureAccelWorld = controlAccelWorld;
 
-            // Check if we would have reached desired velocity by this time
             const float maxDeltaVelMag = maxAcceleration * futureTime;
             if (velDeltaMag <= maxDeltaVelMag)
             {
-                // Already at desired velocity, no more acceleration
                 futureAccelWorld = Vector3Zero();
             }
 
-            // Transform to magic space for feature output
-            const Vector3 futureAccelMagicSpace = Vector3RotateByQuaternion(futureAccelWorld, invMagicWorldRot);
-            outFeatures[fi++] = futureAccelMagicSpace.x;
-            outFeatures[fi++] = futureAccelMagicSpace.z;
+            // Transform to magic space
+            Vector3 accelMagic = Vector3RotateByQuaternion(futureAccelWorld, invMagicWorldRot);
+
+            // Apply dead zone + remap + clamp
+            const float mag = Vector3Length(accelMagic);
+            if (mag > accelDeadZone)
+            {
+                float remappedMag = (mag - accelDeadZone) * accelRemapScale;
+                if (remappedMag > accelMaxMag) remappedMag = accelMaxMag;
+                accelMagic = Vector3Scale(accelMagic, remappedMag / mag);
+            }
+            else
+            {
+                accelMagic = Vector3Zero();
+            }
+
+            outFeatures[fi++] = accelMagic.x;
+            outFeatures[fi++] = accelMagic.z;
         }
     }
 
