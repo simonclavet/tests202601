@@ -50,6 +50,10 @@ extern "C" void cuda_check_error(const char* msg) {
     }
 }
 
+extern "C" void cuda_init_context() {
+    cudaFree(0);
+}
+
 
 // Test tiny-cuda-nn availability
 extern "C" void test_tiny_cuda_nn() {

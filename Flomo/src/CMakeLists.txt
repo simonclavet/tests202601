@@ -48,6 +48,7 @@ set(FLOMO_HEADERS
     anim_database.h
     controlled_character.h
     motion_matching.h
+    networks.h
     ${CMAKE_SOURCE_DIR}/thirdparty/ufbx/ufbx.h
     ${IMGUI_DIR}/imgui.h
     ${RLIMGUI_DIR}/rlImGui.h
@@ -165,6 +166,9 @@ if(MSVC)
         COMMENT "Updating Torch DLLs if needed"
         VERBATIM
     )
+
+    # Force inclusion of torch_cuda backend
+    target_link_options(Flomo PRIVATE "/INCLUDE:?warp_size@cuda@at@@YAHXZ")
 endif()
 
 # Special flags for CUDA compilation (GPU code)

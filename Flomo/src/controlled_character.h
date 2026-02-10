@@ -181,7 +181,8 @@ static void ControlledCharacterUpdate(
     const AnimDatabase* db,
     float dt,
     double worldTime,
-    const AppConfig& config)
+    const AppConfig& config,
+    NetworkState* networkState = nullptr)
 {
     if (!cc->active || characterData->count == 0) return;
 
@@ -260,7 +261,7 @@ static void ControlledCharacterUpdate(
 
             const int skipBoundary = 60;
             float bestCost = 0.0f;
-            const int bestFrame = MotionMatchingSearch(db, cc->mmQuery, skipBoundary, &bestCost);
+            const int bestFrame = MotionMatchingSearch(db, cc->mmQuery, skipBoundary, &bestCost, config, networkState);
 
             cc->mmBestFrame = bestFrame;
             cc->mmBestCost = bestCost;
@@ -573,7 +574,7 @@ static void ControlledCharacterUpdate(
         // normalize current rotations
         Rot6d blended = blendedLocalRotations[j];
         const float lenA = sqrtf(blended.ax * blended.ax + blended.ay * blended.ay + blended.az * blended.az);
-        assert(lenA > 1e-6f);
+        assertEvenInRelease(lenA > 1e-6f);
         Rot6dNormalize(blendedLocalRotations[j]);
     }
 

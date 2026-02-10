@@ -52,7 +52,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->animFrameTime[i] = characterData->bvhData[i].frameTime;
         globalFrame += db->animFrameCount[i];
     }
-    db->totalFrames = globalFrame;
+    db->motionFrameCount = globalFrame;
 
     // Use scale from first animation
     if (db->animCount > 0)
@@ -60,14 +60,14 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->scale = characterData->scales[0];
     }
 
-    printf("AnimDatabase: Rebuilt with %d anims, %d total frames\n", db->animCount, db->totalFrames);
+    printf("AnimDatabase: Rebuilt with %d anims, %d total frames\n", db->animCount, db->motionFrameCount);
 
     // -------------------------
     // Build compact Motion Database
     // -------------------------
     // pick canonical skeleton (first animation) if available
 
-    if (db->animCount == 0 || db->totalFrames == 0)
+    if (db->animCount == 0 || db->motionFrameCount == 0)
     {
         TraceLog(LOG_INFO, "AnimDatabase: no animations available for motion DB");
         return;

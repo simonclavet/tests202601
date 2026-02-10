@@ -71,7 +71,8 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - When an argument is modified as the result, prefix the argument with /*out*/ or /*inout*/ if it is not obvious.
 - Never modify non-const value arguments of functions.
 - don't use pairs and tuples, make small structs instead
-- don't use smart pointers
+- don't use smart pointers, except when using things like libtorch that really like it.
+- place arguments on separate lines when they don't fit in 80 character lines
 - don't use complicated oop concepts like inheritance and polymorphism, unless absolutely necessary
 - don't use exceptions, use assertions defensively. Don't use the keyword noexcept, catch, try, unless absolutely necessary
 - use linebreaks before opening braces for functions and control blocks

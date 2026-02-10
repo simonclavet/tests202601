@@ -219,6 +219,9 @@ struct AppConfig {
     
     bool drawPlayerInput = false;
 
+    // Neural Network settings
+    bool useMMFeatureDenoiser = false;
+
     // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
 
@@ -254,9 +257,6 @@ struct AnimDatabase
     std::vector<int> animStartFrame;   // Global frame index where each anim starts
     std::vector<int> animFrameCount;   // Number of frames in each anim
     std::vector<float> animFrameTime;  // Frame time for each anim (usually same)
-
-    // Total frames across all animations
-    int totalFrames = -1;
 
     // Scale to apply when sampling (for unit conversion)
     float scale = 0.0f;
@@ -352,7 +352,6 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->animStartFrame.clear();
     db->animFrameCount.clear();
     db->animFrameTime.clear();
-    db->totalFrames = -1;
     db->scale = 0.0f;
     db->valid = false;
     db->jointCount = -1;
@@ -619,4 +618,20 @@ struct ControlledCharacter {
     std::vector<HistoryPoint> positionHistory;
     double lastHistorySampleTime = 0.0f;
 
+};
+
+//----------------------------------------------------------------------------------
+// Neural Network state
+//----------------------------------------------------------------------------------
+
+struct NetworkState {
+    bool isTraining = false;
+    float currentLoss = 0.0f;
+    int iterations = 0;
+
+    torch::Device device = torch::kCPU;
+
+    torch::nn::Sequential model = nullptr;
+    torch::nn::Sequential featuresAutoEncoder = nullptr;
+    std::shared_ptr<torch::optim::Adam> optimizer = nullptr;
 };

@@ -32,13 +32,18 @@
 #include "anim_database.h"
 #include "leg_ik.h"
 #include "controlled_character.h"
+#include "networks.h"
 
+#include <filesystem>
+#include <ctime>
 
 using namespace std;
+namespace fs = std::filesystem;
 
 // Declare the CUDA functions
 extern "C" void run_cuda_addition(float* a, float* b, float* c, int n);
 extern "C" void cuda_check_error(const char* msg);
+extern "C" void cuda_init_context();
 extern "C" void test_tiny_cuda_nn();
 
 static void TestCudaAndLibtorchAndTCN()
@@ -232,7 +237,7 @@ struct ScrubberSettings {
 static inline void ScrubberSettingsInit(ScrubberSettings* settings, int argc, char** argv)
 {
     settings->playing = ArgBool(argc, argv, "playing", true);
-    settings->looping = ArgBool(argc, argv, "looping", false);
+    settings->looping = ArgBool(argc, argv, "looping", true);
     settings->inplace = ArgBool(argc, argv, "inplace", false);
     settings->playTime = ArgFloat(argc, argv, "playTime", 0.0f);
     settings->frameSnap = ArgBool(argc, argv, "frameSnap", true);
@@ -290,6 +295,397 @@ static inline void ScrubberSettingsClamp(ScrubberSettings* settings, CharacterDa
     settings->playTime = Clamp(settings->playTime, settings->timeMin, settings->timeMax);
 }
 
+// Helper: Setup state after characters are loaded
+static inline void OnCharactersLoaded(
+    CharacterData& characterData,
+    CapsuleData& capsuleData,
+    ScrubberSettings& scrubberSettings,
+    AnimDatabase& animDatabase,
+    ControlledCharacter& controlledCharacter,
+    AppConfig& config,
+    int argc,
+    char** argv)
+{
+    if (characterData.count == 0)
+        return;
+
+    // Ensure active character is valid
+    if (characterData.active < 0 ||
+        characterData.active >= characterData.count)
+    {
+        characterData.active = characterData.count - 1;
+    }
+
+    // Reset scrubber to known state before updating
+    ScrubberSettingsInit(&scrubberSettings, argc, argv);
+    ScrubberSettingsRecomputeLimits(&scrubberSettings, &characterData);
+    ScrubberSettingsInitMaxs(&scrubberSettings, &characterData);
+
+    // Rebuild animation database
+    animDatabase.featuresConfig = config.mmConfigEditor;
+    AnimDatabaseRebuild(&animDatabase, &characterData);
+
+    if (!animDatabase.valid)
+    {
+        TraceLog(LOG_WARNING,
+            "AnimDatabase invalid after rebuild");
+        controlledCharacter.active = false;
+    }
+    else
+    {
+        // Always reinitialize controlled character to reset cursors
+        // (they point to old AnimDatabase frames after rebuild)
+        ControlledCharacterInit(
+            &controlledCharacter,
+            &characterData.bvhData[0],
+            characterData.scales[0],
+            config.switchInterval);
+    }
+
+    // Resize capsule buffer for all characters + controlled character
+    // Account for up to 3x: normal + footIK debug + basicBlend debug
+    CapsuleDataUpdateForCharacters(&capsuleData, &characterData);
+    if (controlledCharacter.active)
+    {
+        const int totalJoints =
+            (int)capsuleData.capsulePositions.size() +
+            controlledCharacter.xformData.jointCount * 3;
+        CapsuleDataResize(&capsuleData, totalJoints);
+    }
+}
+
+// Helper: Get current timestamp string in format YYYY-MM-DD_HH-MM
+static inline std::string GetTimestampString()
+{
+    time_t now = time(nullptr);
+    tm localTime;
+    localtime_s(&localTime, &now);
+
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d_%02d-%02d",
+        localTime.tm_year + 1900,
+        localTime.tm_mon + 1,
+        localTime.tm_mday,
+        localTime.tm_hour,
+        localTime.tm_min);
+
+    return std::string(buffer);
+}
+
+// Helper: Save list of currently loaded animations to JSON
+static inline bool SaveAnimsList(const CharacterData& characterData, const std::string& filePath)
+{
+    FILE* file = fopen(filePath.c_str(), "w");
+    if (!file)
+    {
+        TraceLog(LOG_ERROR, "Failed to create anims file: %s", filePath.c_str());
+        return false;
+    }
+
+    fprintf(file, "{\n");
+    fprintf(file, "  \"animations\": [\n");
+
+    for (int i = 0; i < characterData.count; ++i)
+    {
+        fprintf(file, "    \"%s\"", characterData.filePaths[i].c_str());
+        if (i < characterData.count - 1)
+        {
+            fprintf(file, ",");
+        }
+        fprintf(file, "\n");
+    }
+
+    fprintf(file, "  ]\n");
+    fprintf(file, "}\n");
+
+    fclose(file);
+    return true;
+}
+
+// Helper: Save config to timestamped folder in saved/
+static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const CharacterData& characterData, std::string& /*out*/ savedFolderName)
+{
+    const std::string baseDir = "saved";
+
+    // Create base directory if it doesn't exist
+    if (!fs::exists(baseDir))
+    {
+        try
+        {
+            fs::create_directories(baseDir);
+        }
+        catch (const fs::filesystem_error& e)
+        {
+            TraceLog(LOG_ERROR, "Failed to create saved configs directory: %s", e.what());
+            return false;
+        }
+    }
+
+    // Generate timestamp folder name
+    std::string timestamp = GetTimestampString();
+    std::string folderPath = baseDir + "/" + timestamp;
+
+    // Handle duplicate timestamps by appending _1, _2, etc
+    int suffix = 1;
+    while (fs::exists(folderPath))
+    {
+        folderPath = baseDir + "/" + timestamp + "_" + std::to_string(suffix);
+        suffix++;
+    }
+
+    // Create the folder
+    try
+    {
+        fs::create_directory(folderPath);
+    }
+    catch (const fs::filesystem_error& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to create config folder: %s", e.what());
+        return false;
+    }
+
+    // Copy current config file to the timestamped folder
+    const std::string configDestPath = folderPath + "/flomo_config.json";
+    try
+    {
+        fs::copy_file(GetConfigPath(), configDestPath, fs::copy_options::overwrite_existing);
+    }
+    catch (const fs::filesystem_error& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to copy config file: %s", e.what());
+        return false;
+    }
+
+    // Save animations list
+    const std::string animsPath = folderPath + "/anims.json";
+    if (!SaveAnimsList(characterData, animsPath))
+    {
+        TraceLog(LOG_ERROR, "Failed to save animations list");
+        return false;
+    }
+
+    savedFolderName = fs::path(folderPath).filename().string();
+    TraceLog(LOG_INFO, "Config saved to: %s", folderPath.c_str());
+    return true;
+}
+
+// Helper: Get list of saved config folders
+static inline std::vector<std::string> GetSavedConfigFolders()
+{
+    std::vector<std::string> folders;
+    const std::string baseDir = "saved";
+
+    if (!fs::exists(baseDir))
+    {
+        return folders;
+    }
+
+    try
+    {
+        for (const auto& entry : fs::directory_iterator(baseDir))
+        {
+            if (entry.is_directory())
+            {
+                folders.push_back(entry.path().filename().string());
+            }
+        }
+
+        // Sort in reverse chronological order (newest first)
+        std::sort(folders.begin(), folders.end(), std::greater<std::string>());
+    }
+    catch (const fs::filesystem_error& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to read saved configs directory: %s", e.what());
+    }
+
+    return folders;
+}
+
+// Helper: Load config from saved folder
+static inline bool LoadConfigFromFolder(
+    const std::string& folderName,
+    AppConfig& /*out*/ config,
+    CharacterData& /*inout*/ characterData,
+    CapsuleData& /*inout*/ capsuleData,
+    ScrubberSettings& /*inout*/ scrubberSettings,
+    AnimDatabase& /*inout*/ animDatabase,
+    ControlledCharacter& /*inout*/ controlledCharacter,
+    int argc,
+    char** argv,
+    char* errMsg,
+    int errMsgSize)
+{
+    const std::string folderPath = "saved/" + folderName;
+    const std::string configPath = folderPath + "/flomo_config.json";
+    const std::string animsPath = folderPath + "/anims.json";
+    const std::string sourcePath = configPath;
+
+    if (!fs::exists(sourcePath))
+    {
+        TraceLog(LOG_ERROR, "Config file not found: %s", sourcePath.c_str());
+        return false;
+    }
+
+    // Copy saved config to main config location temporarily to load it
+    const std::string tempBackup = "flomo_config.json.tmp";
+    try
+    {
+        // Backup current config
+        if (fs::exists(GetConfigPath()))
+        {
+            fs::copy_file(GetConfigPath(), tempBackup, fs::copy_options::overwrite_existing);
+        }
+
+        // Copy saved config to main location
+        fs::copy_file(sourcePath, GetConfigPath(), fs::copy_options::overwrite_existing);
+
+        // Load the config
+        config = LoadAppConfig(argc, argv);
+
+        // Restore original config
+        if (fs::exists(tempBackup))
+        {
+            fs::copy_file(tempBackup, GetConfigPath(), fs::copy_options::overwrite_existing);
+            fs::remove(tempBackup);
+        }
+
+        TraceLog(LOG_INFO, "Config loaded from: %s", sourcePath.c_str());
+    }
+    catch (const fs::filesystem_error& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to load config: %s", e.what());
+
+        // Try to restore backup on error
+        try
+        {
+            if (fs::exists(tempBackup))
+            {
+                fs::copy_file(tempBackup, GetConfigPath(), fs::copy_options::overwrite_existing);
+                fs::remove(tempBackup);
+            }
+        }
+        catch (...) {}
+
+        return false;
+    }
+
+    // Load animations list
+    if (!fs::exists(animsPath))
+    {
+        TraceLog(LOG_WARNING, "Anims file not found: %s (skipping animation loading)", animsPath.c_str());
+        return true;
+    }
+
+    // Read anims.json
+    std::vector<char> animsBuffer;
+    std::ifstream animsFile(animsPath, std::ios::binary | std::ios::ate);
+    if (!animsFile)
+    {
+        TraceLog(LOG_ERROR, "Failed to open anims file: %s", animsPath.c_str());
+        return false;
+    }
+
+    animsBuffer.resize(static_cast<size_t>(animsFile.tellg()) + 1);
+    animsFile.seekg(0);
+    animsFile.read(animsBuffer.data(), animsBuffer.size() - 1);
+    animsBuffer.back() = '\0';
+    const char* animsJson = animsBuffer.data();
+
+    // Reset state that references old character data
+    controlledCharacter.active = false;
+    animDatabase.valid = false;
+    animDatabase.motionFrameCount = 0;
+    CapsuleDataReset(&capsuleData);
+
+    // Clear current characters
+    characterData.count = 0;
+    characterData.active = 0;
+    characterData.bvhData.clear();
+    characterData.scales.clear();
+    characterData.names.clear();
+    characterData.autoScales.clear();
+    characterData.colors.clear();
+    characterData.opacities.clear();
+    characterData.radii.clear();
+    characterData.filePaths.clear();
+    characterData.xformData.clear();
+    characterData.xformTmp0.clear();
+    characterData.xformTmp1.clear();
+    characterData.xformTmp2.clear();
+    characterData.xformTmp3.clear();
+    characterData.jointNamesCombo.clear();
+
+    // Parse animation paths from JSON
+    // Look for "animations": [ "path1", "path2", ... ]
+    const char* animsKey = "\"animations\"";
+    const char* found = strstr(animsJson, animsKey);
+    if (found)
+    {
+        const char* bracket = strchr(found, '[');
+        if (bracket)
+        {
+            const char* p = bracket + 1;
+
+            // Parse each animation path
+            while (*p && *p != ']')
+            {
+                // Skip whitespace
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+                if (*p == ']') break;
+
+                // Look for opening quote
+                if (*p == '"')
+                {
+                    ++p;
+                    const char* pathStart = p;
+
+                    // Find closing quote
+                    while (*p && *p != '"')
+                    {
+                        if (*p == '\\' && *(p + 1) == '"') p += 2;
+                        else ++p;
+                    }
+
+                    if (*p == '"')
+                    {
+                        const size_t len = p - pathStart;
+                        std::string animPath(pathStart, len);
+
+                        // Load the animation
+                        if (!CharacterDataLoadFromFile(&characterData, animPath.c_str(), errMsg, errMsgSize))
+                        {
+                            TraceLog(LOG_WARNING, "Failed to load animation: %s", animPath.c_str());
+                        }
+
+                        ++p;
+                    }
+                }
+
+                // Skip comma and whitespace
+                while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+            }
+        }
+    }
+
+    TraceLog(LOG_INFO,
+        "Loaded %d animations from: %s",
+        characterData.count,
+        animsPath.c_str());
+
+    // Setup state after loading characters
+    OnCharactersLoaded(
+        characterData,
+        capsuleData,
+        scrubberSettings,
+        animDatabase,
+        controlledCharacter,
+        config,
+        argc,
+        argv);
+
+    return true;
+}
+
 
 // Main application state - passed to update/render functions
 struct ApplicationState {
@@ -339,8 +735,16 @@ struct ApplicationState {
     bool debugPaused = false;
     double worldTime = 0.0;  // accumulated time with timescale applied
 
+    // Neural Network state
+    NetworkState networkState;
+
     // Flag for pending database rebuild (set when config changes, cleared when rebuilt)
     bool animDatabaseRebuildPending = false;
+
+    // Saved configs UI state
+    int savedConfigsSelectedIndex = -1;
+    std::vector<std::string> savedConfigFolders;
+    bool savedConfigsNeedRefresh = true;
 };
 
 
@@ -1143,6 +1547,141 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
     ImGui::End();
 }
 
+static inline void ImGuiSavedConfigs(ApplicationState* app)
+{
+    ImGui::SetNextWindowPos(ImVec2(540, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(280, 400), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Saved Configs"))
+    {
+        // Save config button
+        if (ImGui::Button("Save Config"))
+        {
+            std::string folderName;
+            if (SaveConfigToTimestampedFolder(app->config, app->characterData, folderName))
+            {
+                app->savedConfigsNeedRefresh = true;
+                TraceLog(LOG_INFO, "Config saved to folder: %s", folderName.c_str());
+            }
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Save current config and animations to saved/ with timestamp");
+        }
+
+        ImGui::SameLine();
+
+        // Show refresh button
+        if (ImGui::Button("Refresh"))
+        {
+            app->savedConfigsNeedRefresh = true;
+        }
+
+        // Refresh the list if needed
+        if (app->savedConfigsNeedRefresh)
+        {
+            app->savedConfigFolders = GetSavedConfigFolders();
+            app->savedConfigsNeedRefresh = false;
+            app->savedConfigsSelectedIndex = -1;
+        }
+
+        ImGui::Separator();
+
+        // Show list of saved configs
+        if (app->savedConfigFolders.empty())
+        {
+            ImGui::Text("No saved configs found.");
+            ImGui::Text("Use 'Save Config' button above");
+            ImGui::Text("to save current config.");
+        }
+        else
+        {
+            ImGui::Text("Saved Configs (%d):", (int)app->savedConfigFolders.size());
+            ImGui::BeginChild("ConfigList", ImVec2(0, -30), true);
+
+            for (int i = 0; i < (int)app->savedConfigFolders.size(); ++i)
+            {
+                const bool isSelected = (app->savedConfigsSelectedIndex == i);
+                if (ImGui::Selectable(
+                    app->savedConfigFolders[i].c_str(),
+                    isSelected))
+                {
+                    app->savedConfigsSelectedIndex = i;
+                }
+
+                // Load on double-click
+                if (ImGui::IsItemHovered() &&
+                    ImGui::IsMouseDoubleClicked(0))
+                {
+                    const std::string& folderName =
+                        app->savedConfigFolders[i];
+                    AppConfig newConfig;
+                    if (LoadConfigFromFolder(
+                        folderName,
+                        newConfig,
+                        app->characterData,
+                        app->capsuleData,
+                        app->scrubberSettings,
+                        app->animDatabase,
+                        app->controlledCharacter,
+                        app->argc,
+                        app->argv,
+                        app->errMsg,
+                        sizeof(app->errMsg)))
+                    {
+                        app->config = newConfig;
+                        TraceLog(LOG_INFO,
+                            "Config and animations loaded from: %s",
+                            folderName.c_str());
+                    }
+                }
+            }
+
+            ImGui::EndChild();
+
+            // Show instruction
+            ImGui::TextDisabled("Double-click to load");
+        }
+    }
+    ImGui::End();
+}
+
+static inline void ImGuiNeuralNetworks(ApplicationState* app)
+{
+    ImGui::SetNextWindowPos(ImVec2(800, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(220, 120), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Neural Networks"))
+    {
+        if (ImGui::Button("Start Training AE"))
+        {
+            if (app->animDatabase.valid)
+            {
+                NetworkInitAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16);
+            }
+            else
+            {
+                TraceLog(LOG_WARNING, "Cannot start training: AnimDatabase not valid");
+            }
+        }
+
+        if (app->networkState.featuresAutoEncoder)
+        {
+            ImGui::Checkbox("Use Denoiser", &app->config.useMMFeatureDenoiser);
+        }
+
+        if (app->networkState.isTraining)
+        {
+            ImGui::Text("Device: %s", app->networkState.device.is_cuda() ? "GPU" : "CPU");
+            ImGui::Text("Loss: %.6f", app->networkState.currentLoss);
+            ImGui::Text("Iter: %d", app->networkState.iterations);
+            if (ImGui::Button("Stop Training"))
+            {
+                app->networkState.isTraining = false;
+            }
+        }
+    }
+    ImGui::End();
+}
+
 //----------------------------------------------------------------------------------
 // Application
 //----------------------------------------------------------------------------------
@@ -1180,49 +1719,20 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         if (app->characterData.count > prevBvhCount)
         {
-            // Ensure active character is valid
-            if (app->characterData.active < 0 || app->characterData.active >= app->characterData.count)
-            {
-                app->characterData.active = app->characterData.count - 1;
-            }
+            // Setup state after loading characters
+            OnCharactersLoaded(
+                app->characterData,
+                app->capsuleData,
+                app->scrubberSettings,
+                app->animDatabase,
+                app->controlledCharacter,
+                app->config,
+                app->argc,
+                app->argv);
 
-            // Reset scrubber to known state before updating
-            ScrubberSettingsInit(&app->scrubberSettings, app->argc, app->argv);
-
-            ScrubberSettingsRecomputeLimits(&app->scrubberSettings, &app->characterData);
-            ScrubberSettingsInitMaxs(&app->scrubberSettings, &app->characterData);
-
-            // Copy motion matching config (includes lookahead time and blend root modes)
-            app->animDatabase.featuresConfig = app->config.mmConfigEditor;
-
-            // Rebuild animation database
-            AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
-            if (!app->animDatabase.valid) {
-                TraceLog(LOG_WARNING, "AnimDatabase invalid after rebuild - disabling controlled character.");
-                app->controlledCharacter.active = false;
-            }
-            else {
-                // initialize controlled character
-                if (!app->controlledCharacter.active) {
-                    ControlledCharacterInit(
-                        &app->controlledCharacter,
-                        &app->characterData.bvhData[0],
-                        app->characterData.scales[0],
-                        app->config.switchInterval);
-                }
-            }
-
-            // Resize capsule buffer for all characters + controlled character
-            // Account for up to 3x joints: normal + footIK debug + basicBlend debug
-            CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
-            if (app->controlledCharacter.active)
-            {
-                const int totalJoints = (int)app->capsuleData.capsulePositions.size() +
-                    app->controlledCharacter.xformData.jointCount * 3;
-                CapsuleDataResize(&app->capsuleData, totalJoints);
-            }
-
-            string windowTitle = app->characterData.filePaths[app->characterData.active] + " - BVHView";
+            string windowTitle =
+                app->characterData.filePaths[app->characterData.active] +
+                " - BVHView";
             SetWindowTitle(windowTitle.c_str());
         }
     }
@@ -1438,7 +1948,8 @@ static void ApplicationUpdate(void* voidApplicationState)
             &app->animDatabase,
             effectiveDt,
             app->worldTime,
-            app->config);
+            app->config,
+            &app->networkState);
 
     }
 
@@ -2737,6 +3248,10 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         ImGuiPlayerControl(&app->controlledCharacter, &app->config);
 
+        ImGuiSavedConfigs(app);
+
+        ImGuiNeuralNetworks(app);
+
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
     }
@@ -2935,6 +3450,9 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Done
 
+    // Update Neural Network
+    NetworkTrainAutoEncoder(&app->networkState, &app->animDatabase);
+
     EndDrawing();
 }
 
@@ -2979,6 +3497,9 @@ static int ConvertFBXtoBVH(const char* inputPath)
 
 int main(int argc, char** argv)
 {
+    // Initialize CUDA driver context early to avoid lazy initialization issues in LibTorch
+    cuda_init_context();
+
     //TestCudaAndLibtorchAndTCN();
     //testLegIk();
     //TestBallTree();
@@ -3137,7 +3658,7 @@ int main(int argc, char** argv)
         CharacterDataLoadFromFile(&app.characterData, argv[i], app.errMsg, 512);
     }
 
-    const bool loadDefaultFiles = true;
+    const bool loadDefaultFiles = false;
     if (loadDefaultFiles && app.characterData.count == 0)
     {
         app.errMsg[0] = '\0';
@@ -3187,36 +3708,20 @@ int main(int argc, char** argv)
     {
         app.characterData.active = app.characterData.count - 1;
 
-        CapsuleDataUpdateForCharacters(&app.capsuleData, &app.characterData);
-        ScrubberSettingsRecomputeLimits(&app.scrubberSettings, &app.characterData);
-        ScrubberSettingsInitMaxs(&app.scrubberSettings, &app.characterData);
+        // Setup state after loading characters
+        OnCharactersLoaded(
+            app.characterData,
+            app.capsuleData,
+            app.scrubberSettings,
+            app.animDatabase,
+            app.controlledCharacter,
+            app.config,
+            app.argc,
+            app.argv);
 
-        // Copy motion matching config (includes lookahead time and blend root modes)
-        app.animDatabase.featuresConfig = app.config.mmConfigEditor;
-
-        // Build animation database and initialize controlled character
-        AnimDatabaseRebuild(&app.animDatabase, &app.characterData);
-        if (!app.animDatabase.valid) {
-            TraceLog(LOG_WARNING, "AnimDatabase invalid at startup - controlled character disabled.");
-            app.controlledCharacter.active = false;
-        }
-        else {
-            ControlledCharacterInit(
-                &app.controlledCharacter,
-                &app.characterData.bvhData[0],
-                app.characterData.scales[0],
-                app.config.switchInterval);
-        }
-
-        // Resize capsule buffer to include controlled character
-        // Account for up to 3x joints: normal + footIK debug + basicBlend debug
-        {
-            const int totalJoints = (int)app.capsuleData.capsulePositions.size() +
-                app.controlledCharacter.xformData.jointCount * 3;
-            CapsuleDataResize(&app.capsuleData, totalJoints);
-        }
-
-        string windowTitle = app.characterData.filePaths[app.characterData.active] + " - BVHView";
+        string windowTitle =
+            app.characterData.filePaths[app.characterData.active] +
+            " - BVHView";
         SetWindowTitle(windowTitle.c_str());
     }
 
