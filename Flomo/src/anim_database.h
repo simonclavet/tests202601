@@ -1439,6 +1439,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     }
 
 
+
     // Allocate mean vector (per-dimension)
     db->featuresMean.resize(db->featureDim, 0.0f);
 
@@ -1519,6 +1520,65 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     }
 
     TraceLog(LOG_INFO, "AnimDatabase: applied feature type weights to normalized features");
+
+
+
+
+    // Compute pose generation features (neural network training targets)
+    // Using PoseFeatures struct for clean serialization
+    db->poseGenFeaturesComputeDim = PoseFeatures::GetDim(db->jointCount);
+    db->poseGenFeatures.resize(db->motionFrameCount, db->poseGenFeaturesComputeDim);
+    db->poseGenFeatures.fill(0.0f);
+
+    PoseFeatures tempPose;
+    tempPose.Resize(db->jointCount);
+
+    for (int f = 0; f < db->motionFrameCount; ++f)
+    {
+        // Copy lookahead local rotations
+        span<const Rot6d> lookaheadRots = db->lookaheadLocalRotations.row_view(f);
+        for (int j = 0; j < db->jointCount; ++j)
+        {
+            tempPose.lookaheadLocalRotations[j] = lookaheadRots[j];
+        }
+
+        // Copy lookahead local positions
+        span<const Vector3> lookaheadPos = db->lookaheadLocalPositions.row_view(f);
+        for (int j = 0; j < db->jointCount; ++j)
+        {
+            tempPose.lookaheadLocalPositions[j] = lookaheadPos[j];
+        }
+
+        // Copy lookahead root velocity
+        tempPose.lookaheadRootVelocity = db->lookaheadRootMotionVelocitiesRootSpace[f];
+
+        // Copy current root yaw rate (not lookahead)
+        tempPose.rootYawRate = db->rootMotionYawRates[f];
+
+        // Copy lookahead toe positions
+        for (int side : sides)
+        {
+            tempPose.lookaheadToePositionsRootSpace[side] = db->lookaheadToePositionsRootSpace[side][f];
+        }
+
+        // Copy current toe velocities (not lookahead)
+        // Sample at midpoint for better accuracy
+        span<const Vector3> jointVelRow = db->jointVelocitiesRootSpace.row_view(f);
+        for (int side : sides)
+        {
+            const int toeIdx = db->toeIndices[side];
+            assertEvenInRelease(toeIdx >= 0);
+            tempPose.toeVelocitiesRootSpace[side] = jointVelRow[toeIdx];
+        }
+
+        // Serialize to flat array
+        span<float> poseRow = db->poseGenFeatures.row_view(f);
+        tempPose.SerializeTo(poseRow);
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: computed pose generation features (dim=%d) for neural network training",
+        db->poseGenFeaturesComputeDim);
+
 
     // set db->valid true now that we completed full build
     db->valid = true;

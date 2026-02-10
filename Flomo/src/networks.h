@@ -1,10 +1,109 @@
 #pragma once
 
 #include "definitions.h"
+#include <string>
+#include <filesystem>
+#include <unordered_map>
 
 extern "C" void cuda_init_context();
 
-static inline void NetworkInitAutoEncoder(NetworkState* state, int inputDim, int latentDim)
+
+// Bone importance weights from mesh skinning influence
+// Paper: "Learned Motion Matching" (Holden et al.)
+// https://theorangeduck.com/media/uploads/other_stuff/ControlOperators.pdf
+// Used to weight pose feature loss - more important bones (hips, spine, legs) have higher weights
+static inline float GetBoneWeight(const std::string& boneName)
+{
+    static const std::unordered_map<std::string, float> boneWeights = {
+        {"Simulation",       0.00000000f},
+        {"Hips",             0.27088639f},
+        {"Spine",            0.12776886f},
+        {"Spine1",           0.10730254f},
+        {"Spine2",           0.08733685f},
+        {"Spine3",           0.07508411f},
+        {"Neck",             0.00838600f},
+        {"Neck1",            0.00639638f},
+        {"Head",             0.00515253f},
+        {"HeadEnd",          0.00063045f},
+        {"RightShoulder",    0.02654437f},
+        {"RightArm",         0.02060832f},
+        {"RightForeArm",     0.00825604f},
+        {"RightHand",        0.00213240f},
+        {"RightHandThumb1",  0.00073802f},
+        {"RightHandThumb2",  0.00066565f},
+        {"RightHandThumb3",  0.00063558f},
+        {"RightHandThumb4",  0.00063045f},
+        {"RightHandIndex1",  0.00070377f},
+        {"RightHandIndex2",  0.00064898f},
+        {"RightHandIndex3",  0.00063289f},
+        {"RightHandIndex4",  0.00063045f},
+        {"RightHandMiddle1", 0.00072178f},
+        {"RightHandMiddle2", 0.00065547f},
+        {"RightHandMiddle3", 0.00063321f},
+        {"RightHandMiddle4", 0.00063045f},
+        {"RightHandRing1",   0.00070793f},
+        {"RightHandRing2",   0.00065231f},
+        {"RightHandRing3",   0.00063322f},
+        {"RightHandRing4",   0.00063045f},
+        {"RightHandPinky1",  0.00067184f},
+        {"RightHandPinky2",  0.00063829f},
+        {"RightHandPinky3",  0.00063110f},
+        {"RightHandPinky4",  0.00063045f},
+        {"RightForeArmEnd",  0.00063045f},
+        {"RightArmEnd",      0.00063045f},
+        {"LeftShoulder",     0.02739252f},
+        {"LeftArm",          0.02113067f},
+        {"LeftForeArm",      0.00849728f},
+        {"LeftHand",         0.00210641f},
+        {"LeftHandThumb1",   0.00071845f},
+        {"LeftHandThumb2",   0.00065790f},
+        {"LeftHandThumb3",   0.00063489f},
+        {"LeftHandThumb4",   0.00063045f},
+        {"LeftHandIndex1",   0.00069211f},
+        {"LeftHandIndex2",   0.00064446f},
+        {"LeftHandIndex3",   0.00063293f},
+        {"LeftHandIndex4",   0.00063045f},
+        {"LeftHandMiddle1",  0.00071069f},
+        {"LeftHandMiddle2",  0.00065042f},
+        {"LeftHandMiddle3",  0.00063314f},
+        {"LeftHandMiddle4",  0.00063045f},
+        {"LeftHandRing1",    0.00070524f},
+        {"LeftHandRing2",    0.00065236f},
+        {"LeftHandRing3",    0.00063302f},
+        {"LeftHandRing4",    0.00063045f},
+        {"LeftHandPinky1",   0.00067250f},
+        {"LeftHandPinky2",   0.00064092f},
+        {"LeftHandPinky3",   0.00063160f},
+        {"LeftHandPinky4",   0.00063045f},
+        {"LeftForeArmEnd",   0.00063045f},
+        {"LeftArmEnd",       0.00063045f},
+        {"RightUpLeg",       0.05690333f},
+        {"RightLeg",         0.02043630f},
+        {"RightFoot",        0.00305942f},
+        {"RightToeBase",     0.00080056f},
+        {"RightToeBaseEnd",  0.00063045f},
+        {"RightLegEnd",      0.00063045f},
+        {"RightUpLegEnd",    0.00063045f},
+        {"LeftUpLeg",        0.05668447f},
+        {"LeftLeg",          0.02033588f},
+        {"LeftFoot",         0.00289429f},
+        {"LeftToeBase",      0.00078392f},
+        {"LeftToeBaseEnd",   0.00063045f},
+        {"LeftLegEnd",       0.00063045f},
+        {"LeftUpLegEnd",     0.00063045f}
+    };
+
+    auto it = boneWeights.find(boneName);
+    if (it != boneWeights.end())
+    {
+        return it->second;
+    }
+
+    // Default weight for unknown bones
+    return 0.01f;
+}
+
+static inline void NetworkInitAutoEncoder(NetworkState* state, int inputDim, int latentDim, bool startTraining = true)
 {
     if (inputDim <= 0) return;
 
@@ -62,11 +161,42 @@ static inline void NetworkInitAutoEncoder(NetworkState* state, int inputDim, int
     state->optimizer = std::make_shared<torch::optim::Adam>(
         state->featuresAutoEncoder->parameters(), torch::optim::AdamOptions(1e-3));
     
-    state->isTraining = true;
+    state->isTraining = startTraining;
     state->currentLoss = 0.0f;
     state->iterations = 0;
 
     TraceLog(LOG_INFO, "Features AutoEncoder initialized: %d -> %d -> %d", inputDim, latentDim, inputDim);
+}
+
+static inline void NetworkSave(const NetworkState* state, const std::string& folderPath)
+{
+    if (!state->featuresAutoEncoder) return;
+
+    const std::string aePath = folderPath + "/featureAutoEncoder.bin";
+    try {
+        torch::save(state->featuresAutoEncoder, aePath);
+        TraceLog(LOG_INFO, "Saved AutoEncoder to: %s", aePath.c_str());
+    }
+    catch (const std::exception& e) {
+        TraceLog(LOG_ERROR, "Failed to save AutoEncoder: %s", e.what());
+    }
+}
+
+static inline void NetworkLoad(NetworkState* state, int inputDim, int latentDim, const std::string& folderPath)
+{
+    const std::string aePath = folderPath + "/featureAutoEncoder.bin";
+    if (!std::filesystem::exists(aePath)) return;
+
+    try {
+        // Initialize model structure with correct dimensions, but don't start training
+        NetworkInitAutoEncoder(state, inputDim, latentDim, false);
+        torch::load(state->featuresAutoEncoder, aePath);
+        state->featuresAutoEncoder->to(state->device);
+        TraceLog(LOG_INFO, "Loaded AutoEncoder from: %s", aePath.c_str());
+    }
+    catch (const std::exception& e) {
+        TraceLog(LOG_ERROR, "Failed to load AutoEncoder: %s", e.what());
+    }
 }
 
 static inline void NetworkTrainAutoEncoder(NetworkState* state, const AnimDatabase* db)

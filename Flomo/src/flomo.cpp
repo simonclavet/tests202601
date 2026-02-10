@@ -303,8 +303,10 @@ static inline void OnCharactersLoaded(
     AnimDatabase& animDatabase,
     ControlledCharacter& controlledCharacter,
     AppConfig& config,
+    NetworkState& networkState,
     int argc,
-    char** argv)
+    char** argv,
+    const std::string& folderPath = "")
 {
     if (characterData.count == 0)
         return;
@@ -340,6 +342,12 @@ static inline void OnCharactersLoaded(
             &characterData.bvhData[0],
             characterData.scales[0],
             config.switchInterval);
+
+        // Load AutoEncoder if path provided
+        if (!folderPath.empty())
+        {
+            NetworkLoad(&networkState, animDatabase.featureDim, 16, folderPath);
+        }
     }
 
     // Resize capsule buffer for all characters + controlled character
@@ -403,7 +411,7 @@ static inline bool SaveAnimsList(const CharacterData& characterData, const std::
 }
 
 // Helper: Save config to timestamped folder in saved/
-static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const CharacterData& characterData, std::string& /*out*/ savedFolderName)
+static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const CharacterData& characterData, const NetworkState& networkState, std::string& /*out*/ savedFolderName)
 {
     const std::string baseDir = "saved";
 
@@ -464,6 +472,9 @@ static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const 
         return false;
     }
 
+    // Save AutoEncoder if it exists
+    NetworkSave(&networkState, folderPath);
+
     savedFolderName = fs::path(folderPath).filename().string();
     TraceLog(LOG_INFO, "Config saved to: %s", folderPath.c_str());
     return true;
@@ -510,6 +521,7 @@ static inline bool LoadConfigFromFolder(
     ScrubberSettings& /*inout*/ scrubberSettings,
     AnimDatabase& /*inout*/ animDatabase,
     ControlledCharacter& /*inout*/ controlledCharacter,
+    NetworkState& /*inout*/ networkState,
     int argc,
     char** argv,
     char* errMsg,
@@ -680,8 +692,10 @@ static inline bool LoadConfigFromFolder(
         animDatabase,
         controlledCharacter,
         config,
+        networkState,
         argc,
-        argv);
+        argv,
+        folderPath);
 
     return true;
 }
@@ -1557,7 +1571,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
         if (ImGui::Button("Save Config"))
         {
             std::string folderName;
-            if (SaveConfigToTimestampedFolder(app->config, app->characterData, folderName))
+            if (SaveConfigToTimestampedFolder(app->config, app->characterData, app->networkState, folderName))
             {
                 app->savedConfigsNeedRefresh = true;
                 TraceLog(LOG_INFO, "Config saved to folder: %s", folderName.c_str());
@@ -1623,6 +1637,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                         app->scrubberSettings,
                         app->animDatabase,
                         app->controlledCharacter,
+                        app->networkState,
                         app->argc,
                         app->argv,
                         app->errMsg,
@@ -1648,18 +1663,26 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
 static inline void ImGuiNeuralNetworks(ApplicationState* app)
 {
     ImGui::SetNextWindowPos(ImVec2(800, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(220, 120), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(220, 150), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Neural Networks"))
     {
-        if (ImGui::Button("Start Training AE"))
+        if (ImGui::Button("Restart Training AE"))
         {
             if (app->animDatabase.valid)
             {
-                NetworkInitAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16);
+                NetworkInitAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16, true);
             }
             else
             {
                 TraceLog(LOG_WARNING, "Cannot start training: AnimDatabase not valid");
+            }
+        }
+
+        if (app->networkState.featuresAutoEncoder && !app->networkState.isTraining)
+        {
+            if (ImGui::Button("Continue Training"))
+            {
+                app->networkState.isTraining = true;
             }
         }
 
@@ -1727,6 +1750,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                 app->animDatabase,
                 app->controlledCharacter,
                 app->config,
+                app->networkState,
                 app->argc,
                 app->argv);
 
@@ -3716,6 +3740,7 @@ int main(int argc, char** argv)
             app.animDatabase,
             app.controlledCharacter,
             app.config,
+            app.networkState,
             app.argc,
             app.argv);
 

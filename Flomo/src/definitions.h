@@ -241,6 +241,167 @@ struct PlayerControlInput
 
 
 //----------------------------------------------------------------------------------
+// Pose Features - Neural Network Target
+//----------------------------------------------------------------------------------
+
+// Structured representation of pose features for neural network training/inference
+// This is what the network outputs given motion matching features as input
+// These are the targets that ControlledCharacterUpdateNetwork will use to advance the pose
+//
+// Usage example for network inference in ControlledCharacterUpdateNetwork:
+//   PoseFeatures pose;
+//   torch::Tensor output = network.forward(motionMatchingFeatures);
+//   pose.DeserializeFrom(outputSpan, jointCount);
+//   // Apply pose.lookaheadLocalRotations/Positions to character
+//   // Update root motion using pose.lookaheadRootVelocity and pose.rootYawRate
+//   // Update foot IK using pose.lookaheadToePositions and pose.toeVelocities
+struct PoseFeatures
+{
+    // Lookahead pose (what the pose will be after lookahead time)
+    std::vector<Rot6d> lookaheadLocalRotations;   // [jointCount]
+    std::vector<Vector3> lookaheadLocalPositions;  // [jointCount]
+
+    // Root motion (lookahead for velocity, current for yaw rate)
+    Vector3 lookaheadRootVelocity;                 // root velocity in root space (lookahead)
+    float rootYawRate;                             // current yaw rate (rad/s)
+
+    // Foot IK data (lookahead positions, current velocities for speed clamping)
+    Vector3 lookaheadToePositionsRootSpace[SIDES_COUNT];  // [left, right]
+    Vector3 toeVelocitiesRootSpace[SIDES_COUNT];          // [left, right] current velocities
+
+    // Get dimension needed for flat array representation
+    static int GetDim(int jointCount)
+    {
+        int dim = 0;
+        dim += jointCount * 6;  // lookaheadLocalRotations (Rot6d per joint)
+        dim += jointCount * 3;  // lookaheadLocalPositions (Vector3 per joint)
+        dim += 3;               // lookaheadRootVelocity (Vector3)
+        dim += 1;               // rootYawRate (float)
+        dim += 3 * 2;           // lookaheadToePositionsRootSpace (Vector3 x 2 sides)
+        dim += 3 * 2;           // toeVelocitiesRootSpace (Vector3 x 2 sides)
+        return dim;
+    }
+
+    // Resize internal storage for given joint count
+    void Resize(int jointCount)
+    {
+        lookaheadLocalRotations.resize(jointCount);
+        lookaheadLocalPositions.resize(jointCount);
+        lookaheadRootVelocity = Vector3Zero();
+        rootYawRate = 0.0f;
+        for (int side : sides)
+        {
+            lookaheadToePositionsRootSpace[side] = Vector3Zero();
+            toeVelocitiesRootSpace[side] = Vector3Zero();
+        }
+    }
+
+    // Serialize to flat array
+    // dest must have size >= GetDim(jointCount)
+    void SerializeTo(std::span<float> dest) const
+    {
+        int idx = 0;
+
+        // Pack lookahead local rotations (Rot6d: 6 floats per joint)
+        for (const Rot6d& rot : lookaheadLocalRotations)
+        {
+            dest[idx++] = rot.ax;
+            dest[idx++] = rot.ay;
+            dest[idx++] = rot.az;
+            dest[idx++] = rot.bx;
+            dest[idx++] = rot.by;
+            dest[idx++] = rot.bz;
+        }
+
+        // Pack lookahead local positions (Vector3: 3 floats per joint)
+        for (const Vector3& pos : lookaheadLocalPositions)
+        {
+            dest[idx++] = pos.x;
+            dest[idx++] = pos.y;
+            dest[idx++] = pos.z;
+        }
+
+        // Pack lookahead root velocity (Vector3: 3 floats)
+        dest[idx++] = lookaheadRootVelocity.x;
+        dest[idx++] = lookaheadRootVelocity.y;
+        dest[idx++] = lookaheadRootVelocity.z;
+
+        // Pack root yaw rate (float: 1 float)
+        dest[idx++] = rootYawRate;
+
+        // Pack lookahead toe positions (Vector3 x 2: 6 floats)
+        for (int side : sides)
+        {
+            dest[idx++] = lookaheadToePositionsRootSpace[side].x;
+            dest[idx++] = lookaheadToePositionsRootSpace[side].y;
+            dest[idx++] = lookaheadToePositionsRootSpace[side].z;
+        }
+
+        // Pack toe velocities (Vector3 x 2: 6 floats)
+        for (int side : sides)
+        {
+            dest[idx++] = toeVelocitiesRootSpace[side].x;
+            dest[idx++] = toeVelocitiesRootSpace[side].y;
+            dest[idx++] = toeVelocitiesRootSpace[side].z;
+        }
+    }
+
+    // Deserialize from flat array
+    // src must have size >= GetDim(jointCount)
+    void DeserializeFrom(std::span<const float> src, int jointCount)
+    {
+        Resize(jointCount);
+        int idx = 0;
+
+        // Unpack lookahead local rotations
+        for (int j = 0; j < jointCount; ++j)
+        {
+            Rot6d& rot = lookaheadLocalRotations[j];
+            rot.ax = src[idx++];
+            rot.ay = src[idx++];
+            rot.az = src[idx++];
+            rot.bx = src[idx++];
+            rot.by = src[idx++];
+            rot.bz = src[idx++];
+        }
+
+        // Unpack lookahead local positions
+        for (int j = 0; j < jointCount; ++j)
+        {
+            Vector3& pos = lookaheadLocalPositions[j];
+            pos.x = src[idx++];
+            pos.y = src[idx++];
+            pos.z = src[idx++];
+        }
+
+        // Unpack lookahead root velocity
+        lookaheadRootVelocity.x = src[idx++];
+        lookaheadRootVelocity.y = src[idx++];
+        lookaheadRootVelocity.z = src[idx++];
+
+        // Unpack root yaw rate
+        rootYawRate = src[idx++];
+
+        // Unpack lookahead toe positions
+        for (int side : sides)
+        {
+            lookaheadToePositionsRootSpace[side].x = src[idx++];
+            lookaheadToePositionsRootSpace[side].y = src[idx++];
+            lookaheadToePositionsRootSpace[side].z = src[idx++];
+        }
+
+        // Unpack toe velocities
+        for (int side : sides)
+        {
+            toeVelocitiesRootSpace[side].x = src[idx++];
+            toeVelocitiesRootSpace[side].y = src[idx++];
+            toeVelocitiesRootSpace[side].z = src[idx++];
+        }
+    }
+};
+
+
+//----------------------------------------------------------------------------------
 // Animation Database
 //----------------------------------------------------------------------------------
 
@@ -342,6 +503,12 @@ struct AnimDatabase
     std::vector<float> featuresMean;            // mean of each feature dimension [featureDim]
     float featureTypesStd[static_cast<int>(FeatureType::COUNT)] = {};  // std shared by all features of same type
     Array2D<float> normalizedFeatures;          // normalized features [motionFrameCount x featureDim]
+
+    // Neural network training targets: pose generation features [motionFrameCount x poseGenFeaturesComputeDim]
+    // Contains lookahead local rotations, positions, root motion, and foot IK data
+    // This is what the network should output given the motion matching features as input
+    int poseGenFeaturesComputeDim = -1;        // dimension: jointCount*9 + 16
+    Array2D<float> poseGenFeatures;            // [motionFrameCount x poseGenFeaturesComputeDim]
 };
 
 
@@ -390,6 +557,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->featuresMean.clear();
     for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i) db->featureTypesStd[i] = 0.0f;
     db->normalizedFeatures.clear();
+    db->poseGenFeaturesComputeDim = -1;
+    db->poseGenFeatures.clear();
 }
 
 

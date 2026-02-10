@@ -182,7 +182,7 @@ static void ControlledCharacterUpdate(
     float dt,
     double worldTime,
     const AppConfig& config,
-    NetworkState* networkState = nullptr)
+    NetworkState* networkState)
 {
     if (!cc->active || characterData->count == 0) return;
 
