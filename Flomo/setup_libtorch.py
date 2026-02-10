@@ -213,19 +213,28 @@ def main():
         print("\nFailed to setup LibTorch")
         return 1
 
-    # Create release/debug structure
+    # Reorganize into release/debug structure
+    # extracted_path is thirdparty/libtorch (from zip)
+    # We need: thirdparty/libtorch/release/ and thirdparty/libtorch/debug/
+
+    temp_path = os.path.join(thirdparty_dir, "libtorch_temp")
+
+    # Rename extracted libtorch to temp location
+    if os.path.exists(temp_path):
+        shutil.rmtree(temp_path)
+    shutil.move(extracted_path, temp_path)
+
+    # Create new libtorch directory with release subdirectory
     release_dir = os.path.join(thirdparty_dir, "libtorch", "release")
+    os.makedirs(os.path.dirname(release_dir), exist_ok=True)
+
+    # Move temp to release
+    shutil.move(temp_path, release_dir)
+
+    # Note about debug build
     debug_dir = os.path.join(thirdparty_dir, "libtorch", "debug")
-
-    # Move extracted libtorch to release
-    if os.path.exists(release_dir):
-        shutil.rmtree(release_dir)
-    shutil.move(extracted_path, release_dir)
-
-    # For now, use release for both (debug version requires separate download)
-    if not os.path.exists(debug_dir):
-        print("\nNote: Using release build for debug config")
-        print("(Debug LibTorch requires separate download)")
+    print("\nNote: Using release build for debug config")
+    print("(Debug LibTorch would require separate download)")
 
     print(f"\n✓ LibTorch ({libtorch_cuda}) installed successfully!")
     print(f"Location: {release_dir}")
