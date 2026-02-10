@@ -62,7 +62,7 @@ def select_libtorch_cuda_version(cuda_version, compute_cap):
     """
     Select appropriate LibTorch CUDA version.
 
-    Available options: cu126, cu128, cu130
+    Available LibTorch 2.10.0 options: cu126, cu128, cu130
     Blackwell (SM 12.0) requires CUDA 12.6+
     """
     if not cuda_version:
@@ -81,12 +81,16 @@ def select_libtorch_cuda_version(cuda_version, compute_cap):
 
     # Blackwell (SM 12.0) requires CUDA 12.6+
     if major_cap >= 12:
-        if major_cuda >= 13:
-            return "cu130"  # Use CUDA 13.0 for CUDA 13.x
-        elif major_cuda == 12 and minor_cuda >= 8:
-            return "cu128"
-        elif major_cuda == 12 and minor_cuda >= 6:
-            return "cu126"
+        # Check if CUDA version is new enough
+        # (major >= 13) OR (major == 12 AND minor >= 6)
+        if major_cuda >= 13 or (major_cuda == 12 and minor_cuda >= 6):
+            # Match CUDA version to LibTorch version
+            if major_cuda >= 13:
+                return "cu130"
+            elif minor_cuda >= 8:
+                return "cu128"
+            else:
+                return "cu126"
         else:
             print(f"WARNING: Blackwell GPU detected but CUDA version "
                   f"{major_cuda}.{minor_cuda} is too old (need 12.6+)")
@@ -108,7 +112,7 @@ def select_libtorch_cuda_version(cuda_version, compute_cap):
 def get_libtorch_url(cuda_version):
     """Get LibTorch download URL for Windows."""
     base_url = "https://download.pytorch.org/libtorch"
-    version = "2.6.0"  # Latest stable
+    version = "2.10.0"  # Latest stable
 
     if cuda_version == "cpu":
         return (
@@ -141,39 +145,54 @@ def extract_zip(zip_path, extract_to):
         zip_ref.extractall(extract_to)
 
 def setup_libtorch(target_dir, cuda_version):
-    """Download and setup LibTorch."""
+    """Download and setup LibTorch with fallback."""
 
-    # Get download URL
-    url = get_libtorch_url(cuda_version)
+    # Try requested version first
+    versions_to_try = [cuda_version]
 
-    # Download to temp file
-    temp_zip = os.path.join(target_dir, "libtorch_temp.zip")
+    # Add fallbacks if CUDA version fails
+    if cuda_version == "cu130":
+        versions_to_try.extend(["cu128", "cu126"])
+    elif cuda_version == "cu128":
+        versions_to_try.append("cu126")
 
-    try:
-        download_file(url, temp_zip)
-    except Exception as e:
-        print(f"ERROR: Failed to download LibTorch: {e}")
-        return False
+    last_error = None
 
-    # Extract
-    try:
-        extract_zip(temp_zip, target_dir)
-    except Exception as e:
-        print(f"ERROR: Failed to extract: {e}")
-        os.remove(temp_zip)
-        return False
+    for version in versions_to_try:
+        url = get_libtorch_url(version)
+        temp_zip = os.path.join(target_dir, "libtorch_temp.zip")
 
-    # Remove temp zip
-    os.remove(temp_zip)
+        try:
+            if version != cuda_version:
+                print(f"\nTrying fallback version: {version}")
 
-    # The zip extracts to libtorch/
-    extracted_path = os.path.join(target_dir, "libtorch")
+            download_file(url, temp_zip)
 
-    if not os.path.exists(extracted_path):
-        print("ERROR: Extracted libtorch directory not found")
-        return False
+            # Extract
+            extract_zip(temp_zip, target_dir)
+            os.remove(temp_zip)
 
-    return extracted_path
+            # The zip extracts to libtorch/
+            extracted_path = os.path.join(target_dir, "libtorch")
+
+            if not os.path.exists(extracted_path):
+                print("ERROR: Extracted libtorch directory not found")
+                continue
+
+            if version != cuda_version:
+                print(f"Successfully downloaded {version} as fallback")
+
+            return extracted_path
+
+        except Exception as e:
+            last_error = e
+            print(f"Failed to download {version}: {e}")
+            if os.path.exists(temp_zip):
+                os.remove(temp_zip)
+            continue
+
+    print(f"\nERROR: All download attempts failed. Last error: {last_error}")
+    return False
 
 def main():
     """Main setup function."""
@@ -190,11 +209,15 @@ def main():
 
     print(f"\nSelected LibTorch variant: {libtorch_cuda}")
 
-    # Ask user confirmation
-    response = input("\nDownload and install LibTorch? [y/N]: ")
-    if response.lower() != 'y':
-        print("Aborted.")
-        return 1
+    # Ask user confirmation (skip if auto-confirm env var set)
+    auto_confirm = os.environ.get("LIBTORCH_AUTO_CONFIRM", "").lower() == "1"
+    if not auto_confirm:
+        response = input("\nDownload and install LibTorch? [y/N]: ")
+        if response.lower() != 'y':
+            print("Aborted.")
+            return 1
+    else:
+        print("\n[Auto-confirmed] Proceeding with LibTorch installation...")
 
     # Backup existing libtorch if it exists
     libtorch_dir = os.path.join(thirdparty_dir, "libtorch")

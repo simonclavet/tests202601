@@ -6,10 +6,6 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $thirdpartyDir = Join-Path $scriptDir "thirdparty"
 
-# libtorch version config
-$torchVersion = "2.5.1"
-$cudaVersion = "cu121"
-
 # required versions
 $requiredCmakeVersion = [Version]"3.21"
 $requiredCudaVersion = [Version]"13.1"
@@ -88,6 +84,18 @@ if (-not $gitCmd) {
     exit 1
 }
 Write-Host "[OK] Git found" -ForegroundColor Green
+
+# check python (needed for setup_libtorch.py)
+$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCmd) {
+    Write-Host "[MISSING] Python not found!" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Install Python using:" -ForegroundColor Yellow
+    Write-Host "  winget install Python.Python.3.11"
+    Write-Host "  or download from: https://www.python.org/downloads/"
+    exit 1
+}
+Write-Host "[OK] Python found" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Thirdparty dir: $thirdpartyDir"
@@ -233,32 +241,29 @@ if (Test-Path $ufbxDir) {
     Write-Host "[OK] ufbx downloaded" -ForegroundColor Green
 }
 
-# libtorch - need both debug and release
+# libtorch - auto-detect GPU and download appropriate version
 Write-Host ""
 Write-Host "Checking libtorch..." -ForegroundColor Cyan
 $libtorchDir = Join-Path $thirdpartyDir "libtorch"
-$debugDir = Join-Path $libtorchDir "debug"
 $releaseDir = Join-Path $libtorchDir "release"
 
-# Create libtorch folder if needed
-if (-not (Test-Path $libtorchDir)) {
-    New-Item -ItemType Directory -Path $libtorchDir | Out-Null
-}
-
-# Debug build
-if (Test-Path $debugDir) {
-    Write-Host "[OK] libtorch/debug already exists" -ForegroundColor Green
-} else {
-    $debugUrl = "https://download.pytorch.org/libtorch/$cudaVersion/libtorch-win-shared-with-deps-debug-$torchVersion%2B$cudaVersion.zip"
-    Download-AndExtract $debugUrl $debugDir "libtorch DEBUG ($torchVersion+$cudaVersion)"
-}
-
-# Release build
 if (Test-Path $releaseDir) {
-    Write-Host "[OK] libtorch/release already exists" -ForegroundColor Green
+    Write-Host "[OK] libtorch already exists" -ForegroundColor Green
+    Write-Host "  To update, delete 'thirdparty/libtorch' and run this script again" -ForegroundColor Gray
 } else {
-    $releaseUrl = "https://download.pytorch.org/libtorch/$cudaVersion/libtorch-win-shared-with-deps-$torchVersion%2B$cudaVersion.zip"
-    Download-AndExtract $releaseUrl $releaseDir "libtorch RELEASE ($torchVersion+$cudaVersion)"
+    Write-Host "[SETUP] Running setup_libtorch.py to auto-detect GPU..." -ForegroundColor Yellow
+
+    # Run Python script with auto-confirmation
+    Push-Location $scriptDir
+    $env:LIBTORCH_AUTO_CONFIRM = "1"
+    python setup_libtorch.py
+    Pop-Location
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] LibTorch setup failed" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[OK] libtorch installed" -ForegroundColor Green
 }
 
 Write-Host ""
