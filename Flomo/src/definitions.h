@@ -224,6 +224,7 @@ struct AppConfig {
 
     // Neural Network settings
     bool useMMFeatureDenoiser = false;
+    bool testSegmentAutoEncoder = false;
 
     // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
@@ -262,7 +263,8 @@ struct PoseFeatures
 {
     // Lookahead pose (what the pose will be after lookahead time)
     std::vector<Rot6d> lookaheadLocalRotations;   // [jointCount]
-    std::vector<Vector3> lookaheadLocalPositions;  // [jointCount]
+    Vector3 rootLocalPosition;                     // bone 0 only (relative to magic anchor)
+    // bones 1+ local positions are constant skeleton offsets, not stored here
 
     // Root motion (lookahead for velocity, current for yaw rate)
     Vector3 lookaheadRootVelocity;                 // root velocity in root space (lookahead)
@@ -272,24 +274,23 @@ struct PoseFeatures
     Vector3 lookaheadToePositionsRootSpace[SIDES_COUNT];  // [left, right]
     Vector3 toeVelocitiesRootSpace[SIDES_COUNT];          // [left, right] current velocities
 
-    // Get dimension needed for flat array representation
+    // flat layout: [jc*6 rotations] [3 rootPos] [3 rootVel] [1 yawRate] [6 toePos] [6 toeVel]
     static int GetDim(int jointCount)
     {
         int dim = 0;
         dim += jointCount * 6;  // lookaheadLocalRotations (Rot6d per joint)
-        dim += jointCount * 3;  // lookaheadLocalPositions (Vector3 per joint)
+        dim += 3;               // rootLocalPosition (bone 0 only)
         dim += 3;               // lookaheadRootVelocity (Vector3)
         dim += 1;               // rootYawRate (float)
         dim += 3 * 2;           // lookaheadToePositionsRootSpace (Vector3 x 2 sides)
         dim += 3 * 2;           // toeVelocitiesRootSpace (Vector3 x 2 sides)
-        return dim;
+        return dim;             // = jc*6 + 19
     }
 
-    // Resize internal storage for given joint count
     void Resize(int jointCount)
     {
         lookaheadLocalRotations.resize(jointCount);
-        lookaheadLocalPositions.resize(jointCount);
+        rootLocalPosition = Vector3Zero();
         lookaheadRootVelocity = Vector3Zero();
         rootYawRate = 0.0f;
         for (int side : sides)
@@ -299,13 +300,10 @@ struct PoseFeatures
         }
     }
 
-    // Serialize to flat array
-    // dest must have size >= GetDim(jointCount)
     void SerializeTo(std::span<float> dest) const
     {
         int idx = 0;
 
-        // Pack lookahead local rotations (Rot6d: 6 floats per joint)
         for (const Rot6d& rot : lookaheadLocalRotations)
         {
             dest[idx++] = rot.ax;
@@ -316,23 +314,16 @@ struct PoseFeatures
             dest[idx++] = rot.bz;
         }
 
-        // Pack lookahead local positions (Vector3: 3 floats per joint)
-        for (const Vector3& pos : lookaheadLocalPositions)
-        {
-            dest[idx++] = pos.x;
-            dest[idx++] = pos.y;
-            dest[idx++] = pos.z;
-        }
+        dest[idx++] = rootLocalPosition.x;
+        dest[idx++] = rootLocalPosition.y;
+        dest[idx++] = rootLocalPosition.z;
 
-        // Pack lookahead root velocity (Vector3: 3 floats)
         dest[idx++] = lookaheadRootVelocity.x;
         dest[idx++] = lookaheadRootVelocity.y;
         dest[idx++] = lookaheadRootVelocity.z;
 
-        // Pack root yaw rate (float: 1 float)
         dest[idx++] = rootYawRate;
 
-        // Pack lookahead toe positions (Vector3 x 2: 6 floats)
         for (int side : sides)
         {
             dest[idx++] = lookaheadToePositionsRootSpace[side].x;
@@ -340,7 +331,6 @@ struct PoseFeatures
             dest[idx++] = lookaheadToePositionsRootSpace[side].z;
         }
 
-        // Pack toe velocities (Vector3 x 2: 6 floats)
         for (int side : sides)
         {
             dest[idx++] = toeVelocitiesRootSpace[side].x;
@@ -349,14 +339,11 @@ struct PoseFeatures
         }
     }
 
-    // Deserialize from flat array
-    // src must have size >= GetDim(jointCount)
     void DeserializeFrom(std::span<const float> src, int jointCount)
     {
         Resize(jointCount);
         int idx = 0;
 
-        // Unpack lookahead local rotations
         for (int j = 0; j < jointCount; ++j)
         {
             Rot6d& rot = lookaheadLocalRotations[j];
@@ -368,24 +355,16 @@ struct PoseFeatures
             rot.bz = src[idx++];
         }
 
-        // Unpack lookahead local positions
-        for (int j = 0; j < jointCount; ++j)
-        {
-            Vector3& pos = lookaheadLocalPositions[j];
-            pos.x = src[idx++];
-            pos.y = src[idx++];
-            pos.z = src[idx++];
-        }
+        rootLocalPosition.x = src[idx++];
+        rootLocalPosition.y = src[idx++];
+        rootLocalPosition.z = src[idx++];
 
-        // Unpack lookahead root velocity
         lookaheadRootVelocity.x = src[idx++];
         lookaheadRootVelocity.y = src[idx++];
         lookaheadRootVelocity.z = src[idx++];
 
-        // Unpack root yaw rate
         rootYawRate = src[idx++];
 
-        // Unpack lookahead toe positions
         for (int side : sides)
         {
             lookaheadToePositionsRootSpace[side].x = src[idx++];
@@ -393,7 +372,6 @@ struct PoseFeatures
             lookaheadToePositionsRootSpace[side].z = src[idx++];
         }
 
-        // Unpack toe velocities
         for (int side : sides)
         {
             toeVelocitiesRootSpace[side].x = src[idx++];
@@ -512,6 +490,17 @@ struct AnimDatabase
     // This is what the network should output given the motion matching features as input
     int poseGenFeaturesComputeDim = -1;        // dimension: jointCount*9 + 16
     Array2D<float> poseGenFeatures;            // [motionFrameCount x poseGenFeaturesComputeDim]
+    float poseGenFeaturesSegmentLength = 0.4f; // how many seconds of poseGenFeatures a cursor copies
+
+    // normalization for poseGenFeatures (for segment autoencoder training)
+    std::vector<float> poseGenFeaturesMean;    // per-dim mean [poseGenFeaturesComputeDim]
+    std::vector<float> poseGenFeaturesStd;     // per-dim std [poseGenFeaturesComputeDim]
+    std::vector<float> poseGenFeaturesWeight;  // per-dim bone weight [poseGenFeaturesComputeDim]
+    Array2D<float> normalizedPoseGenFeatures;  // (raw - mean) / std * weight [motionFrameCount x poseGenFeaturesComputeDim]
+
+    // segment autoencoder sizing (computed at build time from frame rate and segmentLength)
+    int poseGenSegmentFrameCount = -1;         // how many frames in a segment
+    int poseGenSegmentFlatDim = -1;            // poseGenSegmentFrameCount * poseGenFeaturesComputeDim
 };
 
 
@@ -533,6 +522,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointPositions.clear();
     db->localJointRotations.clear();
     db->lookaheadLocalRotations.clear();
+    db->lookaheadLocalPositions.clear();
     db->lookaheadLocalPositions.clear();
     db->rootMotionVelocitiesRootSpace.clear();
     db->rootMotionYawRates.clear();
@@ -562,6 +552,12 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->normalizedFeatures.clear();
     db->poseGenFeaturesComputeDim = -1;
     db->poseGenFeatures.clear();
+    db->poseGenFeaturesMean.clear();
+    db->poseGenFeaturesStd.clear();
+    db->poseGenFeaturesWeight.clear();
+    db->normalizedPoseGenFeatures.clear();
+    db->poseGenSegmentFrameCount = -1;
+    db->poseGenSegmentFlatDim = -1;
 }
 
 
@@ -627,7 +623,7 @@ struct BVHData
 
 struct BlendCursor {
     int animIndex = -1;                         // which animation/clip
-    float animTime = 0.0f;                      // playback time in that clip
+    float segmentAnimTime = 0.0f;               // playback time within the segment (0 to segmentMaxTime)
     DoubleSpringDamperState weightSpring = {};  // spring state for weight blending (x = current weight)
     float normalizedWeight = 0.0f;              // weight / totalWeight (sums to 1 across active cursors)
     DoubleSpringDamperState fastWeightSpring = {}; // faster spring for yaw rate
@@ -636,11 +632,11 @@ struct BlendCursor {
     float blendTime = 0.3f;                     // halflife for double spring damper
     bool active = false;                        // is cursor in use
 
-    // Local-space pose stored per cursor for blending (size = jointCount)
-    std::vector<Vector3> localPositions;
+
     std::vector<Rot6d> localRotations6d;
     std::vector<Rot6d> lookaheadRotations6d;  // extrapolated pose for lookahead dragging
-    std::vector<Vector3> lookaheadLocalPositions;  // extrapolated positions for lookahead dragging
+    Vector3 rootLocalPosition;
+
 
     // Sampled root motion velocities from database (root space = heading-relative)
     Vector3 sampledRootVelocityRootSpace = Vector3Zero();  // XZ velocity in root space
@@ -665,6 +661,12 @@ struct BlendCursor {
     // Root motion velocity tracking (for acceleration-based blending)
     Vector3 rootVelocityWorldForDisplayOnly = Vector3Zero();    // current root velocity (world space)
     float rootYawRate = 0.0f;                // current yaw rate (radians/sec)
+
+    // poseGenFeatures segment: a local copy of N frames of poseGenFeatures data
+    // segmentAnimTime is relative to segment start (0 to segmentMaxTime)
+    // use segment.rows() for frame count, segment.cols() for dim
+    Array2D<float> segment;              // [segmentFrameCount x poseGenFeaturesComputeDim]
+    float segmentFrameTime = 0.0f;       // seconds per frame
 };
 
 
@@ -809,4 +811,11 @@ struct NetworkState {
     torch::nn::Sequential model = nullptr;
     torch::nn::Sequential featuresAutoEncoder = nullptr;
     std::shared_ptr<torch::optim::Adam> optimizer = nullptr;
+
+    // segment autoencoder
+    torch::nn::Sequential segmentAutoEncoder = nullptr;
+    std::shared_ptr<torch::optim::Adam> segmentOptimizer = nullptr;
+    bool isTrainingSegmentAE = false;
+    float segmentAELoss = 0.0f;
+    int segmentAEIterations = 0;
 };

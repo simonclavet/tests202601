@@ -52,9 +52,6 @@ flomo.exe -fbx2bvh input.fbx
 
 Here are some guidelines.
 
-Use the file AiPlan.md as a scratch pad for the current plan. Append to it as needed, so you keep a memory of
-what you are doing and why, and what you have done.
-
 Some of these conventions are not really respected everywhere in this code, but try to follow them as much as 
 possible for any new - Prefer `int` as the main integer type (don't warn about size_t to int conversions)
 - Use `float` for all floating-point values (add `f` suffix to literals: `1.0f`)
@@ -62,11 +59,12 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - C++20 designated initializers are OK
 - Keep code in single files when practical code you write.
 - When possible initialize variables directly when defining them in the struct definition instead of in the init function or constructor.
+- Don't use default values for function parameters. 
 - Function names are CamelCase, variable and member names are camelCase. constexpr for CONSTANTS
-- Don't use auto unless absolutely necessary.
-- Don't use lambdas
+- Don't use auto unless absolutely necessary or it replaces a gigantic mess (like more than 80 characters).
+- Don't use lambdas unless for extremelly small simple things
 - Be const correct for functions and function parameters (except simple parameter values). 
-- bBe const correct for local variable: if a variable is not modified after initialization, make it const.
+- Be const correct for local variable: if a variable is not modified after initialization, make it const.
 - Don't create unused variables
 - When an argument is modified as the result, prefix the argument with /*out*/ or /*inout*/ if it is not obvious.
 - Never modify non-const value arguments of functions.
@@ -80,13 +78,11 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
 - no need for private and public. Use structs only, unless when we really want to.
 - I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
-- And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important
-things, that is called only once from an other important function that does important things.
-Important and complicated things should not be hidden, they should be there, in plain sight,
-showing what they are doing. 
+- And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important things, that is called only once from an other important function that does important things. Important and complicated things should not be hidden, they should be there, in plain sight, showing what they are doing. 
 - Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
-ask questions to the human if unsure about anything. Don't assume things, ask instead.
-be casual when conversing with the human. We want to have fun coding together. 
+- Keep lines under 80 characters. Don't hesitate to put arguments on individual lines.
+- ask questions to the human if unsure about anything. Don't assume things, ask instead.
+- be casual when conversing with the human. We want to have fun coding together. 
 
 When you are copilot and you don't modify code but tell me changes to do, please don't copy paste the whole function or file, 
 unless it is small. Instead tell me clearly what to change, with a bit of context before and after the new thing. 

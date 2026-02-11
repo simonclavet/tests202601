@@ -103,7 +103,7 @@ static inline float GetBoneWeight(const std::string& boneName)
     return 0.01f;
 }
 
-static inline void NetworkInitAutoEncoder(NetworkState* state, int inputDim, int latentDim, bool startTraining = true)
+static inline void NetworkInitFeaturesAutoEncoder(NetworkState* state, int inputDim, int latentDim, bool startTraining = true)
 {
     if (inputDim <= 0) return;
 
@@ -189,7 +189,7 @@ static inline void NetworkLoad(NetworkState* state, int inputDim, int latentDim,
 
     try {
         // Initialize model structure with correct dimensions, but don't start training
-        NetworkInitAutoEncoder(state, inputDim, latentDim, false);
+        NetworkInitFeaturesAutoEncoder(state, inputDim, latentDim, false);
         torch::load(state->featuresAutoEncoder, aePath);
         state->featuresAutoEncoder->to(state->device);
         TraceLog(LOG_INFO, "Loaded AutoEncoder from: %s", aePath.c_str());
@@ -199,7 +199,7 @@ static inline void NetworkLoad(NetworkState* state, int inputDim, int latentDim,
     }
 }
 
-static inline void NetworkTrainAutoEncoder(NetworkState* state, const AnimDatabase* db)
+static inline void NetworkTrainFeaturesAutoEncoder(NetworkState* state, const AnimDatabase* db)
 {
     if (!state->isTraining || !state->featuresAutoEncoder || !state->optimizer || !db->valid) return;
     if (db->normalizedFeatures.empty() || db->featureDim <= 0) return;
@@ -255,6 +255,222 @@ static inline void NetworkTrainAutoEncoder(NetworkState* state, const AnimDataba
     }
 }
 
-// Keep these for compatibility if called, but they are now replaced by AE versions
-static inline void NetworkInit(NetworkState* state) { (void)state; }
-static inline void NetworkTrainStep(NetworkState* state) { (void)state; }
+// segment autoencoder: compresses a flattened poseGenFeatures segment
+static inline void NetworkInitSegmentAutoEncoder(
+    NetworkState* state,
+    int flatDim,
+    int latentDim,
+    bool startTraining = true)
+{
+    if (flatDim <= 0) return;
+
+    // reuse existing CUDA context (already initialized by features AE or init it now)
+    if (!state->device.is_cuda())
+    {
+        cuda_init_context();
+        const bool cudaOk = torch::cuda::is_available();
+        state->device = cudaOk ? torch::kCUDA : torch::kCPU;
+    }
+
+    // flatDim -> 512 -> 256 -> latentDim -> 256 -> 512 -> flatDim
+    state->segmentAutoEncoder = torch::nn::Sequential(
+        torch::nn::Linear(flatDim, 512),
+        torch::nn::ReLU(),
+        torch::nn::Linear(512, 256),
+        torch::nn::ReLU(),
+        torch::nn::Linear(256, latentDim),
+        torch::nn::Linear(latentDim, 256),
+        torch::nn::ReLU(),
+        torch::nn::Linear(256, 512),
+        torch::nn::ReLU(),
+        torch::nn::Linear(512, flatDim)
+    );
+
+    state->segmentAutoEncoder->to(state->device);
+
+    state->segmentOptimizer = std::make_shared<torch::optim::Adam>(
+        state->segmentAutoEncoder->parameters(), torch::optim::AdamOptions(1e-3));
+
+    state->isTrainingSegmentAE = startTraining;
+    state->segmentAELoss = 0.0f;
+    state->segmentAEIterations = 0;
+
+    TraceLog(LOG_INFO, "Segment AutoEncoder initialized: %d -> 512 -> 256 -> %d -> 256 -> 512 -> %d",
+        flatDim, latentDim, flatDim);
+}
+
+static inline void NetworkSaveSegmentAE(const NetworkState* state, const std::string& folderPath)
+{
+    if (!state->segmentAutoEncoder) return;
+
+    const std::string path = folderPath + "/segmentAutoEncoder.bin";
+    try {
+        torch::save(state->segmentAutoEncoder, path);
+        TraceLog(LOG_INFO, "Saved Segment AutoEncoder to: %s", path.c_str());
+    }
+    catch (const std::exception& e) {
+        TraceLog(LOG_ERROR, "Failed to save Segment AutoEncoder: %s", e.what());
+    }
+}
+
+static inline void NetworkLoadSegmentAE(
+    NetworkState* state,
+    int flatDim,
+    int latentDim,
+    const std::string& folderPath)
+{
+    const std::string path = folderPath + "/segmentAutoEncoder.bin";
+    if (!std::filesystem::exists(path)) return;
+
+    try {
+        NetworkInitSegmentAutoEncoder(state, flatDim, latentDim, false);
+        torch::load(state->segmentAutoEncoder, path);
+        state->segmentAutoEncoder->to(state->device);
+        TraceLog(LOG_INFO, "Loaded Segment AutoEncoder from: %s", path.c_str());
+    }
+    catch (const std::exception& e) {
+        TraceLog(LOG_ERROR, "Failed to load Segment AutoEncoder: %s", e.what());
+    }
+}
+
+static inline void NetworkTrainSegmentAutoEncoder(NetworkState* state, const AnimDatabase* db)
+{
+    if (!state->isTrainingSegmentAE || !state->segmentAutoEncoder || !state->segmentOptimizer) return;
+    if (!db->valid || db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int segFrames = db->poseGenSegmentFrameCount;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const int clipCount = (int)db->clipStartFrame.size();
+
+    state->segmentAutoEncoder->train();
+
+    try {
+        for (int iter = 0; iter < 30; ++iter)
+        {
+            // build batch: each sample is a flattened segment of consecutive frames
+            torch::Tensor targetHost = torch::empty({ batchSize, flatDim });
+            float* ptr = targetHost.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                // pick a random clip, then a random start frame that fits the segment
+                const int clip = rand() % clipCount;
+                const int clipStart = db->clipStartFrame[clip];
+                const int clipEnd = db->clipEndFrame[clip];
+                const int clipLen = clipEnd - clipStart;
+
+                // if clip is too short for a full segment, use what we have
+                const int maxStart = clipLen - segFrames;
+                const int localStart = (maxStart > 0) ? (rand() % (maxStart + 1)) : 0;
+                const int globalStart = clipStart + localStart;
+                const int actualFrames = ((globalStart + segFrames) <= clipEnd) ? segFrames : (clipEnd - globalStart);
+
+                // flatten consecutive rows into the batch
+                float* dst = ptr + b * flatDim;
+                for (int f = 0; f < actualFrames; ++f)
+                {
+                    std::span<const float> row = db->normalizedPoseGenFeatures.row_view(globalStart + f);
+                    for (int d = 0; d < pgDim; ++d)
+                    {
+                        dst[f * pgDim + d] = row[d];
+                    }
+                }
+                // zero-pad if segment was shorter than expected
+                for (int f = actualFrames; f < segFrames; ++f)
+                {
+                    for (int d = 0; d < pgDim; ++d)
+                    {
+                        dst[f * pgDim + d] = 0.0f;
+                    }
+                }
+            }
+
+            torch::Tensor target = targetHost.to(state->device);
+
+            // denoising: add gaussian noise
+            torch::Tensor noise = torch::randn({ batchSize, flatDim }).to(state->device) * 0.05f;
+            torch::Tensor input = target + noise;
+
+            state->segmentOptimizer->zero_grad();
+            torch::Tensor output = state->segmentAutoEncoder->forward(input);
+            torch::Tensor loss = torch::mse_loss(output, target);
+
+            loss.backward();
+            state->segmentOptimizer->step();
+
+            state->segmentAELoss = loss.item<float>();
+            state->segmentAEIterations++;
+        }
+    }
+    catch (const std::exception& e) {
+        TraceLog(LOG_ERROR, "Segment AE Training Error: %s", e.what());
+        state->isTrainingSegmentAE = false;
+    }
+
+    if (state->segmentAEIterations % 300 == 0 && state->segmentAEIterations > 0)
+    {
+        TraceLog(LOG_INFO, "Segment AE Loss (iter %d): %.6f",
+            state->segmentAEIterations, state->segmentAELoss);
+    }
+}
+
+// Pass a segment through the segment autoencoder in-place (normalize -> encode -> decode -> denormalize).
+// Used to visually evaluate reconstruction quality. Does nothing if AE is null.
+static inline void NetworkApplySegmentAE(
+    NetworkState* networkState,
+    const AnimDatabase* db,
+    Array2D<float>* segment)
+{
+    if (!networkState->segmentAutoEncoder) return;
+
+    const int segFrameCount = segment->rows();
+    const int dim = segment->cols();
+    const int flatDim = segFrameCount * dim;
+
+    // normalize: (raw - mean) / std * weight
+    torch::Tensor normalized = torch::empty({ 1, flatDim });
+    float* nPtr = normalized.data_ptr<float>();
+    for (int f = 0; f < segFrameCount; ++f)
+    {
+        std::span<const float> row = segment->row_view(f);
+        for (int d = 0; d < dim; ++d)
+        {
+            nPtr[f * dim + d] = (row[d] - db->poseGenFeaturesMean[d])
+                / db->poseGenFeaturesStd[d] * db->poseGenFeaturesWeight[d];
+        }
+    }
+
+    // pad if segment is shorter than the AE expects
+    //const int aeFlatDim = db->poseGenSegmentFlatDim;
+    assertEvenInRelease(db->poseGenSegmentFlatDim == flatDim);
+    //if (flatDim < aeFlatDim)
+    //{
+    //    torch::Tensor padded = torch::zeros({ 1, aeFlatDim });
+    //    padded.slice(1, 0, flatDim).copy_(normalized);
+    //    normalized = padded;
+    //}
+
+    // forward pass (eval mode)
+    normalized = normalized.to(networkState->device);
+    networkState->segmentAutoEncoder->eval();
+    torch::Tensor reconstructed = networkState->segmentAutoEncoder->forward(normalized);
+    reconstructed = reconstructed.to(torch::kCPU);
+
+    // denormalize and write back: raw = output / weight * std + mean
+    const float* rPtr = reconstructed.data_ptr<float>();
+    for (int f = 0; f < segFrameCount; ++f)
+    {
+        std::span<float> dst = segment->row_view(f);
+        for (int d = 0; d < dim; ++d)
+        {
+            const float w = db->poseGenFeaturesWeight[d];
+            const float denorm = (w > 1e-10f)
+                ? (rPtr[f * dim + d] / w * db->poseGenFeaturesStd[d] + db->poseGenFeaturesMean[d])
+                : db->poseGenFeaturesMean[d];
+            dst[d] = denorm;
+        }
+    }
+}
+

@@ -14,6 +14,7 @@
 #include "leg_ik.h"
 #include "app_config.h"
 #include "motion_matching.h"
+#include "networks.h"
 
 
 
@@ -67,10 +68,11 @@ static void ControlledCharacterInit(
 
     // Ensure blend cursors have storage sized to joint count
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
-        cc->cursors[i].localPositions.resize(cc->xformData.jointCount);
+
         cc->cursors[i].localRotations6d.resize(cc->xformData.jointCount);
         cc->cursors[i].lookaheadRotations6d.resize(cc->xformData.jointCount);
-        cc->cursors[i].lookaheadLocalPositions.resize(cc->xformData.jointCount);
+        cc->cursors[i].rootLocalPosition = Vector3Zero();
+
         cc->cursors[i].globalPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].globalRotations.resize(cc->xformData.jointCount);
         cc->cursors[i].prevLocalRootPos = cc->xformData.localPositions[0];
@@ -97,6 +99,7 @@ static void ControlledCharacterInit(
 
     cc->lookaheadDragLocalRotations6d.resize(cc->xformData.jointCount);
     cc->lookaheadDragLocalPositions.resize(cc->xformData.jointCount);
+
     cc->lookaheadDragInitialized = false;
 
     // Smoothed root motion state
@@ -131,13 +134,20 @@ static BlendCursor* FindAvailableCursor(ControlledCharacter* cc)
 }
 
 // Helper: spawn a new blend cursor at a given animation and time
-// Fades out existing cursors and spawns the new one
+// Copies a segment of poseGenFeatures into the cursor so it can play back without touching the db.
+// animTime is the time within the clip (used to find the global frame to start copying from).
+// After this call, cursor->segmentAnimTime is reset to 0 (relative to segment start).
+// If testSegmentAE is true and the segment AE exists, the segment is passed through the
+// autoencoder (normalize -> encode -> decode -> denormalize) before being stored.
 static void SpawnBlendCursor(
     ControlledCharacter* cc,
+    const AnimDatabase* db,
+    NetworkState* networkState,
     int animIndex,
     float animTime,
     float blendTime,
-    bool immediate)
+    bool immediate,
+    bool testSegmentAE)
 {
     // fade out existing cursors
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
@@ -154,7 +164,6 @@ static void SpawnBlendCursor(
 
     cursor->active = true;
     cursor->animIndex = animIndex;
-    cursor->animTime = animTime;
     cursor->weightSpring = {};
     cursor->fastWeightSpring = {};
 
@@ -169,7 +178,48 @@ static void SpawnBlendCursor(
     cursor->targetWeight = 1.0f;
     cursor->blendTime = blendTime;
 
-    // No need to pre-sample - the normal cursor loop will sample on first frame
+    // copy a segment of poseGenFeatures into the cursor
+    const float frameTime = db->animFrameTime[animIndex];
+    const int clipStart = db->clipStartFrame[animIndex];
+    const int clipEnd = db->clipEndFrame[animIndex];
+    const int clipFrameCount = clipEnd - clipStart;
+
+    // global frame where this cursor starts
+    int localFrame = (int)floorf(animTime / frameTime);
+    if (localFrame < 0) localFrame = 0;
+    if (localFrame >= clipFrameCount) localFrame = clipFrameCount - 1;
+    const int globalFrame = clipStart + localFrame;
+
+    // how many frames fit in the segment (clamped to not exceed clip end)
+    const int segmentLengthInFrames = (int)ceilf(db->poseGenFeaturesSegmentLength / frameTime) + 1;
+    const int framesAvailable = clipEnd - globalFrame;
+    const int segFrameCount = (segmentLengthInFrames < framesAvailable) ? segmentLengthInFrames : framesAvailable;
+    assert(segFrameCount >= 1);
+
+    const int dim = db->poseGenFeaturesComputeDim;
+    cursor->segment.resize(segFrameCount, dim);
+    cursor->segmentFrameTime = frameTime;
+
+    // copy rows from raw poseGenFeatures
+    for (int f = 0; f < segFrameCount; ++f)
+    {
+        std::span<const float> src = db->poseGenFeatures.row_view(globalFrame + f);
+        std::span<float> dst = cursor->segment.row_view(f);
+        for (int d = 0; d < dim; ++d)
+        {
+            dst[d] = src[d];
+        }
+    }
+
+    // optionally pass through the segment autoencoder to test reconstruction quality
+    if (testSegmentAE)
+    {
+        NetworkApplySegmentAE(networkState, db, &cursor->segment);
+    }
+
+    // animTime is now relative to segment start
+    cursor->segmentAnimTime = 0.0f;
+
     cc->animIndex = animIndex;
     cc->animTime = animTime;
 }
@@ -226,12 +276,14 @@ static void ControlledCharacterUpdate(
     if (firstFrame)
     {
         // spawn initial cursor at random position
-        const int newAnim = rand() % characterData->count;
-        const BVHData* newBvh = &characterData->bvhData[newAnim];
-        const float newMaxTime = (newBvh->frameCount - 1) * newBvh->frameTime;
-        const float startTime = ((float)rand() / (float)RAND_MAX) * newMaxTime;
+        const int newAnim = 0;// rand() % characterData->count;
+        //const BVHData* newBvh = &characterData->bvhData[newAnim];
+        //const float newMaxTime = (newBvh->frameCount - 1) * newBvh->frameTime;
+        const float startTime = 0.1f;
         cc->lookaheadDragInitialized = false;
-        SpawnBlendCursor(cc, newAnim, startTime, config.defaultBlendTime, true);
+        SpawnBlendCursor(cc, db, networkState, 
+            newAnim, startTime, 
+            config.defaultBlendTime, true, config.testSegmentAutoEncoder);
         cc->switchTimer = config.switchInterval;
     }
     else if (cc->animMode == AnimationMode::RandomSwitch)
@@ -241,10 +293,10 @@ static void ControlledCharacterUpdate(
         {
             const int newAnim = rand() % characterData->count;
             const BVHData* newBvh = &characterData->bvhData[newAnim];
-            const float newMaxTime = (newBvh->frameCount - 1) * newBvh->frameTime;
+            const float newMaxTime = (newBvh->frameCount - 60) * newBvh->frameTime;
             const float startTime = ((float)rand() / (float)RAND_MAX) * newMaxTime;
 
-            SpawnBlendCursor(cc, newAnim, startTime, config.defaultBlendTime, false);
+            SpawnBlendCursor(cc, db, networkState, newAnim, startTime, config.defaultBlendTime, false, config.testSegmentAutoEncoder);
             cc->switchTimer = config.switchInterval;
         }
     }
@@ -294,7 +346,7 @@ static void ControlledCharacterUpdate(
                                 cur.active &&
                                 cur.animIndex == clipIdx)
                             {
-                                const float timeDiff = fabsf(cur.animTime - targetTime);
+                                const float timeDiff = fabsf(cur.segmentAnimTime - targetTime);
                                 if (timeDiff < minTimeDiff)
                                 {
                                     tooCloseToExisting = true;
@@ -308,7 +360,7 @@ static void ControlledCharacterUpdate(
 
                     if (spawnNewCursor)
                     {
-                        SpawnBlendCursor(cc, clipIdx, targetTime, config.defaultBlendTime, false);
+                        SpawnBlendCursor(cc, db, networkState, clipIdx, targetTime, config.defaultBlendTime, false, config.testSegmentAutoEncoder);
                     }
                 }
             }
@@ -356,22 +408,22 @@ static void ControlledCharacterUpdate(
             BlendCursor& cur = cc->cursors[ci];
             if (!cur.active) continue;
 
-            // Advance cursor time and clamp
-            cur.animTime += dt;
-            const BVHData* cbvh = &characterData->bvhData[cur.animIndex];
-            const float clipMax = (cbvh->frameCount - 1) * cbvh->frameTime;
-            if (cur.animTime > clipMax)
+            // Advance cursor time and clamp to segment length
+            cur.segmentAnimTime += dt;
+            // old: const BVHData* cbvh = &characterData->bvhData[cur.animIndex];
+            // old: const float clipMax = (cbvh->frameCount - 1) * cbvh->frameTime;
+            const float segMax = (cur.segment.rows() - 1) * cur.segmentFrameTime;
+            if (cur.segmentAnimTime > segMax)
             {
-                cur.animTime = clipMax;
-                // Warn once when cursor reaches end (only log on first frame it hits the end)
+                cur.segmentAnimTime = segMax;
                 static int lastWarnedCursor = -1;
                 static float lastWarnedTime = -1.0f;
-                if (lastWarnedCursor != ci || fabsf(lastWarnedTime - clipMax) > 0.01f)
+                if (lastWarnedCursor != ci || fabsf(lastWarnedTime - segMax) > 0.01f)
                 {
-                    TraceLog(LOG_WARNING, "Cursor %d reached end of animation %d at time %.2f - stopped advancing",
-                        ci, cur.animIndex, clipMax);
+                    TraceLog(LOG_WARNING, "Cursor %d reached end of segment (anim %d) at time %.2f - stopped advancing",
+                        ci, cur.animIndex, segMax);
                     lastWarnedCursor = ci;
-                    lastWarnedTime = clipMax;
+                    lastWarnedTime = segMax;
                 }
             }
 
@@ -424,7 +476,7 @@ static void ControlledCharacterUpdate(
             cur.fastNormalizedWeight = (totalFastCursorWeight > 1e-6f) ? (cur.fastWeightSpring.x / totalFastCursorWeight) : 0.0f;
 
             // deactivate tiny normalized weight cursors
-            if (cur.normalizedWeight <= 1e-4f && cur.fastNormalizedWeight <= 1e-4f && cur.targetWeight <= 1e-4f)
+            if (cur.normalizedWeight <= 1e-3f && cur.fastNormalizedWeight <= 1e-3f && cur.targetWeight <= 1e-3f)
             {
                 cur.active = false;
                 cur.animIndex = -1;
@@ -442,91 +494,94 @@ static void ControlledCharacterUpdate(
     float blendedYawRate = 0.0f;
     float blendedLookaheadYawRate = 0.0f;
 
+    // Two PoseFeatures temporaries for interpolation between adjacent segment frames
+    PoseFeatures poseFeat0;
+    PoseFeatures poseFeat1;
+    poseFeat0.Resize(jc);
+    poseFeat1.Resize(jc);
+
     for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
     {
         BlendCursor& cur = cc->cursors[ci];
         if (!cur.active) continue;
         const float w = cur.normalizedWeight;
 
-        const int clipStart = db->clipStartFrame[cur.animIndex];
+        // --- sample from cursor's local segment instead of db ---
 
-        // Sample pose at animTime
-        int f0, f1;
-        float interFrameAlpha;
-        GetInterFrameAlpha(db, cur.animIndex, cur.animTime, f0, f1, interFrameAlpha);
-        const int baseFrame = clipStart + f0;
-
-        // Sample velocities at midpoint for better accuracy
-        int vf0, vf1;
-        float vInterFrameAlpha;
-        GetInterFrameAlpha(db, cur.animIndex, cur.animTime - dt * 0.5f, vf0, vf1, vInterFrameAlpha);
-        const int vBaseFrame = clipStart + vf0;
-
-        // Sample local positions and rotations
-        std::span<const Vector3> posRow0 = db->localJointPositions.row_view(baseFrame);
-        std::span<const Vector3> posRow1 = db->localJointPositions.row_view(baseFrame + 1);
-        std::span<const Rot6d> rotRow0 = db->localJointRotations.row_view(baseFrame);
-        std::span<const Rot6d> rotRow1 = db->localJointRotations.row_view(baseFrame + 1);
-        for (int j = 0; j < jc; ++j)
+        // compute f0, f1, alpha within the segment
+        int sf0 = 0;
+        int sf1 = 0;
+        float sAlpha = 0.0f;
+        if (cur.segmentFrameTime > 0.0f && cur.segment.rows() > 0)
         {
-            cur.localPositions[j] = Vector3Lerp(posRow0[j], posRow1[j], interFrameAlpha);
-        }
-        for (int j = 0; j < jc; ++j)
-        {
-            cur.localRotations6d[j] = Rot6dLerp(rotRow0[j], rotRow1[j], interFrameAlpha);
+            const float maxFrame = (float)(cur.segment.rows() - 1);
+            float frameF = cur.segmentAnimTime / cur.segmentFrameTime;
+            if (frameF < 0.0f) frameF = 0.0f;
+            if (frameF > maxFrame) frameF = maxFrame;
+            sf0 = (int)floorf(frameF);
+            sf1 = sf0 + 1;
+            if (sf1 >= cur.segment.rows()) sf1 = cur.segment.rows() - 1;
+            sAlpha = frameF - (float)sf0;
         }
 
-        // Sample lookahead rotations and positions (for lookahead dragging)
-        std::span<const Rot6d> lookaheadRotRow0 = db->lookaheadLocalRotations.row_view(baseFrame);
-        std::span<const Rot6d> lookaheadRotRow1 = db->lookaheadLocalRotations.row_view(baseFrame + 1);
-        std::span<const Vector3> lookaheadPosRow0 = db->lookaheadLocalPositions.row_view(baseFrame);
-        std::span<const Vector3> lookaheadPosRow1 = db->lookaheadLocalPositions.row_view(baseFrame + 1);
+        // deserialize the two bounding frames
+        std::span<const float> segRow0 = cur.segment.row_view(sf0);
+        std::span<const float> segRow1 = cur.segment.row_view(sf1);
+        poseFeat0.DeserializeFrom(segRow0, jc);
+        poseFeat1.DeserializeFrom(segRow1, jc);
+
+        // interpolate into cursor workspace (lookahead data = primary data now)
+        // Root bone (j=0) position from deserialized pose features
+        cur.rootLocalPosition = Vector3Lerp(poseFeat0.rootLocalPosition, poseFeat1.rootLocalPosition, sAlpha);
+
+        // lookahead rotations are for all bones
         for (int j = 0; j < jc; ++j)
         {
-            cur.lookaheadRotations6d[j] = Rot6dLerp(lookaheadRotRow0[j], lookaheadRotRow1[j], interFrameAlpha);
-        }
-        for (int j = 0; j < jc; ++j)
-        {
-            cur.lookaheadLocalPositions[j] = Vector3Lerp(lookaheadPosRow0[j], lookaheadPosRow1[j], interFrameAlpha);
+            const Rot6d r = Rot6dLerp(poseFeat0.lookaheadLocalRotations[j], poseFeat1.lookaheadLocalRotations[j], sAlpha);
+            cur.localRotations6d[j] = r;
+            cur.lookaheadRotations6d[j] = r;
         }
 
-        // Sample root motion velocities and yaw rates
-        cur.sampledRootVelocityRootSpace = LerpFrames(&db->rootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
-        blendedRootVelocityRootSpace = Vector3Add(blendedRootVelocityRootSpace, Vector3Scale(cur.sampledRootVelocityRootSpace, w));
+        // root velocity (lookahead only, same for both old fields)
+        const Vector3 rootVel = Vector3Lerp(poseFeat0.lookaheadRootVelocity, poseFeat1.lookaheadRootVelocity, sAlpha);
+        cur.sampledRootVelocityRootSpace = rootVel;
+        cur.sampledLookaheadRootVelocityRootSpace = rootVel;
+        blendedRootVelocityRootSpace = Vector3Add(blendedRootVelocityRootSpace, Vector3Scale(rootVel, w));
+        blendedLookaheadRootVelocityRootSpace = Vector3Add(blendedLookaheadRootVelocityRootSpace, Vector3Scale(rootVel, w));
 
-        cur.sampledLookaheadRootVelocityRootSpace = LerpFrames(&db->lookaheadRootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
-        blendedLookaheadRootVelocityRootSpace = Vector3Add(blendedLookaheadRootVelocityRootSpace, Vector3Scale(cur.sampledLookaheadRootVelocityRootSpace, w));
+        // yaw rate
+        const float yawRate = Lerp(poseFeat0.rootYawRate, poseFeat1.rootYawRate, sAlpha);
+        cur.sampledRootYawRate = yawRate;
+        cur.sampledLookaheadRootYawRate = yawRate;
+        blendedYawRate += yawRate * cur.fastNormalizedWeight;
+        blendedLookaheadYawRate += yawRate * cur.fastNormalizedWeight;
 
-        cur.sampledRootYawRate = LerpFrames(&db->rootMotionYawRates[baseFrame], interFrameAlpha);
-        blendedYawRate += cur.sampledRootYawRate * cur.fastNormalizedWeight;
+        // display velocity
+        cur.rootVelocityWorldForDisplayOnly = Vector3RotateByQuaternion(rootVel, cc->worldRotation);
 
-        cur.sampledLookaheadRootYawRate = LerpFrames(&db->lookaheadRootMotionYawRates[baseFrame], interFrameAlpha);
-        blendedLookaheadYawRate += cur.sampledLookaheadRootYawRate * cur.fastNormalizedWeight;
-
-        // For display only: world-space velocity (not used for blending)
-        cur.rootVelocityWorldForDisplayOnly = Vector3RotateByQuaternion(cur.sampledRootVelocityRootSpace, cc->worldRotation);
-
-        // Sample toe positions and velocities (for foot IK)
-        std::span<const Vector3> jointVelRow0 = db->jointVelocitiesRootSpace.row_view(vBaseFrame);
-        std::span<const Vector3> jointVelRow1 = db->jointVelocitiesRootSpace.row_view(vBaseFrame + 1);
+        // toe positions and velocities from segment
         for (int side : sides)
         {
-            assertEvenInRelease(db->toeIndices[side] >= 0);
-            const int toeIdx = db->toeIndices[side];
+            const Vector3 toePos = Vector3Lerp(
+                poseFeat0.lookaheadToePositionsRootSpace[side],
+                poseFeat1.lookaheadToePositionsRootSpace[side], sAlpha);
+            // lookahead toe = current toe for our purposes
+            toeBlendedPositionRootSpace[side] = Vector3Add(toeBlendedPositionRootSpace[side], Vector3Scale(toePos, w));
+            toeBlendedLookaheadPositionRootSpace[side] = Vector3Add(toeBlendedLookaheadPositionRootSpace[side], Vector3Scale(toePos, w));
 
-            // Current toe position (root space)
-            const Vector3 cursorToePosRootSpace = LerpFrames(&db->toePositionsRootSpace[side][baseFrame], interFrameAlpha);
-            toeBlendedPositionRootSpace[side] = Vector3Add(toeBlendedPositionRootSpace[side], Vector3Scale(cursorToePosRootSpace, w));
-
-            // Lookahead toe position (root space)
-            const Vector3 cursorToeLookaheadPosRootSpace = LerpFrames(&db->lookaheadToePositionsRootSpace[side][baseFrame], interFrameAlpha);
-            toeBlendedLookaheadPositionRootSpace[side] = Vector3Add(toeBlendedLookaheadPositionRootSpace[side], 
-                Vector3Scale(cursorToeLookaheadPosRootSpace, w));
-
-            // Toe velocity sampled at midpoint (root space)
-            const Vector3 cursorToeVelRootSpace = Vector3Lerp(jointVelRow0[toeIdx], jointVelRow1[toeIdx], vInterFrameAlpha);
-            toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(cursorToeVelRootSpace, w));
+            const Vector3 toeVel = Vector3Lerp(
+                poseFeat0.toeVelocitiesRootSpace[side],
+                poseFeat1.toeVelocitiesRootSpace[side], sAlpha);
+            toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(toeVel, w));
         }
+
+        // old: sampling from db arrays (kept for reference)
+        // const int clipStart = db->clipStartFrame[cur.animIndex];
+        // GetInterFrameAlpha(db, cur.animIndex, cur.segmentAnimTime, f0, f1, interFrameAlpha);
+        // const int baseFrame = clipStart + f0;
+        // posRow0 = db->localJointPositions.row_view(baseFrame); etc.
+        // cur.sampledRootVelocityRootSpace = LerpFrames(&db->rootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
+        // cur.sampledLookaheadRootVelocityRootSpace = LerpFrames(&db->lookaheadRootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
     }
 
 
@@ -544,8 +599,8 @@ static void ControlledCharacterUpdate(
  
 
     // --- Rot6d blending using normalized weights
-    std::vector<Vector3> blendedLocalPositions(jc, Vector3Zero());
-    std::vector<Vector3> blendedLookaheadLocalPositions(jc, Vector3Zero());
+    std::vector<Vector3> blendedLocalPositions(jc); // only root will be blended, others are static offsets
+    blendedLocalPositions[0] = Vector3Zero();
 
     std::vector<Rot6d> blendedLocalRotations(jc, Rot6dZero());
     std::vector<Rot6d> blendedLookaheadLocalRotations(jc, Rot6dZero());
@@ -558,18 +613,10 @@ static void ControlledCharacterUpdate(
         if (!cur.active) continue;
         const float w = cur.normalizedWeight;
 
-        for (int j = 0; j < jc; ++j)
-        {
-            blendedLocalPositions[j] = Vector3Add(
-                blendedLocalPositions[j], Vector3Scale(cur.localPositions[j], w));
-        }
-        for (int j = 0; j < jc; ++j)
-        {
-            //angVelAccum[j] = Vector3Add(angVelAccum[j], Vector3Scale(cur.localAngularVelocities[j], w));
-            // weighted accumulation of lookahead positions
-            blendedLookaheadLocalPositions[j] = Vector3Add(
-                blendedLookaheadLocalPositions[j], Vector3Scale(cur.lookaheadLocalPositions[j], w));
-        }
+        // Blending for root position (index 0)
+        blendedLocalPositions[0] = Vector3Add(
+            blendedLocalPositions[0], Vector3Scale(cur.rootLocalPosition, w));
+
         for (int j = 0; j < jc; ++j)
         {
            // weighted accumulation of Rot6d using helper
@@ -579,6 +626,12 @@ static void ControlledCharacterUpdate(
         {
             Rot6dScaledAdd(w, cur.lookaheadRotations6d[j], blendedLookaheadLocalRotations[j]);
         }
+    } // End of for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+
+    // Initialize non-root blendedLocalPositions with static skeleton offsets
+    for (int j = 1; j < jc; ++j)
+    {
+        blendedLocalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
     }
 
     // normalize blended Rot6d to get target rotations
@@ -623,7 +676,14 @@ static void ControlledCharacterUpdate(
     {
         for (int j = 0; j < jc; ++j)
         {
-            cc->xformLookahead.localPositions[j] = blendedLookaheadLocalPositions[j];
+            if (j == 0)
+            {
+                cc->xformLookahead.localPositions[j] = blendedLocalPositions[0];
+            }
+            else
+            {
+                cc->xformLookahead.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+            }
             Rot6d lookaheadRot = blendedLookaheadLocalRotations[j];
             Rot6dNormalize(lookaheadRot);
             Rot6dToQuaternion(lookaheadRot, cc->xformLookahead.localRotations[j]);
@@ -660,7 +720,14 @@ static void ControlledCharacterUpdate(
             }
             for (int j = 0; j < jc; ++j)
             {
-                cc->lookaheadDragLocalPositions[j] = blendedLocalPositions[j];
+                if (j == 0)
+                {
+                    cc->lookaheadDragLocalPositions[j] = blendedLocalPositions[0];
+                }
+                else
+                {
+                    cc->lookaheadDragLocalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+                }
             }
 
             cc->lookaheadDragRootVelocityRootSpace = blendedRootVelocityRootSpace;
@@ -684,11 +751,11 @@ static void ControlledCharacterUpdate(
                 blendedLookaheadLocalRotations[j], lookaheadProjectionAlpha);
         }
 
-        for (int j = 0; j < jc; ++j)
-        {
-            cc->lookaheadDragLocalPositions[j] =
-                Vector3Lerp(cc->lookaheadDragLocalPositions[j], blendedLookaheadLocalPositions[j], lookaheadProjectionAlpha);
-        }
+        // Lerp for root position (j=0)
+        cc->lookaheadDragLocalPositions[0] =
+            Vector3Lerp(cc->lookaheadDragLocalPositions[0], blendedLocalPositions[0], lookaheadProjectionAlpha);
+
+        // For other bones (j > 0), positions are static and do not lerp.
 
         // Apply dragged rotations (convert from Rot6d to quaternions)
         for (int j = 0; j < jc; ++j)
@@ -697,9 +764,10 @@ static void ControlledCharacterUpdate(
         }
 
         // Apply dragged positions
-        for (int j = 0; j < jc; ++j)
+        cc->xformData.localPositions[0] = cc->lookaheadDragLocalPositions[0];
+        for (int j = 1; j < jc; ++j)
         {
-            cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
+            cc->xformData.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
         }
 
         cc->lookaheadDragRootVelocityRootSpace = Vector3Lerp(
@@ -735,7 +803,14 @@ static void ControlledCharacterUpdate(
         for (int j = 0; j < jc; ++j)
         {
             Rot6dToQuaternion(blendedLocalRotations[j], cc->xformData.localRotations[j]);
-            cc->xformData.localPositions[j] = blendedLocalPositions[j];
+            if (j == 0)
+            {
+                cc->xformData.localPositions[j] = blendedLocalPositions[0];
+            }
+            else
+            {
+                cc->xformData.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+            }
         }
 
         // Store for debug visualization
@@ -783,7 +858,14 @@ static void ControlledCharacterUpdate(
         // Convert from Rot6d to Quaternion for FK computation
         for (int j = 0; j < jc; ++j)
         {
-            cur.globalPositions[j] = cur.localPositions[j];
+            if (j == 0)
+            {
+                cur.globalPositions[j] = cur.rootLocalPosition;
+            }
+            else
+            {
+                cur.globalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+            }
             Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
         }
 
@@ -1089,9 +1171,10 @@ static void ControlledCharacterUpdateNetwork(
         {
             cc->lookaheadDragLocalRotations6d[j] = initialPose.lookaheadLocalRotations[j];
         }
-        for (int j = 0; j < jc; ++j)
+        cc->lookaheadDragLocalPositions[0] = initialPose.rootLocalPosition;
+        for (int j = 1; j < jc; ++j)
         {
-            cc->lookaheadDragLocalPositions[j] = initialPose.lookaheadLocalPositions[j];
+            cc->lookaheadDragLocalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
         }
 
         cc->lookaheadDragRootVelocityRootSpace = initialPose.lookaheadRootVelocity;
@@ -1103,9 +1186,10 @@ static void ControlledCharacterUpdateNetwork(
             Rot6dToQuaternion(cc->lookaheadDragLocalRotations6d[j],
                              cc->xformData.localRotations[j]);
         }
-        for (int j = 0; j < jc; ++j)
+        cc->xformData.localPositions[0] = cc->lookaheadDragLocalPositions[0];
+        for (int j = 1; j < jc; ++j)
         {
-            cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
+            cc->xformData.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
         }
 
         // Initialize world position and rotation
@@ -1182,7 +1266,14 @@ static void ControlledCharacterUpdateNetwork(
     {
         for (int j = 0; j < jc; ++j)
         {
-            cc->xformLookahead.localPositions[j] = targetPose.lookaheadLocalPositions[j];
+            if (j == 0)
+            {
+                cc->xformLookahead.localPositions[j] = targetPose.rootLocalPosition;
+            }
+            else
+            {
+                cc->xformLookahead.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+            }
             Rot6d lookaheadRot = targetPose.lookaheadLocalRotations[j];
             Rot6dNormalize(lookaheadRot);
             Rot6dToQuaternion(lookaheadRot, cc->xformLookahead.localRotations[j]);
@@ -1213,13 +1304,16 @@ static void ControlledCharacterUpdateNetwork(
             lookaheadProjectionAlpha);
     }
 
-    // Lerp positions toward lookahead target (separate loop for cache coherency)
-    for (int j = 0; j < jc; ++j)
+    // Lerp root position toward lookahead target
+    cc->lookaheadDragLocalPositions[0] = Vector3Lerp(
+        cc->lookaheadDragLocalPositions[0],
+        targetPose.rootLocalPosition,
+        lookaheadProjectionAlpha);
+
+    // For other bones (j > 0), positions are static and do not lerp.
+    for (int j = 1; j < jc; ++j)
     {
-        cc->lookaheadDragLocalPositions[j] = Vector3Lerp(
-            cc->lookaheadDragLocalPositions[j],
-            targetPose.lookaheadLocalPositions[j],
-            lookaheadProjectionAlpha);
+        cc->lookaheadDragLocalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
     }
 
     // Convert dragged rotations to quaternions (separate loop for cache coherency)
@@ -1229,10 +1323,11 @@ static void ControlledCharacterUpdateNetwork(
                          cc->xformData.localRotations[j]);
     }
 
-    // Apply dragged positions (separate loop for cache coherency)
-    for (int j = 0; j < jc; ++j)
+    // Apply dragged positions
+    cc->xformData.localPositions[0] = cc->lookaheadDragLocalPositions[0];
+    for (int j = 1; j < jc; ++j)
     {
-        cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
+        cc->xformData.localPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
     }
 
     // Lerp root velocity toward lookahead target

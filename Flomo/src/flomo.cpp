@@ -347,6 +347,10 @@ static inline void OnCharactersLoaded(
         if (!folderPath.empty())
         {
             NetworkLoad(&networkState, animDatabase.featureDim, 16, folderPath);
+            if (animDatabase.poseGenSegmentFlatDim > 0)
+            {
+                NetworkLoadSegmentAE(&networkState, animDatabase.poseGenSegmentFlatDim, 128, folderPath);
+            }
         }
     }
 
@@ -390,12 +394,33 @@ static inline bool SaveAnimsList(const CharacterData& characterData, const std::
         return false;
     }
 
+    const fs::path cwd = fs::current_path();
+
     fprintf(file, "{\n");
     fprintf(file, "  \"animations\": [\n");
 
     for (int i = 0; i < characterData.count; ++i)
     {
-        fprintf(file, "    \"%s\"", characterData.filePaths[i].c_str());
+        // If the path is inside the working directory, save as relative
+        std::string savePath = characterData.filePaths[i];
+        std::error_code ec;
+        const fs::path absPath = fs::absolute(savePath, ec);
+        if (!ec)
+        {
+            const fs::path rel = fs::relative(absPath, cwd, ec);
+            if (!ec && !rel.empty() && rel.string().find("..") != 0)
+            {
+                savePath = rel.string();
+            }
+        }
+
+        // Normalize to forward slashes for the json
+        for (char& c : savePath)
+        {
+            if (c == '\\') c = '/';
+        }
+
+        fprintf(file, "    \"%s\"", savePath.c_str());
         if (i < characterData.count - 1)
         {
             fprintf(file, ",");
@@ -474,6 +499,7 @@ static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const 
 
     // Save AutoEncoder if it exists
     NetworkSave(&networkState, folderPath);
+    NetworkSaveSegmentAE(&networkState, folderPath);
 
     savedFolderName = fs::path(folderPath).filename().string();
     TraceLog(LOG_INFO, "Config saved to: %s", folderPath.c_str());
@@ -1671,7 +1697,7 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
         {
             if (app->animDatabase.valid)
             {
-                NetworkInitAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16, true);
+                NetworkInitFeaturesAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16, true);
             }
             else
             {
@@ -1701,6 +1727,47 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
             {
                 app->networkState.isTraining = false;
             }
+        }
+
+        ImGui::Separator();
+
+        // segment autoencoder
+        if (ImGui::Button("Restart Training Segment AE"))
+        {
+            if (app->animDatabase.valid && app->animDatabase.poseGenSegmentFlatDim > 0)
+            {
+                NetworkInitSegmentAutoEncoder(
+                    &app->networkState,
+                    app->animDatabase.poseGenSegmentFlatDim,
+                    128, true);
+            }
+            else
+            {
+                TraceLog(LOG_WARNING, "Cannot start segment AE: AnimDatabase not valid or no poseGenFeatures");
+            }
+        }
+
+        if (app->networkState.segmentAutoEncoder && !app->networkState.isTrainingSegmentAE)
+        {
+            if (ImGui::Button("Continue Segment AE"))
+            {
+                app->networkState.isTrainingSegmentAE = true;
+            }
+        }
+
+        if (app->networkState.isTrainingSegmentAE)
+        {
+            ImGui::Text("Seg AE Loss: %.4f (x100)", app->networkState.segmentAELoss * 100.0f);
+            ImGui::Text("Seg AE Iter: %d", app->networkState.segmentAEIterations);
+            if (ImGui::Button("Stop Segment AE"))
+            {
+                app->networkState.isTrainingSegmentAE = false;
+            }
+        }
+
+        if (app->networkState.segmentAutoEncoder)
+        {
+            ImGui::Checkbox("Test Segment AE", &app->config.testSegmentAutoEncoder);
         }
     }
     ImGui::End();
@@ -1968,19 +2035,19 @@ static void ApplicationUpdate(void* voidApplicationState)
         app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
 
         // Choose update method based on animation mode
-        if (app->config.animationMode == AnimationMode::SingleFrameReconstructFromSearch)
-        {
-            // Network-based pose generation (simulated from database)
-            ControlledCharacterUpdateNetwork(
-                &app->controlledCharacter,
-                &app->characterData,
-                &app->animDatabase,
-                effectiveDt,
-                app->worldTime,
-                app->config,
-                &app->networkState);
-        }
-        else
+        //if (app->config.animationMode == AnimationMode::SingleFrameReconstructFromSearch)
+        //{
+        //    // Network-based pose generation (simulated from database)
+        //    ControlledCharacterUpdateNetwork(
+        //        &app->controlledCharacter,
+        //        &app->characterData,
+        //        &app->animDatabase,
+        //        effectiveDt,
+        //        app->worldTime,
+        //        app->config,
+        //        &app->networkState);
+        //}
+        //else
         {
             // Standard cursor-based blending
             ControlledCharacterUpdate(
@@ -3461,11 +3528,12 @@ static void ApplicationUpdate(void* voidApplicationState)
                 // Progress bar showing normalized weight
                 ImGui::ProgressBar(cur.normalizedWeight, ImVec2(-1, 0), "");
 
-                // Time info
-                const float maxTime = (cur.animIndex >= 0 && cur.animIndex < app->characterData.count)
-                    ? (app->characterData.bvhData[cur.animIndex].frameCount - 1) * app->characterData.bvhData[cur.animIndex].frameTime
+                // Time info (now relative to segment)
+                const int segFrames = cur.segment.rows();
+                const float maxTime = (segFrames > 0)
+                    ? (segFrames - 1) * cur.segmentFrameTime
                     : 0.0f;
-                ImGui::Text("  Time: %.2f / %.2f", cur.animTime, maxTime);
+                ImGui::Text("  Time: %.2f / %.2f (seg %d frames)", cur.segmentAnimTime, maxTime, segFrames);
 
                 //// Root motion delta info
                 //const float deltaLen = Vector3Length(cur.lastDeltaWorld);
@@ -3513,7 +3581,8 @@ static void ApplicationUpdate(void* voidApplicationState)
     // Done
 
     // Update Neural Network
-    NetworkTrainAutoEncoder(&app->networkState, &app->animDatabase);
+    NetworkTrainFeaturesAutoEncoder(&app->networkState, &app->animDatabase);
+    NetworkTrainSegmentAutoEncoder(&app->networkState, &app->animDatabase);
 
     EndDrawing();
 }

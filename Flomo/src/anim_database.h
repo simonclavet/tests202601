@@ -4,6 +4,7 @@
 #include <vector>
 #include <span>
 #include <cmath>
+#include <unordered_map>
 
 #include "raylib.h"
 #include "raymath.h"
@@ -1542,12 +1543,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             tempPose.lookaheadLocalRotations[j] = lookaheadRots[j];
         }
 
-        // Copy lookahead local positions
+        // Copy bone 0 (root) local position only — other bones are static skeleton offsets
         span<const Vector3> lookaheadPos = db->lookaheadLocalPositions.row_view(f);
-        for (int j = 0; j < db->jointCount; ++j)
-        {
-            tempPose.lookaheadLocalPositions[j] = lookaheadPos[j];
-        }
+        tempPose.rootLocalPosition = lookaheadPos[0];
 
         // Copy lookahead root velocity
         tempPose.lookaheadRootVelocity = db->lookaheadRootMotionVelocitiesRootSpace[f];
@@ -1579,6 +1577,144 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     TraceLog(LOG_INFO, "AnimDatabase: computed pose generation features (dim=%d) for neural network training",
         db->poseGenFeaturesComputeDim);
 
+    // normalize poseGenFeatures for segment autoencoder training
+    {
+        const int pgDim = db->poseGenFeaturesComputeDim;
+        const int N = db->motionFrameCount;
+        const int jc = db->jointCount;
+
+        // per-dim mean
+        db->poseGenFeaturesMean.resize(pgDim, 0.0f);
+        for (int d = 0; d < pgDim; ++d)
+        {
+            float sum = 0.0f;
+            for (int f = 0; f < N; ++f)
+            {
+                sum += db->poseGenFeatures.at(f, d);
+            }
+            db->poseGenFeaturesMean[d] = sum / N;
+        }
+
+        // per-dim std
+        db->poseGenFeaturesStd.resize(pgDim, 1.0f);
+        for (int d = 0; d < pgDim; ++d)
+        {
+            float sumSqDiff = 0.0f;
+            const float mean = db->poseGenFeaturesMean[d];
+            for (int f = 0; f < N; ++f)
+            {
+                const float diff = db->poseGenFeatures.at(f, d) - mean;
+                sumSqDiff += diff * diff;
+            }
+            const float s = sqrtf(sumSqDiff / N);
+            db->poseGenFeaturesStd[d] = (s > 1e-8f) ? s : 1.0f;
+        }
+
+        // per-dim bone weight
+        // poseGenFeatures layout (compact — only bone 0 position):
+        //   [0 .. jc*6)          lookaheadLocalRotations (6 per joint)
+        //   [jc*6 .. jc*6+3)     rootLocalPosition (bone 0 only)
+        //   [jc*6+3 .. jc*6+6)   lookaheadRootVelocity
+        //   [jc*6+6]             rootYawRate
+        //   [jc*6+7 .. jc*6+13)  lookaheadToePositions (3 per side)
+        //   [jc*6+13 .. jc*6+19) toeVelocities (3 per side)
+        //
+        // bone weight lookup (same table as GetBoneWeight in networks.h)
+        static const std::unordered_map<std::string, float> boneWeights = {
+            {"Simulation",0.0f},{"Hips",0.27089f},{"Spine",0.12777f},{"Spine1",0.10730f},
+            {"Spine2",0.08734f},{"Spine3",0.07508f},{"Neck",0.00839f},{"Neck1",0.00640f},
+            {"Head",0.00515f},{"HeadEnd",0.00063f},
+            {"RightShoulder",0.02654f},{"RightArm",0.02061f},{"RightForeArm",0.00826f},
+            {"RightHand",0.00213f},
+            {"LeftShoulder",0.02739f},{"LeftArm",0.02113f},{"LeftForeArm",0.00850f},
+            {"LeftHand",0.00211f},
+            {"RightUpLeg",0.05690f},{"RightLeg",0.02044f},{"RightFoot",0.00306f},
+            {"RightToeBase",0.00080f},{"RightToeBaseEnd",0.00063f},
+            {"LeftUpLeg",0.05668f},{"LeftLeg",0.02034f},{"LeftFoot",0.00289f},
+            {"LeftToeBase",0.00078f},{"LeftToeBaseEnd",0.00063f},
+        };
+        const float defaultBoneWeight = 0.01f;
+
+        const BVHData* skeleton = &characterData->bvhData[0];
+
+        // helper: get bone weight for joint index
+        auto boneWeightForJoint = [&](int j) -> float
+        {
+            const std::string& name = skeleton->joints[j].name;
+            auto it = boneWeights.find(name);
+            return (it != boneWeights.end()) ? it->second : defaultBoneWeight;
+        };
+
+        db->poseGenFeaturesWeight.resize(pgDim, defaultBoneWeight);
+
+        //const float hipsWeight = boneWeightForJoint(0);
+        int currentIndex = 0;
+
+        constexpr int rot6dDim = 6;
+        constexpr int vec3Dim = 3;
+
+        // rotations: dims [0, jc*6)
+        for (int j = 0; j < jc; ++j)
+        {
+            const float boneWeight = boneWeightForJoint(j);
+            for (int d = 0; d < rot6dDim; ++d)
+            {
+                db->poseGenFeaturesWeight[currentIndex++] = boneWeight;
+                currentIndex++;
+            }
+        }
+
+        // hips lookahead position (bone 0)
+        for (int d = 0; d < vec3Dim; ++d)
+        {
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
+        }
+        // root velocity
+        for (int d = 0; d < vec3Dim; ++d)
+        {
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
+        }
+        
+        // yaw rate
+        db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
+
+        // toe positions + velocities
+        const float leftToeWeight = 0.2f;////(db->toeIndices[SIDE_LEFT] >= 0) ? boneWeightForJoint(db->toeIndices[SIDE_LEFT]) : defaultBoneWeight;
+        const float rightToeWeight = 0.2f;// (db->toeIndices[SIDE_RIGHT] >= 0) ? boneWeightForJoint(db->toeIndices[SIDE_RIGHT]) : defaultBoneWeight;
+        for (int d = 0; d < 3; ++d)
+        {
+            db->poseGenFeaturesWeight[currentIndex++] = leftToeWeight;
+            db->poseGenFeaturesWeight[currentIndex++] = rightToeWeight;
+        }
+        for (int d = 0; d < 3; ++d)
+        {
+            db->poseGenFeaturesWeight[currentIndex++] = leftToeWeight;
+            db->poseGenFeaturesWeight[currentIndex++] = rightToeWeight;
+        }
+
+        assert(currentIndex == pgDim);
+
+        // compute normalizedPoseGenFeatures = (raw - mean) / std * weight
+        db->normalizedPoseGenFeatures.resize(N, pgDim);
+        for (int f = 0; f < N; ++f)
+        {
+            span<const float> raw = db->poseGenFeatures.row_view(f);
+            span<float> norm = db->normalizedPoseGenFeatures.row_view(f);
+            for (int d = 0; d < pgDim; ++d)
+            {
+                norm[d] = (raw[d] - db->poseGenFeaturesMean[d]) / db->poseGenFeaturesStd[d] * db->poseGenFeaturesWeight[d];
+            }
+        }
+
+        // compute segment sizing for the autoencoder
+        // use frame time of first clip (they're usually all the same)
+        const float frameTime = db->animFrameTime[0];
+        db->poseGenSegmentFrameCount = (int)ceilf(db->poseGenFeaturesSegmentLength / frameTime) + 1;
+        db->poseGenSegmentFlatDim = db->poseGenSegmentFrameCount * pgDim;
+
+        TraceLog(LOG_INFO, "AnimDatabase: normalized poseGenFeatures (dim=%d, segFrames=%d, segFlatDim=%d)",
+            pgDim, db->poseGenSegmentFrameCount, db->poseGenSegmentFlatDim);
+    }
 
     // set db->valid true now that we completed full build
     db->valid = true;
@@ -1621,6 +1757,3 @@ static inline void GetInterFrameAlpha(
         outAlpha = frameF - (float)outF0;
     }
 }
-
-// Sample toe velocity in root space from db->jointVelocitiesRootSpace at animTime
-// Used for foot IK velocity blending
