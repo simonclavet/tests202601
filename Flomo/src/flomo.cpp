@@ -1101,6 +1101,7 @@ static inline void ImGuiRenderSettings(AppConfig* config,
         ImGui::Checkbox("Draw Root Velocities", &config->drawRootVelocities);
         ImGui::Checkbox("Draw Toe Velocities", &config->drawToeVelocities);
         ImGui::Checkbox("Draw Foot IK", &config->drawFootIK);
+        ImGui::Checkbox("Draw Lookahead Pose", &config->drawLookaheadPose);
         ImGui::Checkbox("Draw Basic Blend", &config->drawBasicBlend);
         ImGui::Checkbox("Draw Magic Anchor", &config->drawMagicAnchor);
         ImGui::Checkbox("Draw Player Input", &config->drawPlayerInput);
@@ -1966,14 +1967,31 @@ static void ApplicationUpdate(void* voidApplicationState)
         app->controlledCharacter.cursorBlendMode = app->config.cursorBlendMode;
         app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
 
-        ControlledCharacterUpdate(
-            &app->controlledCharacter,
-            &app->characterData,
-            &app->animDatabase,
-            effectiveDt,
-            app->worldTime,
-            app->config,
-            &app->networkState);
+        // Choose update method based on animation mode
+        if (app->config.animationMode == AnimationMode::SingleFrameReconstructFromSearch)
+        {
+            // Network-based pose generation (simulated from database)
+            ControlledCharacterUpdateNetwork(
+                &app->controlledCharacter,
+                &app->characterData,
+                &app->animDatabase,
+                effectiveDt,
+                app->worldTime,
+                app->config,
+                &app->networkState);
+        }
+        else
+        {
+            // Standard cursor-based blending
+            ControlledCharacterUpdate(
+                &app->controlledCharacter,
+                &app->characterData,
+                &app->animDatabase,
+                effectiveDt,
+                app->worldTime,
+                app->config,
+                &app->networkState);
+        }
 
     }
 
@@ -2603,6 +2621,26 @@ static void ApplicationUpdate(void* voidApplicationState)
                 app->controlledCharacter.color,
                 GRAY);
         }
+
+    }
+    // Draw lookahead pose skeleton (semi-transparent magenta)
+    if (app->config.drawLookaheadPose && app->controlledCharacter.active)
+    {
+        DrawSkeleton(
+            &app->controlledCharacter.xformLookahead,
+            app->config.drawEndSites,
+            ColorAlpha(MAGENTA, 0.5f),
+            ColorAlpha(MAGENTA, 0.3f));
+    }
+
+    // Draw basic blend skeleton (semi-transparent green)
+    if (app->config.drawBasicBlend && app->controlledCharacter.active)
+    {
+        DrawSkeleton(
+            &app->controlledCharacter.xformBasicBlend,
+            app->config.drawEndSites,
+            ColorAlpha(LIME, 0.5f),
+            ColorAlpha(LIME, 0.3f));
     }
 
     // Draw joint velocities

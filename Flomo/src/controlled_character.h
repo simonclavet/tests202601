@@ -61,6 +61,10 @@ static void ControlledCharacterInit(
     TransformDataInit(&cc->xformBasicBlend);
     TransformDataResize(&cc->xformBasicBlend, skeleton);
 
+    // Initialize lookahead debug transform buffer
+    TransformDataInit(&cc->xformLookahead);
+    TransformDataResize(&cc->xformLookahead, skeleton);
+
     // Ensure blend cursors have storage sized to joint count
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
         cc->cursors[i].localPositions.resize(cc->xformData.jointCount);
@@ -276,24 +280,33 @@ static void ControlledCharacterUpdate(
                     const float frameTime = db->animFrameTime[clipIdx];
                     const float targetTime = localFrame * frameTime;
 
-                    // Don't spawn new cursor if an existing cursor is already playing the same anim at nearby time
-                    const float minTimeDiff = 0.2f;  // seconds
-                    bool tooCloseToExisting = false;
-                    for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
+                    bool spawnNewCursor = true;
+                    const bool preventBlendingCloseToExisting = false;
+                    if (preventBlendingCloseToExisting)
                     {
-                        const BlendCursor& cur = cc->cursors[ci];
-                        if (cur.active && cur.animIndex == clipIdx)
+                        // Don't spawn new cursor if an existing cursor is already playing the same anim at nearby time
+                        const float minTimeDiff = 0.2f;  // seconds
+                        bool tooCloseToExisting = false;
+                        for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
                         {
-                            const float timeDiff = fabsf(cur.animTime - targetTime);
-                            if (timeDiff < minTimeDiff)
+                            const BlendCursor& cur = cc->cursors[ci];
+                            if (cur.targetWeight == 1.0f &&
+                                cur.active &&
+                                cur.animIndex == clipIdx)
                             {
-                                tooCloseToExisting = true;
-                                break;
+                                const float timeDiff = fabsf(cur.animTime - targetTime);
+                                if (timeDiff < minTimeDiff)
+                                {
+                                    tooCloseToExisting = true;
+                                    spawnNewCursor = false;
+                                    break;
+                                }
                             }
                         }
                     }
 
-                    if (!tooCloseToExisting)
+
+                    if (spawnNewCursor)
                     {
                         SpawnBlendCursor(cc, clipIdx, targetTime, config.defaultBlendTime, false);
                     }
@@ -602,6 +615,29 @@ static void ControlledCharacterUpdate(
                 cc->worldPosition);
             cc->xformBasicBlend.globalRotations[i] = QuaternionMultiply(
                 cc->worldRotation, cc->xformBasicBlend.globalRotations[i]);
+        }
+    }
+
+    // Save lookahead pose for debug visualization
+    if (config.drawLookaheadPose)
+    {
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->xformLookahead.localPositions[j] = blendedLookaheadLocalPositions[j];
+            Rot6d lookaheadRot = blendedLookaheadLocalRotations[j];
+            Rot6dNormalize(lookaheadRot);
+            Rot6dToQuaternion(lookaheadRot, cc->xformLookahead.localRotations[j]);
+        }
+        // FK
+        TransformDataForwardKinematics(&cc->xformLookahead);
+        // Transform to world space
+        for (int i = 0; i < jc; ++i)
+        {
+            cc->xformLookahead.globalPositions[i] = Vector3Add(
+                Vector3RotateByQuaternion(cc->xformLookahead.globalPositions[i], cc->worldRotation),
+                cc->worldPosition);
+            cc->xformLookahead.globalRotations[i] = QuaternionMultiply(
+                cc->worldRotation, cc->xformLookahead.globalRotations[i]);
         }
     }
 
@@ -966,6 +1002,443 @@ static void ControlledCharacterUpdate(
     if (config.enableFootIK)
     {
         // Apply leg IK to pull toes toward virtual toe positions
+        // At this point globalPositions/Rotations are in world space, so IK target is world space
+        // and RecomputeLegFK will produce world-space results (using world-space parent transforms)
+        for (int side : sides)
+        {
+            LegChainIndices legIdx;
+            legIdx.hip = db->hipJointIndex;
+            legIdx.upleg = db->uplegIndices[side];
+            legIdx.lowleg = db->lowlegIndices[side];
+            legIdx.foot = db->footIndices[side];
+            legIdx.toe = db->toeIndices[side];
+
+            if (!legIdx.IsValid()) continue;
+
+            SolveLegIKInPlace(&cc->xformData, legIdx, cc->virtualToePos[side]);
+        }
+    }
+
+    // Compute toe velocity from final pose (after IK)
+    for (int side : sides)
+    {
+        const int toeIdx = db->toeIndices[side];
+        if (toeIdx < 0 || toeIdx >= cc->xformData.jointCount) continue;
+
+        const Vector3 currentPos = cc->xformData.globalPositions[toeIdx];
+        if (cc->toeTrackingInitialized)
+        {
+            cc->toeVelocity[side] = Vector3Scale(
+                Vector3Subtract(currentPos, cc->prevToeGlobalPos[side]), 1.0f / dt);
+        }
+        else
+        {
+            cc->toeVelocity[side] = Vector3Zero();
+        }
+        cc->prevToeGlobalPos[side] = currentPos;
+    }
+    cc->toeTrackingInitialized = true;
+}
+
+
+// Network-based pose generation (no cursor blending)
+// Searches every frame and applies pose from poseGenFeatures directly
+// This simulates what a neural network would do: features -> pose
+static void ControlledCharacterUpdateNetwork(
+    ControlledCharacter* cc,
+    const CharacterData* characterData,
+    const AnimDatabase* db,
+    float dt,
+    double worldTime,
+    const AppConfig& config,
+    NetworkState* networkState = nullptr)
+{
+    if (!cc->active || characterData->count == 0) return;
+
+    const int jc = cc->xformData.jointCount;
+
+    // Require valid AnimDatabase with pose generation features
+    if (db == nullptr || !db->valid || db->poseGenFeaturesComputeDim <= 0)
+    {
+        TraceLog(LOG_WARNING, "ControlledCharacterUpdateNetwork: AnimDatabase not valid or missing poseGenFeatures");
+        cc->active = false;
+        return;
+    }
+
+    if (db->jointCount != cc->xformData.jointCount)
+    {
+        TraceLog(LOG_WARNING, "ControlledCharacterUpdateNetwork: jointCount mismatch");
+        cc->active = false;
+        return;
+    }
+
+    if (dt <= 1e-6f) return;
+
+    // First frame initialization: use first frame's lookahead pose from database
+    if (!cc->lookaheadDragInitialized)
+    {
+        TraceLog(LOG_INFO, "ControlledCharacterUpdateNetwork: initializing from frame 0");
+
+        // Deserialize first frame's pose generation features
+        PoseFeatures initialPose;
+        std::span<const float> poseRow = db->poseGenFeatures.row_view(0);
+        initialPose.DeserializeFrom(poseRow, db->jointCount);
+
+        // Initialize lookahead drag states from initial pose (separate loops for cache coherency)
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->lookaheadDragLocalRotations6d[j] = initialPose.lookaheadLocalRotations[j];
+        }
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->lookaheadDragLocalPositions[j] = initialPose.lookaheadLocalPositions[j];
+        }
+
+        cc->lookaheadDragRootVelocityRootSpace = initialPose.lookaheadRootVelocity;
+        cc->lookaheadDragYawRate = initialPose.rootYawRate;
+
+        // Convert to quaternions and apply
+        for (int j = 0; j < jc; ++j)
+        {
+            Rot6dToQuaternion(cc->lookaheadDragLocalRotations6d[j],
+                             cc->xformData.localRotations[j]);
+        }
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
+        }
+
+        // Initialize world position and rotation
+        cc->worldPosition = Vector3{ 2.0f, 0.0f, 0.0f };
+        cc->worldRotation = QuaternionIdentity();
+
+        // Initialize virtual control velocity
+        cc->virtualControlSmoothedVelocity = Vector3Zero();
+        cc->virtualControlSmoothedVelocityInitialized = true;
+
+        cc->lookaheadDragInitialized = true;
+
+        // Do FK and transform to world space
+        TransformDataForwardKinematics(&cc->xformData);
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->xformData.globalPositions[j] = Vector3Add(
+                Vector3RotateByQuaternion(cc->xformData.globalPositions[j], cc->worldRotation),
+                cc->worldPosition);
+            cc->xformData.globalRotations[j] = QuaternionMultiply(
+                cc->worldRotation, cc->xformData.globalRotations[j]);
+        }
+
+        return;
+    }
+
+    // Update virtual control velocity (for motion matching features)
+    {
+        const Vector3 desiredVel = cc->playerInput.desiredVelocity;
+        const float maxAccel = config.virtualControlMaxAcceleration;
+        const float maxDeltaVelMag = maxAccel * dt;
+
+        const Vector3 velDelta = Vector3Subtract(desiredVel, cc->virtualControlSmoothedVelocity);
+        const float velDeltaMag = Vector3Length(velDelta);
+
+        if (velDeltaMag <= maxDeltaVelMag)
+        {
+            cc->virtualControlSmoothedVelocity = desiredVel;
+        }
+        else if (velDeltaMag > 1e-6f)
+        {
+            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
+            cc->virtualControlSmoothedVelocity = Vector3Add(
+                cc->virtualControlSmoothedVelocity,
+                Vector3Scale(velDeltaDir, maxDeltaVelMag));
+        }
+    }
+
+    // Compute motion matching features from current pose
+    ComputeMotionFeatures(db, cc, cc->mmQuery);
+
+    // Search for best matching frame
+    const int skipBoundary = 60;
+    float bestCost = 0.0f;
+    const int bestFrame = MotionMatchingSearch(
+        db, cc->mmQuery, skipBoundary, &bestCost, config, networkState);
+   
+    cc->mmBestFrame = bestFrame;
+    cc->mmBestCost = bestCost;
+
+    if (bestFrame < 0)
+    {
+        TraceLog(LOG_WARNING, "ControlledCharacterUpdateNetwork: search failed");
+        return;
+    }
+
+    // Deserialize pose generation features for the winning frame
+    PoseFeatures targetPose;
+    std::span<const float> poseRow = db->poseGenFeatures.row_view(bestFrame);
+    targetPose.DeserializeFrom(poseRow, db->jointCount);
+
+    // Save lookahead pose for debug visualization
+    if (config.drawLookaheadPose)
+    {
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->xformLookahead.localPositions[j] = targetPose.lookaheadLocalPositions[j];
+            Rot6d lookaheadRot = targetPose.lookaheadLocalRotations[j];
+            Rot6dNormalize(lookaheadRot);
+            Rot6dToQuaternion(lookaheadRot, cc->xformLookahead.localRotations[j]);
+        }
+        // FK
+        TransformDataForwardKinematics(&cc->xformLookahead);
+        // Transform to world space
+        for (int i = 0; i < jc; ++i)
+        {
+            cc->xformLookahead.globalPositions[i] = Vector3Add(
+                Vector3RotateByQuaternion(cc->xformLookahead.globalPositions[i], cc->worldRotation),
+                cc->worldPosition);
+            cc->xformLookahead.globalRotations[i] = QuaternionMultiply(
+                cc->worldRotation, cc->xformLookahead.globalRotations[i]);
+        }
+    }
+
+    // Lookahead dragging: lerp toward target instead of direct application
+    const float lookaheadTime = Max(dt, db->featuresConfig.poseDragLookaheadTime);
+    const float lookaheadProjectionAlpha = dt / lookaheadTime;
+
+    // Lerp rotations toward lookahead target (separate loop for cache coherency)
+    for (int j = 0; j < jc; ++j)
+    {
+        cc->lookaheadDragLocalRotations6d[j] = Rot6dLerp(
+            cc->lookaheadDragLocalRotations6d[j],
+            targetPose.lookaheadLocalRotations[j],
+            lookaheadProjectionAlpha);
+    }
+
+    // Lerp positions toward lookahead target (separate loop for cache coherency)
+    for (int j = 0; j < jc; ++j)
+    {
+        cc->lookaheadDragLocalPositions[j] = Vector3Lerp(
+            cc->lookaheadDragLocalPositions[j],
+            targetPose.lookaheadLocalPositions[j],
+            lookaheadProjectionAlpha);
+    }
+
+    // Convert dragged rotations to quaternions (separate loop for cache coherency)
+    for (int j = 0; j < jc; ++j)
+    {
+        Rot6dToQuaternion(cc->lookaheadDragLocalRotations6d[j],
+                         cc->xformData.localRotations[j]);
+    }
+
+    // Apply dragged positions (separate loop for cache coherency)
+    for (int j = 0; j < jc; ++j)
+    {
+        cc->xformData.localPositions[j] = cc->lookaheadDragLocalPositions[j];
+    }
+
+    // Lerp root velocity toward lookahead target
+    cc->lookaheadDragRootVelocityRootSpace = Vector3Lerp(
+        cc->lookaheadDragRootVelocityRootSpace,
+        targetPose.lookaheadRootVelocity,
+        lookaheadProjectionAlpha);
+
+    // Yaw rate: use current (not lookahead) for better precision
+    cc->lookaheadDragYawRate = targetPose.rootYawRate;
+
+    // Apply root motion
+    const Vector3 rootVelWorld = Vector3RotateByQuaternion(
+        cc->lookaheadDragRootVelocityRootSpace, cc->worldRotation);
+    cc->worldPosition = Vector3Add(cc->worldPosition, Vector3Scale(rootVelWorld, dt));
+
+    const Quaternion yawDelta = QuaternionFromAxisAngle(
+        Vector3{ 0.0f, 1.0f, 0.0f }, cc->lookaheadDragYawRate * dt);
+    cc->worldRotation = QuaternionMultiply(yawDelta, cc->worldRotation);
+
+    // Keep only Y component to prevent pitch/roll accumulation
+    cc->worldRotation = QuaternionYComponent(cc->worldRotation);
+
+    // Update toe velocities (needed for speed clamping)
+    for (int side : sides)
+    {
+        const Vector3 toeVelRootSpace = targetPose.toeVelocitiesRootSpace[side];
+        cc->toeBlendedVelocityWorld[side] = Vector3RotateByQuaternion(toeVelRootSpace, cc->worldRotation);
+    }
+
+    // Update lookahead drag toe positions and virtual toe positions
+    // Same logic as ControlledCharacterUpdate for consistent foot locking behavior
+    for (int side : sides)
+    {
+        if (!cc->lookaheadDragToePosInitialized)
+        {
+            // Initialize on first frame
+            cc->lookaheadDragToePosRootSpace[side] = targetPose.lookaheadToePositionsRootSpace[side];
+            cc->lookaheadDragToePosWorld[side] = Vector3Add(
+                Vector3RotateByQuaternion(cc->lookaheadDragToePosRootSpace[side], cc->worldRotation),
+                cc->worldPosition);
+            cc->virtualToePos[side] = cc->lookaheadDragToePosWorld[side];
+            TraceLog(LOG_INFO, "Virtual toe: initialized %s toe at (%.2f, %.2f, %.2f)",
+                StringFromSide(side), cc->virtualToePos[side].x, cc->virtualToePos[side].y, cc->virtualToePos[side].z);
+        }
+        else
+        {
+            // Lerp lookahead drag toe position toward target (lookahead dragging mode)
+            cc->lookaheadDragToePosRootSpace[side] = Vector3Lerp(
+                cc->lookaheadDragToePosRootSpace[side],
+                targetPose.lookaheadToePositionsRootSpace[side],
+                lookaheadProjectionAlpha);
+
+            // Convert lookahead drag position from root space to world space
+            cc->lookaheadDragToePosWorld[side] = Vector3Add(
+                Vector3RotateByQuaternion(cc->lookaheadDragToePosRootSpace[side], cc->worldRotation),
+                cc->worldPosition);
+
+            // Update virtualToePos: try to go to target, but speed-clamped
+            const Vector3 prevVirtualToePos = cc->virtualToePos[side];
+            Vector3 newVirtualToePos = cc->lookaheadDragToePosWorld[side];
+
+            const bool doSpeedClamp = true;
+            if (doSpeedClamp)
+            {
+                // Speed clamp (XZ only) based on blended toe velocity
+                const Vector3 blendedToeVel = cc->toeBlendedVelocityWorld[side];
+                const Vector3 displacement = Vector3Subtract(newVirtualToePos, prevVirtualToePos);
+                const float distXZ = Vector3Length2D(displacement);
+
+                if (distXZ > 1e-6f)
+                {
+                    const float blendedSpeedXZ = Vector3Length2D(blendedToeVel);
+
+                    const float lowSpeed = 0.5f;
+                    const float highSpeed = 2.0f;
+                    const float howFast = ClampedInvLerp(lowSpeed, highSpeed, blendedSpeedXZ);
+                    const float lowMult = 1.2f;
+                    const float highMult = 1.4f;
+                    const float speedMultiplier = SmoothLerp(lowMult, highMult, howFast);
+                    const float maxSpeed = blendedSpeedXZ * speedMultiplier;
+                    const float maxDistXZ = maxSpeed * dt;
+
+                    if (distXZ > maxDistXZ)
+                    {
+                        const float scale = maxDistXZ / distXZ;
+                        newVirtualToePos.x = prevVirtualToePos.x + displacement.x * scale;
+                        newVirtualToePos.z = prevVirtualToePos.z + displacement.z * scale;
+                        // Y is NOT clamped - height should track target directly
+                    }
+                }
+            }
+
+            cc->virtualToePos[side] = newVirtualToePos;
+
+            // Check unlock condition: distance between lookaheadDrag (unconstrained) and virtual (constrained)
+            const Vector3 unlockDelta = Vector3Subtract(cc->lookaheadDragToePosWorld[side], cc->virtualToePos[side]);
+            const float distXZUnlock = Vector3Length2D(unlockDelta);
+
+            // Trigger unlock when constrained can't keep up with unconstrained
+            const int otherSide = OtherSideInt(side);
+            const bool otherFootUnlocked = (cc->virtualToeUnlockTimer[otherSide] >= 0.0f);
+
+            if (config.enableTimedUnlocking &&
+                distXZUnlock > config.unlockDistance &&
+                cc->virtualToeUnlockTimer[side] < 0.0f &&
+                !otherFootUnlocked)
+            {
+                cc->virtualToeUnlockTimer[side] = config.unlockDuration;
+                cc->virtualToeUnlockStartDistance[side] = distXZUnlock;
+            }
+
+            // Update unlock timer
+            if (cc->virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                cc->virtualToeUnlockTimer[side] -= dt;
+                if (cc->virtualToeUnlockTimer[side] < 0.0f)
+                {
+                    cc->virtualToeUnlockTimer[side] = -1.0f;
+                }
+            }
+
+            // If unlocked, pull constrained toward unconstrained (shrinking sphere)
+            if (config.enableTimedUnlocking && cc->virtualToeUnlockTimer[side] >= 0.0f)
+            {
+                const float unlockProgress = cc->virtualToeUnlockTimer[side] / config.unlockDuration;
+                const float smoothUnlockProgress = SmoothStep(unlockProgress);
+                const float maxClampDist = cc->virtualToeUnlockStartDistance[side] * smoothUnlockProgress;
+
+                cc->virtualToeUnlockClampRadius[side] = maxClampDist;
+
+                const Vector3 clampDelta = Vector3Subtract(cc->lookaheadDragToePosWorld[side], cc->virtualToePos[side]);
+                const float distXZClamp = Vector3Length2D(clampDelta);
+
+                if (distXZClamp > maxClampDist)
+                {
+                    const float clampScale = maxClampDist / distXZClamp;
+                    cc->virtualToePos[side].x = cc->lookaheadDragToePosWorld[side].x - clampDelta.x * clampScale;
+                    cc->virtualToePos[side].z = cc->lookaheadDragToePosWorld[side].z - clampDelta.z * clampScale;
+                }
+            }
+            else
+            {
+                cc->virtualToeUnlockClampRadius[side] = 0.0f;
+            }
+        }
+    }
+
+    cc->lookaheadDragToePosInitialized = true;
+
+    // Do forward kinematics
+    TransformDataForwardKinematics(&cc->xformData);
+
+    // Transform to world space
+    for (int j = 0; j < jc; ++j)
+    {
+        cc->xformData.globalPositions[j] = Vector3Add(
+            Vector3RotateByQuaternion(cc->xformData.globalPositions[j], cc->worldRotation),
+            cc->worldPosition);
+        cc->xformData.globalRotations[j] = QuaternionMultiply(
+            cc->worldRotation, cc->xformData.globalRotations[j]);
+    }
+
+    // Update position history every HISTORY_SAMPLE_INTERVAL seconds
+    // This maintains a ring buffer of recent positions for motion matching past position feature
+    {
+        static constexpr float HISTORY_SAMPLE_INTERVAL = 0.01f;  // 10ms between samples
+        static constexpr float HISTORY_MAX_DURATION = 0.5f;      // keep 500ms of history
+
+        // Check if we should sample (interval elapsed)
+        if ((worldTime - cc->lastHistorySampleTime) >= HISTORY_SAMPLE_INTERVAL)
+        {
+            // Add new history point at the back
+            HistoryPoint newPoint;
+            newPoint.position = cc->worldPosition;
+            newPoint.timestamp = worldTime;
+            cc->positionHistory.push_back(newPoint);
+
+            cc->lastHistorySampleTime = worldTime;
+
+            // Remove old history points from the front (keep only HISTORY_MAX_DURATION seconds)
+            const double cutoffTime = worldTime - HISTORY_MAX_DURATION;
+            while (!cc->positionHistory.empty() && cc->positionHistory.front().timestamp < cutoffTime)
+            {
+                cc->positionHistory.erase(cc->positionHistory.begin());
+            }
+        }
+    }
+
+    // Save pre-IK state for debugging visualization
+
+    if (cc->debugSaveBeforeIK)
+    {
+        // Copy current FK result before IK modifies it
+        for (int i = 0; i < cc->xformData.jointCount; ++i)
+        {
+            cc->xformBeforeIK.globalPositions[i] = cc->xformData.globalPositions[i];
+            cc->xformBeforeIK.globalRotations[i] = cc->xformData.globalRotations[i];
+            cc->xformBeforeIK.localPositions[i] = cc->xformData.localPositions[i];
+            cc->xformBeforeIK.localRotations[i] = cc->xformData.localRotations[i];
+        }
+    }
+
+    if (config.enableFootIK)
+    {
+        // Apply leg IK to pull toes toward virtualToePos (speed-clamped target)
         // At this point globalPositions/Rotations are in world space, so IK target is world space
         // and RecomputeLegFK will produce world-space results (using world-space parent transforms)
         for (int side : sides)

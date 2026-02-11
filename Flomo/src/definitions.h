@@ -6,8 +6,9 @@
 // Animation playback mode for controlled character
 enum class AnimationMode : int
 {
-    RandomSwitch = 0,   // randomly switch between animations
-    MotionMatching,     // use motion matching to find best animation
+    RandomSwitch = 0,              // randomly switch between animations
+    MotionMatching,                // use motion matching to find best animation
+    SingleFrameReconstructFromSearch,  // search + reconstruct from poseGenFeatures (network simulation)
     COUNT
 };
 
@@ -17,6 +18,7 @@ static inline const char* AnimationModeName(AnimationMode mode)
     {
     case AnimationMode::RandomSwitch: return "Random Switch";
     case AnimationMode::MotionMatching: return "Motion Matching";
+    case AnimationMode::SingleFrameReconstructFromSearch: return "Single Frame Reconstruct From Search";
     default: return "Unknown";
     }
 }
@@ -195,6 +197,7 @@ struct AppConfig {
     bool drawRootVelocities = false; // Draw root motion velocity from each cursor
     bool drawToeVelocities = false;  // Draw toe velocity vectors (actual vs blended)
     bool drawFootIK = false;         // Draw foot IK debug (virtual toe positions, etc.)
+    bool drawLookaheadPose = false;  // Draw blended lookahead pose skeleton
     bool drawBasicBlend = false;     // Draw basic blend result (before lookahead dragging)
     bool drawMagicAnchor = false;    // Draw Magic anchor (spine3 projected + head→hand yaw)
     bool drawPastHistory = false;    // Draw past position history for motion matching
@@ -713,6 +716,9 @@ struct ControlledCharacter {
 
     // Basic blend result (before lookahead dragging) for debugging
     TransformData xformBasicBlend;
+
+    // Blended lookahead pose for debugging
+    TransformData xformLookahead;
 
     // Visual properties
     Color color;
