@@ -961,6 +961,30 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
     TraceLog(LOG_INFO, "AnimDatabase: computed toe positions in root space");
 
+    // Populate legalStartFrames
+    db->legalStartFrames.clear();
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        const float frameTime = db->animFrameTime[c];
+
+        const int minLegalFrameOffset = (int)ceilf(0.1f / frameTime);
+        const int maxLegalFrameOffset = (int)ceilf(1.0f / frameTime);
+
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            const int framesFromStart = f - clipStart;
+            const int framesToEnd = clipEnd - 1 - f;
+
+            if (framesFromStart >= minLegalFrameOffset && framesToEnd >= maxLegalFrameOffset)
+            {
+                db->legalStartFrames.push_back(f);
+            }
+        }
+    }
+    TraceLog(LOG_INFO, "AnimDatabase: populated %d legal start frames", (int)db->legalStartFrames.size());
+
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
 
     db->featureDim = 0;
@@ -1660,7 +1684,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             for (int d = 0; d < rot6dDim; ++d)
             {
                 db->poseGenFeaturesWeight[currentIndex++] = boneWeight;
-                currentIndex++;
             }
         }
 
@@ -1679,17 +1702,15 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
 
         // toe positions + velocities
-        const float leftToeWeight = 0.2f;////(db->toeIndices[SIDE_LEFT] >= 0) ? boneWeightForJoint(db->toeIndices[SIDE_LEFT]) : defaultBoneWeight;
-        const float rightToeWeight = 0.2f;// (db->toeIndices[SIDE_RIGHT] >= 0) ? boneWeightForJoint(db->toeIndices[SIDE_RIGHT]) : defaultBoneWeight;
         for (int d = 0; d < 3; ++d)
         {
-            db->poseGenFeaturesWeight[currentIndex++] = leftToeWeight;
-            db->poseGenFeaturesWeight[currentIndex++] = rightToeWeight;
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
         }
         for (int d = 0; d < 3; ++d)
         {
-            db->poseGenFeaturesWeight[currentIndex++] = leftToeWeight;
-            db->poseGenFeaturesWeight[currentIndex++] = rightToeWeight;
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
+            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
         }
 
         assert(currentIndex == pgDim);

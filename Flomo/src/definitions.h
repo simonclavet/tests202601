@@ -8,7 +8,7 @@ enum class AnimationMode : int
 {
     RandomSwitch = 0,              // randomly switch between animations
     MotionMatching,                // use motion matching to find best animation
-    SingleFrameReconstructFromSearch,  // search + reconstruct from poseGenFeatures (network simulation)
+    AverageLatentPredictor,            // features -> predictor -> decoded pose segment
     COUNT
 };
 
@@ -18,7 +18,7 @@ static inline const char* AnimationModeName(AnimationMode mode)
     {
     case AnimationMode::RandomSwitch: return "Random Switch";
     case AnimationMode::MotionMatching: return "Motion Matching";
-    case AnimationMode::SingleFrameReconstructFromSearch: return "Single Frame Reconstruct From Search";
+    case AnimationMode::AverageLatentPredictor: return "Average Latent Predictor";
     default: return "Unknown";
     }
 }
@@ -250,15 +250,6 @@ struct PlayerControlInput
 
 // Structured representation of pose features for neural network training/inference
 // This is what the network outputs given motion matching features as input
-// These are the targets that ControlledCharacterUpdateNetwork will use to advance the pose
-//
-// Usage example for network inference in ControlledCharacterUpdateNetwork:
-//   PoseFeatures pose;
-//   torch::Tensor output = network.forward(motionMatchingFeatures);
-//   pose.DeserializeFrom(outputSpan, jointCount);
-//   // Apply pose.lookaheadLocalRotations/Positions to character
-//   // Update root motion using pose.lookaheadRootVelocity and pose.rootYawRate
-//   // Update foot IK using pose.lookaheadToePositions and pose.toeVelocities
 struct PoseFeatures
 {
     // Lookahead pose (what the pose will be after lookahead time)
@@ -337,6 +328,8 @@ struct PoseFeatures
             dest[idx++] = toeVelocitiesRootSpace[side].y;
             dest[idx++] = toeVelocitiesRootSpace[side].z;
         }
+
+        assert(idx == GetDim((int)lookaheadLocalRotations.size()));
     }
 
     void DeserializeFrom(std::span<const float> src, int jointCount)
@@ -378,6 +371,9 @@ struct PoseFeatures
             toeVelocitiesRootSpace[side].y = src[idx++];
             toeVelocitiesRootSpace[side].z = src[idx++];
         }
+
+        assert(idx == GetDim((int)lookaheadLocalRotations.size()));
+
     }
 };
 
@@ -413,6 +409,7 @@ struct AnimDatabase
     // Number of frames actually stored in the compacted motion DB (may be <= totalFrames
     // if some clips have mismatched skeletons and are skipped)
     int motionFrameCount = -1;
+    std::vector<int> legalStartFrames;
 
     // Per-frame joint transforms in animation space: [motionFrameCount x jointCount]
     Array2D<Vector3> jointPositionsAnimSpace;       // positions in animation world space
@@ -488,9 +485,9 @@ struct AnimDatabase
     // Neural network training targets: pose generation features [motionFrameCount x poseGenFeaturesComputeDim]
     // Contains lookahead local rotations, positions, root motion, and foot IK data
     // This is what the network should output given the motion matching features as input
-    int poseGenFeaturesComputeDim = -1;        // dimension: jointCount*9 + 16
+    int poseGenFeaturesComputeDim = -1;        
     Array2D<float> poseGenFeatures;            // [motionFrameCount x poseGenFeaturesComputeDim]
-    float poseGenFeaturesSegmentLength = 0.4f; // how many seconds of poseGenFeatures a cursor copies
+    float poseGenFeaturesSegmentLength = 0.5f; // how many seconds of poseGenFeatures a cursor copies
 
     // normalization for poseGenFeatures (for segment autoencoder training)
     std::vector<float> poseGenFeaturesMean;    // per-dim mean [poseGenFeaturesComputeDim]
@@ -515,6 +512,7 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->valid = false;
     db->jointCount = -1;
     db->motionFrameCount = -1;
+    db->legalStartFrames.clear();
     db->jointPositionsAnimSpace.clear();
     db->jointRotationsAnimSpace.clear();
     db->jointVelocitiesRootSpace.clear();
@@ -522,7 +520,6 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->localJointPositions.clear();
     db->localJointRotations.clear();
     db->lookaheadLocalRotations.clear();
-    db->lookaheadLocalPositions.clear();
     db->lookaheadLocalPositions.clear();
     db->rootMotionVelocitiesRootSpace.clear();
     db->rootMotionYawRates.clear();
@@ -803,19 +800,31 @@ struct ControlledCharacter {
 
 struct NetworkState {
     bool isTraining = false;
-    float currentLoss = 0.0f;
-    int iterations = 0;
-
     torch::Device device = torch::kCPU;
 
-    torch::nn::Sequential model = nullptr;
+    // feature autoencoder
     torch::nn::Sequential featuresAutoEncoder = nullptr;
-    std::shared_ptr<torch::optim::Adam> optimizer = nullptr;
+    std::shared_ptr<torch::optim::Adam> featureAEOptimizer =
+        nullptr;
+    float featureAELoss = 0.0f;
+    int featureAEIterations = 0;
 
     // segment autoencoder
     torch::nn::Sequential segmentAutoEncoder = nullptr;
-    std::shared_ptr<torch::optim::Adam> segmentOptimizer = nullptr;
-    bool isTrainingSegmentAE = false;
+    std::shared_ptr<torch::optim::Adam> segmentOptimizer =
+        nullptr;
     float segmentAELoss = 0.0f;
     int segmentAEIterations = 0;
+
+    // segment latent average predictor
+    torch::nn::Sequential segmentLatentAveragePredictor =
+        nullptr;
+    std::shared_ptr<torch::optim::Adam> predictorOptimizer =
+        nullptr;
+    float predictorLoss = 0.0f;
+    int predictorIterations = 0;
+
+    // unified training timing
+    double trainingElapsedSeconds = 0.0;
+    double timeSinceLastAutoSave = 0.0;
 };

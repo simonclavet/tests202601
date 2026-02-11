@@ -5,6 +5,7 @@ CMakeSettings.json
 data/
 thirdparty/
 build/
+saved/
 
 # Visual Studio stuff
 .vs/

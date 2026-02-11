@@ -343,14 +343,14 @@ static inline void OnCharactersLoaded(
             characterData.scales[0],
             config.switchInterval);
 
-        // Load AutoEncoder if path provided
+        // Load networks if path provided
         if (!folderPath.empty())
         {
-            NetworkLoad(&networkState, animDatabase.featureDim, 16, folderPath);
-            if (animDatabase.poseGenSegmentFlatDim > 0)
-            {
-                NetworkLoadSegmentAE(&networkState, animDatabase.poseGenSegmentFlatDim, 128, folderPath);
-            }
+            NetworkLoadAll(
+                &networkState,
+                animDatabase.featureDim,
+                animDatabase.poseGenSegmentFlatDim,
+                folderPath);
         }
     }
 
@@ -435,8 +435,52 @@ static inline bool SaveAnimsList(const CharacterData& characterData, const std::
     return true;
 }
 
-// Helper: Save config to timestamped folder in saved/
-static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const CharacterData& characterData, const NetworkState& networkState, std::string& /*out*/ savedFolderName)
+// Save config, anims, and networks into an existing folder
+static inline bool SaveConfigToFolder(
+    const AppConfig& config,
+    const CharacterData& characterData,
+    const NetworkState& networkState,
+    const std::string& folderPath)
+{
+    // Copy current config file
+    const std::string configDestPath =
+        folderPath + "/flomo_config.json";
+    try
+    {
+        fs::copy_file(
+            GetConfigPath(),
+            configDestPath,
+            fs::copy_options::overwrite_existing);
+    }
+    catch (const fs::filesystem_error& e)
+    {
+        TraceLog(LOG_ERROR,
+            "Failed to copy config file: %s", e.what());
+        return false;
+    }
+
+    // Save animations list
+    const std::string animsPath = folderPath + "/anims.json";
+    if (!SaveAnimsList(characterData, animsPath))
+    {
+        TraceLog(LOG_ERROR, "Failed to save animations list");
+        return false;
+    }
+
+    // Save networks if they exist
+    NetworkSaveAll(&networkState, folderPath);
+
+    TraceLog(LOG_INFO, "Config saved to: %s",
+        folderPath.c_str());
+    return true;
+}
+
+// Create a new timestamped folder and save into it
+static inline bool SaveConfigToNewFolder(
+    const AppConfig& config,
+    const CharacterData& characterData,
+    const NetworkState& networkState,
+    std::string& /*out*/ savedFolderName)
 {
     const std::string baseDir = "saved";
 
@@ -449,7 +493,9 @@ static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const 
         }
         catch (const fs::filesystem_error& e)
         {
-            TraceLog(LOG_ERROR, "Failed to create saved configs directory: %s", e.what());
+            TraceLog(LOG_ERROR,
+                "Failed to create saved configs directory: %s",
+                e.what());
             return false;
         }
     }
@@ -458,11 +504,12 @@ static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const 
     std::string timestamp = GetTimestampString();
     std::string folderPath = baseDir + "/" + timestamp;
 
-    // Handle duplicate timestamps by appending _1, _2, etc
+    // Handle duplicate timestamps
     int suffix = 1;
     while (fs::exists(folderPath))
     {
-        folderPath = baseDir + "/" + timestamp + "_" + std::to_string(suffix);
+        folderPath = baseDir + "/" + timestamp + "_"
+            + std::to_string(suffix);
         suffix++;
     }
 
@@ -473,36 +520,19 @@ static inline bool SaveConfigToTimestampedFolder(const AppConfig& config, const 
     }
     catch (const fs::filesystem_error& e)
     {
-        TraceLog(LOG_ERROR, "Failed to create config folder: %s", e.what());
+        TraceLog(LOG_ERROR,
+            "Failed to create config folder: %s", e.what());
         return false;
     }
 
-    // Copy current config file to the timestamped folder
-    const std::string configDestPath = folderPath + "/flomo_config.json";
-    try
+    if (!SaveConfigToFolder(
+        config, characterData, networkState, folderPath))
     {
-        fs::copy_file(GetConfigPath(), configDestPath, fs::copy_options::overwrite_existing);
-    }
-    catch (const fs::filesystem_error& e)
-    {
-        TraceLog(LOG_ERROR, "Failed to copy config file: %s", e.what());
         return false;
     }
 
-    // Save animations list
-    const std::string animsPath = folderPath + "/anims.json";
-    if (!SaveAnimsList(characterData, animsPath))
-    {
-        TraceLog(LOG_ERROR, "Failed to save animations list");
-        return false;
-    }
-
-    // Save AutoEncoder if it exists
-    NetworkSave(&networkState, folderPath);
-    NetworkSaveSegmentAE(&networkState, folderPath);
-
-    savedFolderName = fs::path(folderPath).filename().string();
-    TraceLog(LOG_INFO, "Config saved to: %s", folderPath.c_str());
+    savedFolderName =
+        fs::path(folderPath).filename().string();
     return true;
 }
 
@@ -1594,19 +1624,54 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
     ImGui::SetNextWindowSize(ImVec2(280, 400), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Saved Configs"))
     {
-        // Save config button
-        if (ImGui::Button("Save Config"))
+        // Save buttons
+        const bool hasSelection =
+            app->savedConfigsSelectedIndex >= 0
+            && app->savedConfigsSelectedIndex
+                < (int)app->savedConfigFolders.size();
+
+        if (hasSelection)
+        {
+            if (ImGui::Button("Override Config"))
+            {
+                const std::string& folderName =
+                    app->savedConfigFolders[
+                        app->savedConfigsSelectedIndex];
+                const std::string folderPath =
+                    "saved/" + folderName;
+                SaveConfigToFolder(
+                    app->config,
+                    app->characterData,
+                    app->networkState,
+                    folderPath);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip(
+                    "Override selected config: %s",
+                    app->savedConfigFolders[
+                        app->savedConfigsSelectedIndex]
+                        .c_str());
+            }
+            ImGui::SameLine();
+        }
+
+        if (ImGui::Button("Save New"))
         {
             std::string folderName;
-            if (SaveConfigToTimestampedFolder(app->config, app->characterData, app->networkState, folderName))
+            if (SaveConfigToNewFolder(
+                app->config,
+                app->characterData,
+                app->networkState,
+                folderName))
             {
                 app->savedConfigsNeedRefresh = true;
-                TraceLog(LOG_INFO, "Config saved to folder: %s", folderName.c_str());
             }
         }
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("Save current config and animations to saved/ with timestamp");
+            ImGui::SetTooltip(
+                "Save to a new timestamped folder");
         }
 
         ImGui::SameLine();
@@ -1689,85 +1754,128 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
 
 static inline void ImGuiNeuralNetworks(ApplicationState* app)
 {
-    ImGui::SetNextWindowPos(ImVec2(800, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(220, 150), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(
+        ImVec2(800, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(
+        ImVec2(280, 250), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Neural Networks"))
     {
-        if (ImGui::Button("Restart Training AE"))
+        const bool training =
+            app->networkState.isTraining;
+        const bool hasAEs =
+            app->networkState.featuresAutoEncoder
+            && app->networkState.segmentAutoEncoder;
+
+        if (!training)
         {
-            if (app->animDatabase.valid)
+            if (ImGui::Button("Start Training"))
             {
-                NetworkInitFeaturesAutoEncoder(&app->networkState, app->animDatabase.featureDim, 16, true);
+                if (app->animDatabase.valid
+                    && app->animDatabase
+                        .poseGenSegmentFlatDim > 0)
+                {
+                    NetworkInitAllForTraining(
+                        &app->networkState,
+                        &app->animDatabase);
+                }
+                else
+                {
+                    TraceLog(LOG_WARNING,
+                        "Cannot start: AnimDatabase"
+                        " not valid");
+                }
             }
-            else
+
+            if (hasAEs)
             {
-                TraceLog(LOG_WARNING, "Cannot start training: AnimDatabase not valid");
+                ImGui::SameLine();
+                if (ImGui::Button("Continue Training"))
+                {
+                    app->networkState.isTraining = true;
+                }
             }
         }
-
-        if (app->networkState.featuresAutoEncoder && !app->networkState.isTraining)
+        else
         {
-            if (ImGui::Button("Continue Training"))
-            {
-                app->networkState.isTraining = true;
-            }
-        }
-
-        if (app->networkState.featuresAutoEncoder)
-        {
-            ImGui::Checkbox("Use Denoiser", &app->config.useMMFeatureDenoiser);
-        }
-
-        if (app->networkState.isTraining)
-        {
-            ImGui::Text("Device: %s", app->networkState.device.is_cuda() ? "GPU" : "CPU");
-            ImGui::Text("Loss: %.6f", app->networkState.currentLoss);
-            ImGui::Text("Iter: %d", app->networkState.iterations);
             if (ImGui::Button("Stop Training"))
             {
                 app->networkState.isTraining = false;
             }
         }
 
-        ImGui::Separator();
-
-        // segment autoencoder
-        if (ImGui::Button("Restart Training Segment AE"))
+        // checkboxes (independent of training)
+        if (app->networkState.featuresAutoEncoder)
         {
-            if (app->animDatabase.valid && app->animDatabase.poseGenSegmentFlatDim > 0)
-            {
-                NetworkInitSegmentAutoEncoder(
-                    &app->networkState,
-                    app->animDatabase.poseGenSegmentFlatDim,
-                    128, true);
-            }
-            else
-            {
-                TraceLog(LOG_WARNING, "Cannot start segment AE: AnimDatabase not valid or no poseGenFeatures");
-            }
+            ImGui::Checkbox(
+                "Use Denoiser",
+                &app->config.useMMFeatureDenoiser);
         }
-
-        if (app->networkState.segmentAutoEncoder && !app->networkState.isTrainingSegmentAE)
-        {
-            if (ImGui::Button("Continue Segment AE"))
-            {
-                app->networkState.isTrainingSegmentAE = true;
-            }
-        }
-
-        if (app->networkState.isTrainingSegmentAE)
-        {
-            ImGui::Text("Seg AE Loss: %.4f (x100)", app->networkState.segmentAELoss * 100.0f);
-            ImGui::Text("Seg AE Iter: %d", app->networkState.segmentAEIterations);
-            if (ImGui::Button("Stop Segment AE"))
-            {
-                app->networkState.isTrainingSegmentAE = false;
-            }
-        }
-
         if (app->networkState.segmentAutoEncoder)
         {
-            ImGui::Checkbox("Test Segment AE", &app->config.testSegmentAutoEncoder);
+            ImGui::Checkbox(
+                "Test Segment AE",
+                &app->config.testSegmentAutoEncoder);
+        }
+
+        if (training || hasAEs)
+        {
+            ImGui::Separator();
+
+            ImGui::Text("Device: %s",
+                app->networkState.device.is_cuda()
+                    ? "GPU" : "CPU");
+
+            const int totalMin =
+                (int)(app->networkState
+                    .trainingElapsedSeconds / 60.0);
+            const int totalSec =
+                (int)(app->networkState
+                    .trainingElapsedSeconds) % 60;
+            ImGui::Text("Training: %dm %02ds",
+                totalMin, totalSec);
+
+            const bool headstart =
+                app->networkState
+                    .trainingElapsedSeconds
+                    < HEADSTART_SECONDS
+                && !app->networkState
+                    .segmentLatentAveragePredictor;
+            if (headstart)
+            {
+                const int remaining = (int)(
+                    HEADSTART_SECONDS
+                    - app->networkState
+                        .trainingElapsedSeconds);
+                ImGui::Text(
+                    "Headstart: %ds remaining",
+                    remaining);
+            }
+
+            ImGui::Separator();
+
+            ImGui::Text(
+                "Feature AE  Loss: %.6f  Iter: %d",
+                app->networkState.featureAELoss,
+                app->networkState.featureAEIterations);
+            ImGui::Text(
+                "Segment AE  Loss: %.6f  Iter: %d",
+                app->networkState.segmentAELoss,
+                app->networkState.segmentAEIterations);
+
+            if (app->networkState
+                    .segmentLatentAveragePredictor)
+            {
+                ImGui::Text(
+                    "Predictor   Loss: %.6f  Iter: %d",
+                    app->networkState.predictorLoss,
+                    app->networkState
+                        .predictorIterations);
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled(
+                    "Predictor: waiting for headstart");
+            }
         }
     }
     ImGui::End();
@@ -2034,31 +2142,14 @@ static void ApplicationUpdate(void* voidApplicationState)
         app->controlledCharacter.cursorBlendMode = app->config.cursorBlendMode;
         app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
 
-        // Choose update method based on animation mode
-        //if (app->config.animationMode == AnimationMode::SingleFrameReconstructFromSearch)
-        //{
-        //    // Network-based pose generation (simulated from database)
-        //    ControlledCharacterUpdateNetwork(
-        //        &app->controlledCharacter,
-        //        &app->characterData,
-        //        &app->animDatabase,
-        //        effectiveDt,
-        //        app->worldTime,
-        //        app->config,
-        //        &app->networkState);
-        //}
-        //else
-        {
-            // Standard cursor-based blending
-            ControlledCharacterUpdate(
-                &app->controlledCharacter,
-                &app->characterData,
-                &app->animDatabase,
-                effectiveDt,
-                app->worldTime,
-                app->config,
-                &app->networkState);
-        }
+        ControlledCharacterUpdate(
+            &app->controlledCharacter,
+            &app->characterData,
+            &app->animDatabase,
+            effectiveDt,
+            app->worldTime,
+            app->config,
+            &app->networkState);
 
     }
 
@@ -3580,9 +3671,38 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Done
 
-    // Update Neural Network
-    NetworkTrainFeaturesAutoEncoder(&app->networkState, &app->animDatabase);
-    NetworkTrainSegmentAutoEncoder(&app->networkState, &app->animDatabase);
+    // Update Neural Networks (all three, time-budgeted)
+    NetworkTrainAll(
+        &app->networkState, &app->animDatabase, 0.1);
+
+    // Auto-save every 5 minutes during training.
+    // Always overwrites the same "autosave" folder so we
+    // don't pile up folders over a long weekend run.
+    if (app->networkState.isTraining
+        && app->networkState.timeSinceLastAutoSave
+            >= AUTOSAVE_INTERVAL_SECONDS)
+    {
+        app->networkState.timeSinceLastAutoSave = 0.0;
+
+        const std::string autoSavePath = "saved/autosave";
+        if (!fs::exists("saved"))
+        {
+            fs::create_directories("saved");
+        }
+        if (!fs::exists(autoSavePath))
+        {
+            fs::create_directory(autoSavePath);
+        }
+
+        SaveConfigToFolder(
+            app->config,
+            app->characterData,
+            app->networkState,
+            autoSavePath);
+        app->savedConfigsNeedRefresh = true;
+        TraceLog(LOG_INFO, "Auto-saved to: %s",
+            autoSavePath.c_str());
+    }
 
     EndDrawing();
 }
