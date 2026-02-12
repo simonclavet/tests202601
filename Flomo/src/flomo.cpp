@@ -1563,6 +1563,7 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             {
                 db.featuresConfig = editedMMConfig;  // Copy all config including lookahead time and blend root modes
                 AnimDatabaseRebuild(&db, &app->characterData);
+                NetworkResetAll(&app->networkState);
                 app->animDatabaseRebuildPending = false;
                 TraceLog(LOG_INFO, "Motion matching config updated");
             }
@@ -1573,9 +1574,26 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
     ImGui::End();
 }
 
-static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, AppConfig* config)
+static inline void ImGuiPlayerControl(ApplicationState* app)
 {
-    if (!controlledCharacter->active) return;
+    ControlledCharacter* cc = &app->controlledCharacter;
+    AppConfig* config = &app->config;
+    if (!cc->active) return;
+
+    const bool hasPredictor =
+        static_cast<bool>(
+            app->networkState
+                .segmentLatentAveragePredictor);
+
+    // if current mode needs networks and there are none,
+    // fall back to motion matching
+    if (config->animationMode
+            == AnimationMode::AverageLatentPredictor
+        && !hasPredictor)
+    {
+        config->animationMode =
+            AnimationMode::MotionMatching;
+    }
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(220, 160), ImGuiCond_FirstUseEver);
@@ -1587,8 +1605,13 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
         {
             for (int i = 0; i < static_cast<int>(AnimationMode::COUNT); ++i)
             {
+                const AnimationMode mode =
+                    static_cast<AnimationMode>(i);
+                if (mode == AnimationMode::AverageLatentPredictor
+                    && !hasPredictor)
+                    continue;
                 const bool isSelected = (currentMode == i);
-                if (ImGui::Selectable(AnimationModeName(static_cast<AnimationMode>(i)), isSelected))
+                if (ImGui::Selectable(AnimationModeName(mode), isSelected))
                 {
                     config->animationMode = static_cast<AnimationMode>(i);
                 }
@@ -1600,7 +1623,7 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
             ImGui::EndCombo();
         }
 
-        PlayerControlInput& input = controlledCharacter->playerInput;
+        PlayerControlInput& input = cc->playerInput;
         ImGui::SliderFloat("Max Speed", &input.maxSpeed, 0.1f, 10.0f, "%.2f m/s");
         ImGui::SliderFloat("Virtual Accel", &config->virtualControlMaxAcceleration, 0.1f, 20.0f, "%.2f m/s2");
 
@@ -1611,8 +1634,8 @@ static inline void ImGuiPlayerControl(ControlledCharacter* controlledCharacter, 
         if (config->animationMode == AnimationMode::MotionMatching)
         {
             ImGui::Separator();
-            ImGui::Text("Best Frame: %d", controlledCharacter->mmBestFrame);
-            ImGui::Text("Best Cost: %.4f", controlledCharacter->mmBestCost);
+            ImGui::Text("Best Frame: %d", cc->mmBestFrame);
+            ImGui::Text("Best Cost: %.4f", cc->mmBestCost);
         }
     }
     ImGui::End();
@@ -3466,7 +3489,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Animation settings
         ImGuiAnimSettings(app);
 
-        ImGuiPlayerControl(&app->controlledCharacter, &app->config);
+        ImGuiPlayerControl(app);
 
         ImGuiSavedConfigs(app);
 

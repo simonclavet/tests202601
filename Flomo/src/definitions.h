@@ -207,6 +207,7 @@ struct AppConfig {
     float defaultBlendTime = 0.1f;  // time for blend cursor spring to reach 95% of target
     float switchInterval = 3.0f;    // time between random animation switches
     float mmSearchPeriod = 0.1f;    // time between motion matching searches
+    float inputDecidedSearchPeriod = 0.2f;  // cooldown for input-decided early searches
     float virtualControlMaxAcceleration = 4.0f;   // maximum acceleration for virtual control velocity (m/s^2)
 
     // Cursor blend mode settings
@@ -704,6 +705,10 @@ struct ControlledCharacter {
     int mmBestFrame = -1;           // best matching frame from last search
     float mmBestCost = 0.0f;        // cost of best match
     float mmSearchTimer = 0.0f;     // time since last search
+    Vector3 prevDesiredVelocity = Vector3Zero();
+    Vector3 prevDesiredAimDirection = { 0.0f, 0.0f, 1.0f };
+    float prevInputUpdateTimer = 0.0f;
+    float inputDecidedSearchCooldown = 0.0f;
 
     // Pose output (local space with root zeroed, then transformed to world)
     TransformData xformData;

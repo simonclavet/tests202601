@@ -902,6 +902,33 @@ static inline void NetworkInitAllForTraining(
         HEADSTART_SECONDS);
 }
 
+// reset all networks to null (e.g. after database rebuild
+// which invalidates feature dimensions)
+static inline void NetworkResetAll(NetworkState* state)
+{
+    state->isTraining = false;
+
+    state->featuresAutoEncoder = nullptr;
+    state->featureAEOptimizer = nullptr;
+    state->featureAELoss = 0.0f;
+    state->featureAEIterations = 0;
+
+    state->segmentAutoEncoder = nullptr;
+    state->segmentOptimizer = nullptr;
+    state->segmentAELoss = 0.0f;
+    state->segmentAEIterations = 0;
+
+    state->segmentLatentAveragePredictor = nullptr;
+    state->predictorOptimizer = nullptr;
+    state->predictorLoss = 0.0f;
+    state->predictorIterations = 0;
+
+    state->trainingElapsedSeconds = 0.0;
+    state->timeSinceLastAutoSave = 0.0;
+
+    TraceLog(LOG_INFO, "All networks reset.");
+}
+
 //---------------------------------------------------------
 // predict a full segment from raw motion features
 //---------------------------------------------------------

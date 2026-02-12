@@ -322,6 +322,44 @@ static void ControlledCharacterUpdate(
     }
 
     // --- Animation mode logic ---
+
+    // input decided search: detect sudden input changes
+    // and bring the next search forward
+    if (cc->animMode == AnimationMode::MotionMatching
+        || cc->animMode == AnimationMode::AverageLatentPredictor)
+    {
+        cc->inputDecidedSearchCooldown -= dt;
+        const Vector3 velDiff = Vector3Subtract(
+            cc->playerInput.desiredVelocity,
+            cc->prevDesiredVelocity);
+        const Vector3 aimDiff = Vector3Subtract(
+            cc->playerInput.desiredAimDirection,
+            cc->prevDesiredAimDirection);
+        const bool bigInputChange =
+            Vector3Length(velDiff) > 1.0f
+            || Vector3Length(aimDiff) > 0.5f;
+        if (bigInputChange
+            && cc->inputDecidedSearchCooldown <= 0.0f)
+        {
+            cc->mmSearchTimer =
+                fminf(cc->mmSearchTimer, 0.02f);
+            cc->inputDecidedSearchCooldown =
+                config.inputDecidedSearchPeriod;
+        }
+
+        // update prevs at fixed rate so slomo doesn't
+        // accumulate tiny deltas into a false trigger
+        cc->prevInputUpdateTimer -= dt;
+        if (cc->prevInputUpdateTimer <= 0.0f)
+        {
+            cc->prevInputUpdateTimer = 0.015f;
+            cc->prevDesiredVelocity =
+                cc->playerInput.desiredVelocity;
+            cc->prevDesiredAimDirection =
+                cc->playerInput.desiredAimDirection;
+        }
+    }
+
     if (firstFrame)
     {
         // spawn initial cursor at random position
