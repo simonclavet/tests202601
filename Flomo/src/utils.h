@@ -7,7 +7,8 @@
 //#include "assert.h"
 #include <cstdlib>
 #include <iostream>
-#include <span> 
+#include <span>
+#include <random>
 
 #ifdef __GNUC__
 #define ASSERT_EVEN_IN_RELEASE_FUNCTION __PRETTY_FUNCTION__
@@ -34,7 +35,14 @@
 template<typename... Ts>
 constexpr void unused(Ts&&...) {}
 
-
+// random int in [0, maxExclusive). Uses mt19937 so it works
+// for ranges way beyond MSVC's RAND_MAX of 32767.
+static inline int RandomInt(int maxExclusive)
+{
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(0, maxExclusive - 1);
+    return dist(rng);
+}
 
 //----------------------------------------------------------------------------------
 // Command Line Args
@@ -483,3 +491,13 @@ public:
         return data_.cend();
     }
 };
+
+
+using Clock = std::chrono::high_resolution_clock;
+// use Clock::time_point
+static inline double ElapsedSeconds(
+    Clock::time_point start)
+{
+    return std::chrono::duration<double>(
+        Clock::now() - start).count();
+}

@@ -139,11 +139,11 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = localRightVel.z;
     }
 
-    // ToeDiff: (left - right) in magic frame
+    // ToeDiff: (left - right) from blended segment data (crisp, not from FK chain)
     if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
     {
-        outFeatures[fi++] = localLeftPos.x - localRightPos.x;
-        outFeatures[fi++] = localLeftPos.z - localRightPos.z;
+        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.x;
+        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.z;
     }
 
 
@@ -304,6 +304,27 @@ static void ComputeMotionFeatures(
 
         outFeatures[fi++] = headToSlowest.x;
         outFeatures[fi++] = headToSlowest.z;
+    }
+
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage))
+    {
+        const int headIdx = db->headIndex;
+        Vector3 headPos = Vector3Zero();
+        if (headIdx >= 0 && headIdx < xform->jointCount)
+        {
+            headPos = xform->globalPositions[headIdx];
+        }
+
+       // Get positions in magic frame
+        const Vector3 magicToHead = Vector3Subtract(headPos, magicPos);
+        const Vector3 localHeadPos = Vector3RotateByQuaternion(magicToHead, invMagicWorldRot);
+
+        const Vector3 avgToePos = Vector3Lerp(localLeftPos, localRightPos, 0.5f);
+
+        const Vector3 headToAvg = Vector3Subtract(avgToePos, localHeadPos);
+
+        outFeatures[fi++] = headToAvg.x;
+        outFeatures[fi++] = headToAvg.z;
     }
 
     // FutureAccelClamped: predicted acceleration with dead zone and cap

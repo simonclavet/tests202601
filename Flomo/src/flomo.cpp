@@ -1580,20 +1580,14 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
     AppConfig* config = &app->config;
     if (!cc->active) return;
 
-    const bool hasPredictor =
-        static_cast<bool>(
-            app->networkState
-                .segmentLatentAveragePredictor);
+    const bool hasPredictor = static_cast<bool>(app->networkState.segmentLatentAveragePredictor);
+    const bool hasFlow = static_cast<bool>(app->networkState.latentFlowModel);
 
-    // if current mode needs networks and there are none,
-    // fall back to motion matching
-    if (config->animationMode
-            == AnimationMode::AverageLatentPredictor
-        && !hasPredictor)
-    {
-        config->animationMode =
-            AnimationMode::MotionMatching;
-    }
+    // if current mode needs networks and there are none, fall back to motion matching
+    if (config->animationMode == AnimationMode::AverageLatentPredictor && !hasPredictor)
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::FlowSampled && !hasFlow)
+        config->animationMode = AnimationMode::MotionMatching;
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(220, 160), ImGuiCond_FirstUseEver);
@@ -1605,10 +1599,10 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
         {
             for (int i = 0; i < static_cast<int>(AnimationMode::COUNT); ++i)
             {
-                const AnimationMode mode =
-                    static_cast<AnimationMode>(i);
-                if (mode == AnimationMode::AverageLatentPredictor
-                    && !hasPredictor)
+                const AnimationMode mode = static_cast<AnimationMode>(i);
+                if (mode == AnimationMode::AverageLatentPredictor && !hasPredictor)
+                    continue;
+                if (mode == AnimationMode::FlowSampled && !hasFlow)
                     continue;
                 const bool isSelected = (currentMode == i);
                 if (ImGui::Selectable(AnimationModeName(mode), isSelected))
@@ -1780,7 +1774,7 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
     ImGui::SetNextWindowPos(
         ImVec2(800, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(
-        ImVec2(280, 250), ImGuiCond_FirstUseEver);
+        ImVec2(300, 500), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Neural Networks"))
     {
         const bool training =
@@ -1876,28 +1870,64 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
 
             ImGui::Separator();
 
-            ImGui::Text(
-                "Feature AE  Loss: %.6f  Iter: %d",
-                app->networkState.featureAELoss,
-                app->networkState.featureAEIterations);
-            ImGui::Text(
-                "Segment AE  Loss: %.6f  Iter: %d",
-                app->networkState.segmentAELoss,
-                app->networkState.segmentAEIterations);
+            const NetworkState& ns = app->networkState;
+            const ImVec2 plotSize(0, 50);
 
-            if (app->networkState
-                    .segmentLatentAveragePredictor)
+            ImGui::Text("Feature AE  Loss: %.6f  Iter: %d", ns.featureAELoss, ns.featureAEIterations);
+            if (!ns.featureAELossHistory.empty())
             {
-                ImGui::Text(
-                    "Predictor   Loss: %.6f  Iter: %d",
-                    app->networkState.predictorLoss,
-                    app->networkState
-                        .predictorIterations);
+                ImGui::PlotLines("##featureAE",
+                    ns.featureAELossHistory.data(), (int)ns.featureAELossHistory.size(),
+                    0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+            }
+
+            ImGui::Text("Segment AE  Loss: %.6f  Iter: %d", ns.segmentAELoss, ns.segmentAEIterations);
+            if (!ns.segmentAELossHistory.empty())
+            {
+                ImGui::PlotLines("##segmentAE",
+                    ns.segmentAELossHistory.data(), (int)ns.segmentAELossHistory.size(),
+                    0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+            }
+
+            if (ns.segmentLatentAveragePredictor)
+            {
+                ImGui::Text("Predictor   Loss: %.6f  Iter: %d", ns.predictorLoss, ns.predictorIterations);
+                if (!ns.predictorLossHistory.empty())
+                {
+                    ImGui::PlotLines("##predictor",
+                        ns.predictorLossHistory.data(), (int)ns.predictorLossHistory.size(),
+                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                }
             }
             else if (training)
             {
-                ImGui::TextDisabled(
-                    "Predictor: waiting for headstart");
+                ImGui::TextDisabled("Predictor: waiting for headstart");
+            }
+
+            if (ns.latentFlowModel)
+            {
+                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d", ns.flowLoss, ns.flowIterations);
+                if (!ns.flowLossHistory.empty())
+                {
+                    ImGui::PlotLines("##flow",
+                        ns.flowLossHistory.data(), (int)ns.flowLossHistory.size(),
+                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                }
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("Flow: waiting for AE warmup");
+            }
+
+            if (ns.e2eIterations > 0)
+            {
+                ImGui::Text("End-to-End  Loss: %.6f  Iter: %d", ns.e2eLoss, ns.e2eIterations);
+                if (!ns.e2eLossHistory.empty())
+                {
+                    ImGui::PlotLines("##e2e",
+                        ns.e2eLossHistory.data(), (int)ns.e2eLossHistory.size(),
+                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                }
             }
         }
     }
@@ -3525,6 +3555,27 @@ static void ApplicationUpdate(void* voidApplicationState)
                         app->animDatabase.featureNames[fi].c_str() : "Feature";
                     ImGui::Text("%s: % .6f", fname, query[fi]);
                 }
+
+                // Blended pose features from controlled character
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.0f, 1.0f), "Pose Features (Blended)");
+                const ControlledCharacter& cc = app->controlledCharacter;
+                for (int side : sides)
+                {
+                    const char* s = StringFromSide(side);
+                    const Vector3& p = cc.toeBlendedPositionWorld[side];
+                    const Vector3& v = cc.toeBlendedVelocityWorld[side];
+                    ImGui::Text("%s ToePos:  % .3f % .3f % .3f", s, p.x, p.y, p.z);
+                    ImGui::Text("%s ToeVel:  % .3f % .3f % .3f (spd %.3f)", s, v.x, v.y, v.z, Vector3Length2D(v));
+                }
+                const Vector3& diff = cc.toeBlendedPosDiffRootSpace;
+                ImGui::Text("ToeDiff XZ:  % .3f % .3f", diff.x, diff.z);
+                ImGui::Text("ToeSpeedDiff: % .3f", cc.blendedToeSpeedDiff);
+                for (int side : sides)
+                {
+                    const Vector3& vt = cc.virtualToePos[side];
+                    ImGui::Text("%s Virtual: % .3f % .3f % .3f", StringFromSide(side), vt.x, vt.y, vt.z);
+                }
             }
             else
             {
@@ -3558,6 +3609,36 @@ static void ApplicationUpdate(void* voidApplicationState)
                             const char* fname = (fi < (int)app->animDatabase.featureNames.size()) ?
                                 app->animDatabase.featureNames[fi].c_str() : "Feature";
                             ImGui::Text("%s: % .6f", fname, featRow[fi]);
+                        }
+
+                        // Pose generation features for same frame
+                        if (app->animDatabase.poseGenFeaturesComputeDim > 0 &&
+                            app->animDatabase.poseGenFeatures.cols() > 0)
+                        {
+                            ImGui::Separator();
+                            ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.0f, 1.0f), "Pose Features (DB)");
+                            const int jc = app->animDatabase.jointCount;
+                            PoseFeatures pf;
+                            pf.DeserializeFrom(
+                                app->animDatabase.poseGenFeatures.row_view(motionIndex), jc);
+
+                            ImGui::Text("RootPos:   % .3f % .3f % .3f",
+                                pf.rootLocalPosition.x, pf.rootLocalPosition.y, pf.rootLocalPosition.z);
+                            ImGui::Text("RootVelXZ: % .3f % .3f",
+                                pf.lookaheadRootVelocity.x, pf.lookaheadRootVelocity.z);
+                            ImGui::Text("YawRate:   % .3f", pf.rootYawRate);
+                            for (int side : sides)
+                            {
+                                const char* s = StringFromSide(side);
+                                const Vector3& p = pf.lookaheadToePositionsRootSpace[side];
+                                const Vector3& v = pf.toeVelocitiesRootSpace[side];
+                                ImGui::Text("%s ToePos:  % .3f % .3f % .3f", s, p.x, p.y, p.z);
+                                ImGui::Text("%s ToeVel:  % .3f % .3f % .3f (spd %.3f)",
+                                    s, v.x, v.y, v.z, Vector3Length2D(v));
+                            }
+                            ImGui::Text("ToeDiff XZ:  % .3f % .3f",
+                                pf.toePosDiffRootSpace.x, pf.toePosDiffRootSpace.z);
+                            ImGui::Text("ToeSpeedDiff: % .3f", pf.toeSpeedDiff);
                         }
                     }
                     else

@@ -25,6 +25,151 @@ static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
     return -1;
 }
 
+constexpr int KMEANS_CLUSTER_COUNT = 500;
+constexpr double KMEANS_TIME_BUDGET_SECONDS = 10.0;
+
+// k-means clustering on normalizedFeatures for the legal start frames.
+// after this, db->clusterFrames[c] has the global frame indices for cluster c.
+// we use this for stratified sampling during training so rare motions
+// get proportionally more representation in each batch.
+static void AnimDatabaseClusterFeatures(AnimDatabase* db)
+{
+    const int numFrames = (int)db->legalStartFrames.size();
+    const int dim = db->featureDim;
+
+    if (numFrames == 0 || dim <= 0 || db->normalizedFeatures.empty())
+    {
+        db->clusterCount = 0;
+        db->clusterFrames.clear();
+        return;
+    }
+
+    const int k = (numFrames < KMEANS_CLUSTER_COUNT)
+        ? numFrames : KMEANS_CLUSTER_COUNT;
+
+    // centroids: k vectors of dim floats
+    std::vector<float> centroids(k * dim);
+
+    // seed centroids from k random legal frames (shuffle-pick to avoid dupes)
+    {
+        std::vector<int> indices(numFrames);
+        for (int i = 0; i < numFrames; ++i) indices[i] = i;
+
+        // fisher-yates for the first k elements
+        for (int i = 0; i < k; ++i)
+        {
+            const int j = i + RandomInt(numFrames - i);
+            std::swap(indices[i], indices[j]);
+        }
+        for (int c = 0; c < k; ++c)
+        {
+            const int frame = db->legalStartFrames[indices[c]];
+            std::span<const float> row = db->normalizedFeatures.row_view(frame);
+            memcpy(&centroids[c * dim], row.data(), dim * sizeof(float));
+        }
+    }
+
+    // assignments: which cluster each legal frame belongs to
+    std::vector<int> assignments(numFrames, 0);
+
+    const Clock::time_point start = Clock::now();
+    int iter = 0;
+    while (ElapsedSeconds(start) < KMEANS_TIME_BUDGET_SECONDS)
+    {
+        iter++;
+        // assign each frame to nearest centroid
+        for (int i = 0; i < numFrames; ++i)
+        {
+            const int frame = db->legalStartFrames[i];
+            std::span<const float> row = db->normalizedFeatures.row_view(frame);
+
+            float bestDist = FLT_MAX;
+            int bestCluster = 0;
+            for (int c = 0; c < k; ++c)
+            {
+                float dist = 0.0f;
+                const float* ctr = &centroids[c * dim];
+                for (int d = 0; d < dim; ++d)
+                {
+                    const float diff = row[d] - ctr[d];
+                    dist += diff * diff;
+                }
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestCluster = c;
+                }
+            }
+            assignments[i] = bestCluster;
+        }
+
+        // recompute centroids as mean of assigned frames
+        std::vector<float> sums(k * dim, 0.0f);
+        std::vector<int> counts(k, 0);
+
+        for (int i = 0; i < numFrames; ++i)
+        {
+            const int c = assignments[i];
+            const int frame = db->legalStartFrames[i];
+            std::span<const float> row = db->normalizedFeatures.row_view(frame);
+            float* dst = &sums[c * dim];
+            for (int d = 0; d < dim; ++d)
+                dst[d] += row[d];
+            counts[c]++;
+        }
+
+        for (int c = 0; c < k; ++c)
+        {
+            if (counts[c] == 0)
+            {
+                // empty cluster: re-seed from a random legal frame
+                const int ri = RandomInt(numFrames);
+                const int frame = db->legalStartFrames[ri];
+                std::span<const float> row = db->normalizedFeatures.row_view(frame);
+                memcpy(&centroids[c * dim], row.data(), dim * sizeof(float));
+            }
+            else
+            {
+                const float inv = 1.0f / (float)counts[c];
+                for (int d = 0; d < dim; ++d)
+                    centroids[c * dim + d] = sums[c * dim + d] * inv;
+            }
+        }
+    }
+
+    // build the per-cluster frame lists
+    db->clusterCount = k;
+    db->clusterFrames.resize(k);
+    for (int c = 0; c < k; ++c)
+        db->clusterFrames[c].clear();
+
+    for (int i = 0; i < numFrames; ++i)
+    {
+        const int c = assignments[i];
+        const int frame = db->legalStartFrames[i];
+        db->clusterFrames[c].push_back(frame);
+    }
+
+    // log some stats
+    int minSize = numFrames;
+    int maxSize = 0;
+    int nonEmpty = 0;
+    for (int c = 0; c < k; ++c)
+    {
+        const int sz = (int)db->clusterFrames[c].size();
+        if (sz > 0)
+        {
+            nonEmpty++;
+            if (sz < minSize) minSize = sz;
+            if (sz > maxSize) maxSize = sz;
+        }
+    }
+    TraceLog(LOG_INFO,
+        "AnimDatabase: k-means %d clusters (%d non-empty) in %d iters (%.1fs), sizes min=%d max=%d avg=%d",
+        k, nonEmpty, iter, ElapsedSeconds(start),
+        minSize, maxSize, numFrames / (nonEmpty > 0 ? nonEmpty : 1));
+}
+
 // Updated AnimDatabaseRebuild: require all animations to match canonical skeleton.
 // Populate localJointPositions/localJointRotations as well as global arrays.
 // If any clip mismatches jointCount we invalidate the DB (db->valid = false).
@@ -997,6 +1142,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     if (cfg.IsFeatureEnabled(FeatureType::PastPosition)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::AimDirection)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
     if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe)) db->featureDim += 2;
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
 
     db->features.clear();
@@ -1409,6 +1555,32 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             }
         }
 
+        // HEAD TO TOE AVERAGE: vector from head to the simple average of both toe positions
+        if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage))
+        {
+            const int headIdx = db->headIndex;
+            const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
+            const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
+
+            const Vector3 avgToePos = {
+                (localLeftPos.x + localRightPos.x) * 0.5f,
+                (localLeftPos.y + localRightPos.y) * 0.5f,
+                (localLeftPos.z + localRightPos.z) * 0.5f,
+            };
+            const Vector3 headToAvg = Vector3Subtract(avgToePos, localHeadPos);
+
+            featRow[currentFeature++] = headToAvg.x;
+            featRow[currentFeature++] = headToAvg.z;
+
+            if (isFirstFrame)
+            {
+                db->featureNames.push_back(string("HeadToToeAvgX"));
+                db->featureNames.push_back(string("HeadToToeAvgZ"));
+                db->featureTypes.push_back(FeatureType::HeadToToeAverage);
+                db->featureTypes.push_back(FeatureType::HeadToToeAverage);
+            }
+        }
+
         // FUTURE ACCELERATION CLAMPED: smoothed acceleration with dead zone and cap
         // mag < 1 m/s2 → 0, mag in [1,3] → remapped to [0,3], mag > 3 → clamped at 3
         if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped))
@@ -1585,13 +1757,23 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
         // Copy current toe velocities (not lookahead)
         // Sample at midpoint for better accuracy
-        span<const Vector3> jointVelRow = db->jointVelocitiesRootSpace.row_view(f);
+        span<const Vector3> jointVelRootSpaceRow = db->jointVelocitiesRootSpace.row_view(f);
         for (int side : sides)
         {
             const int toeIdx = db->toeIndices[side];
             assertEvenInRelease(toeIdx >= 0);
-            tempPose.toeVelocitiesRootSpace[side] = jointVelRow[toeIdx];
+            tempPose.toeVelocitiesRootSpace[side] = jointVelRootSpaceRow[toeIdx];
         }
+
+        // current-frame 2D toe position difference (crisp, directly from world positions)
+        const Vector3 leftToe = db->toePositionsRootSpace[SIDE_LEFT][f];
+        const Vector3 rightToe = db->toePositionsRootSpace[SIDE_RIGHT][f];
+        tempPose.toePosDiffRootSpace = { leftToe.x - rightToe.x, 0.0f, leftToe.z - rightToe.z };
+
+        // toe speed difference magnitude (always positive — can't regress to zero)
+        const float leftSpeedXZ = Vector3Length2D(jointVelRootSpaceRow[db->toeIndices[SIDE_LEFT]]);
+        const float rightSpeedXZ = Vector3Length2D(jointVelRootSpaceRow[db->toeIndices[SIDE_RIGHT]]);
+        tempPose.toeSpeedDiff = fabsf(leftSpeedXZ - rightSpeedXZ);
 
         // Serialize to flat array
         span<float> poseRow = db->poseGenFeatures.row_view(f);
@@ -1634,18 +1816,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             db->poseGenFeaturesStd[d] = (s > 1e-8f) ? s : 1.0f;
         }
 
-        // per-dim bone weight
-        // poseGenFeatures layout (compact — only bone 0 position):
-        //   [0 .. jc*6)          lookaheadLocalRotations (6 per joint)
-        //   [jc*6 .. jc*6+3)     rootLocalPosition (bone 0 only)
-        //   [jc*6+3 .. jc*6+6)   lookaheadRootVelocity
-        //   [jc*6+6]             rootYawRate
-        //   [jc*6+7 .. jc*6+13)  lookaheadToePositions (3 per side)
-        //   [jc*6+13 .. jc*6+19) toeVelocities (3 per side)
-        //
-        // bone weight lookup (same table as GetBoneWeight in networks.h)
+        // per-dim bone weight — we build a PoseFeatures where each component
+        // holds the weight we want for that dim, then serialize it. this way the
+        // layout is defined in one place (PoseFeatures::SerializeTo) and we don't
+        // have to manually track index offsets here.
         static const std::unordered_map<std::string, float> boneWeights = {
-            {"Simulation",0.0f},{"Hips",0.27089f},{"Spine",0.12777f},{"Spine1",0.10730f},
+            {"Hips",0.27089f},{"Spine",0.12777f},{"Spine1",0.10730f},
             {"Spine2",0.08734f},{"Spine3",0.07508f},{"Neck",0.00839f},{"Neck1",0.00640f},
             {"Head",0.00515f},{"HeadEnd",0.00063f},
             {"RightShoulder",0.02654f},{"RightArm",0.02061f},{"RightForeArm",0.00826f},
@@ -1657,63 +1833,37 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {"LeftUpLeg",0.05668f},{"LeftLeg",0.02034f},{"LeftFoot",0.00289f},
             {"LeftToeBase",0.00078f},{"LeftToeBaseEnd",0.00063f},
         };
-        const float defaultBoneWeight = 0.01f;
+        constexpr float defaultBoneWeight = 0.01f;
+        constexpr float nonRotWeight = 1.0f;
 
         const BVHData* skeleton = &characterData->bvhData[0];
 
-        // helper: get bone weight for joint index
-        auto boneWeightForJoint = [&](int j) -> float
+        // fill a PoseFeatures with weights instead of actual values,
+        // then serialize — each component becomes the weight for that dim
+        PoseFeatures weightPose;
+        weightPose.Resize(jc);
+
+        for (int j = 0; j < jc; ++j)
         {
             const std::string& name = skeleton->joints[j].name;
             auto it = boneWeights.find(name);
-            return (it != boneWeights.end()) ? it->second : defaultBoneWeight;
-        };
-
-        db->poseGenFeaturesWeight.resize(pgDim, defaultBoneWeight);
-
-        //const float hipsWeight = boneWeightForJoint(0);
-        int currentIndex = 0;
-
-        constexpr int rot6dDim = 6;
-        constexpr int vec3Dim = 3;
-
-        // rotations: dims [0, jc*6)
-        for (int j = 0; j < jc; ++j)
-        {
-            const float boneWeight = boneWeightForJoint(j);
-            for (int d = 0; d < rot6dDim; ++d)
-            {
-                db->poseGenFeaturesWeight[currentIndex++] = boneWeight;
-            }
+            float w = (it != boneWeights.end()) ? it->second : defaultBoneWeight;
+            w *= 5.0f; // scale up weights so the most important bones have weight around 1.0f, to avoid too small values after normalization
+            weightPose.lookaheadLocalRotations[j] = { w, w, w, w, w, w };
         }
+        weightPose.rootLocalPosition = { nonRotWeight, nonRotWeight, nonRotWeight };
+        weightPose.lookaheadRootVelocity = { nonRotWeight, nonRotWeight, nonRotWeight };
+        weightPose.rootYawRate = nonRotWeight;
+        for (int side : sides)
+        {
+            weightPose.lookaheadToePositionsRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
+            weightPose.toeVelocitiesRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
+        }
+        weightPose.toePosDiffRootSpace = { nonRotWeight, 0.0f, nonRotWeight };
+        weightPose.toeSpeedDiff = nonRotWeight;
 
-        // hips lookahead position (bone 0)
-        for (int d = 0; d < vec3Dim; ++d)
-        {
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-        }
-        // root velocity
-        for (int d = 0; d < vec3Dim; ++d)
-        {
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-        }
-        
-        // yaw rate
-        db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-
-        // toe positions + velocities
-        for (int d = 0; d < 3; ++d)
-        {
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-        }
-        for (int d = 0; d < 3; ++d)
-        {
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-            db->poseGenFeaturesWeight[currentIndex++] = 0.2f;
-        }
-
-        assert(currentIndex == pgDim);
+        db->poseGenFeaturesWeight.resize(pgDim);
+        weightPose.SerializeTo(db->poseGenFeaturesWeight);
 
         // compute normalizedPoseGenFeatures = (raw - mean) / std * weight
         db->normalizedPoseGenFeatures.resize(N, pgDim);

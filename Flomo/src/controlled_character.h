@@ -275,6 +275,55 @@ static void SpawnBlendCursorFromPredictor(
     cursor->segmentAnimTime = 0.0f;
 }
 
+// same thing but using the flow matching model for
+// diverse sampling instead of the average predictor
+static void SpawnBlendCursorFromFlow(
+    ControlledCharacter* cc,
+    const AnimDatabase* db,
+    NetworkState* networkState,
+    const std::vector<float>& query,
+    float blendTime,
+    bool immediate)
+{
+    for (int i = 0;
+        i < ControlledCharacter::MAX_BLEND_CURSORS;
+        ++i)
+    {
+        if (cc->cursors[i].active)
+            cc->cursors[i].targetWeight = 0.0f;
+    }
+
+    BlendCursor* cursor = FindAvailableCursor(cc);
+    assert(cursor != nullptr);
+    if (!cursor) return;
+
+    cursor->active = true;
+    cursor->animIndex = -1;
+    cursor->weightSpring = {};
+    cursor->fastWeightSpring = {};
+
+    if (immediate)
+    {
+        cursor->weightSpring.x = 1.0f;
+        cursor->weightSpring.xi = 1.0f;
+        cursor->fastWeightSpring.x = 1.0f;
+        cursor->fastWeightSpring.xi = 1.0f;
+    }
+
+    cursor->targetWeight = 1.0f;
+    cursor->blendTime = blendTime;
+    cursor->segmentFrameTime = db->animFrameTime[0];
+
+    if (!NetworkPredictSegmentFlow(
+        networkState, db, query, cursor->segment))
+    {
+        cursor->active = false;
+        return;
+    }
+
+    cursor->segmentAnimTime = 0.0f;
+}
+
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
 // - uses db->localJointPositions / localJointRotations6d for sampling (no per-frame global->local conversion)
 // - blends per-cursor root deltas in world-space (XZ + yaw) and applies to cc->world*
@@ -326,7 +375,8 @@ static void ControlledCharacterUpdate(
     // input decided search: detect sudden input changes
     // and bring the next search forward
     if (cc->animMode == AnimationMode::MotionMatching
-        || cc->animMode == AnimationMode::AverageLatentPredictor)
+        || cc->animMode == AnimationMode::AverageLatentPredictor
+        || cc->animMode == AnimationMode::FlowSampled)
     {
         cc->inputDecidedSearchCooldown -= dt;
         const Vector3 velDiff = Vector3Subtract(
@@ -380,7 +430,7 @@ static void ControlledCharacterUpdate(
         {
             assert(!db->legalStartFrames.empty()); // Legal start frames should always be populated by AnimDatabaseBuild
 
-            const int randomIndex = rand() % db->legalStartFrames.size();
+            const int randomIndex = RandomInt((int)db->legalStartFrames.size());
             const int selectedGlobalFrame = db->legalStartFrames[randomIndex];
             
             const int newAnimIdx = FindClipForMotionFrame(db, selectedGlobalFrame);
@@ -475,6 +525,21 @@ static void ControlledCharacterUpdate(
                 config.defaultBlendTime, false);
         }
     }
+    else if (cc->animMode == AnimationMode::FlowSampled)
+    {
+        // same timer pattern as AverageLatentPredictor but uses the flow model
+        // to sample diverse poses instead of just the average
+        cc->mmSearchTimer -= dt;
+        if (cc->mmSearchTimer <= 0.0f)
+        {
+            ComputeMotionFeatures(db, cc, cc->mmQuery);
+            cc->mmSearchTimer = config.mmSearchPeriod;
+
+            SpawnBlendCursorFromFlow(
+                cc, db, networkState, cc->mmQuery,
+                config.defaultBlendTime, false);
+        }
+    }
 
     // --- Update motion matching feature velocity (independent from actual velocity) ---
     // This velocity is used for FutureVel features and updated using maxAcceleration
@@ -525,21 +590,21 @@ static void ControlledCharacterUpdate(
             if (cur.segmentAnimTime > segMax)
             {
                 cur.segmentAnimTime = segMax;
-                static int lastWarnedCursor = -1;
-                static float lastWarnedTime = -1.0f;
-                if (lastWarnedCursor != ci || fabsf(lastWarnedTime - segMax) > 0.01f)
-                {
-                    TraceLog(LOG_WARNING, "Cursor %d reached end of segment (anim %d) at time %.2f - stopped advancing",
-                        ci, cur.animIndex, segMax);
-                    lastWarnedCursor = ci;
-                    lastWarnedTime = segMax;
-                }
+                //static int lastWarnedCursor = -1;
+                //static float lastWarnedTime = -1.0f;
+                //if (lastWarnedCursor != ci || fabsf(lastWarnedTime - segMax) > 0.01f)
+                //{
+                //    TraceLog(LOG_WARNING, "Cursor %d reached end of segment (anim %d) at time %.2f - stopped advancing",
+                //        ci, cur.animIndex, segMax);
+                //    lastWarnedCursor = ci;
+                //    lastWarnedTime = segMax;
+                //}
             }
 
             // Update weight via spring integrator
             DoubleSpringDamper(cur.weightSpring, cur.targetWeight, cur.blendTime, dt);
-            // Update fast weight via spring integrator (hardcoded 0.05s blend time)
-            DoubleSpringDamper(cur.fastWeightSpring, cur.targetWeight, 0.05f, dt);
+            // Update fast weight via spring integrator 
+            DoubleSpringDamper(cur.fastWeightSpring, cur.targetWeight, 0.07f, dt);
 
             // Clamp the output weights to [0, 1]
             cur.weightSpring.x = ClampZeroOne(cur.weightSpring.x);
@@ -597,6 +662,8 @@ static void ControlledCharacterUpdate(
     Vector3 toeBlendedPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedLookaheadPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
+    Vector3 toeBlendedPosDiffRootSpace = Vector3Zero();
+    float blendedToeSpeedDiff = 0.0f;
     
     Vector3 blendedRootVelocityRootSpace = Vector3Zero();
     Vector3 blendedLookaheadRootVelocityRootSpace = Vector3Zero();
@@ -684,13 +751,15 @@ static void ControlledCharacterUpdate(
             toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(toeVel, w));
         }
 
-        // old: sampling from db arrays (kept for reference)
-        // const int clipStart = db->clipStartFrame[cur.animIndex];
-        // GetInterFrameAlpha(db, cur.animIndex, cur.segmentAnimTime, f0, f1, interFrameAlpha);
-        // const int baseFrame = clipStart + f0;
-        // posRow0 = db->localJointPositions.row_view(baseFrame); etc.
-        // cur.sampledRootVelocityRootSpace = LerpFrames(&db->rootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
-        // cur.sampledLookaheadRootVelocityRootSpace = LerpFrames(&db->lookaheadRootMotionVelocitiesRootSpace[baseFrame], interFrameAlpha);
+        // toe position difference (left - right) in root space
+        const Vector3 toePosDiff = Vector3Lerp(
+            poseFeat0.toePosDiffRootSpace, poseFeat1.toePosDiffRootSpace, sAlpha);
+        toeBlendedPosDiffRootSpace = Vector3Add(toeBlendedPosDiffRootSpace, Vector3Scale(toePosDiff, w));
+
+        // toe speed difference magnitude (always positive)
+        const float speedDiff = Lerp(poseFeat0.toeSpeedDiff, poseFeat1.toeSpeedDiff, sAlpha);
+        blendedToeSpeedDiff += speedDiff * w;
+
     }
 
 
@@ -703,9 +772,8 @@ static void ControlledCharacterUpdate(
             Vector3RotateByQuaternion(toeBlendedPositionRootSpace[side], cc->worldRotation),
             cc->worldPosition);
     }
-    
-
- 
+    cc->toeBlendedPosDiffRootSpace = toeBlendedPosDiffRootSpace;
+    cc->blendedToeSpeedDiff = blendedToeSpeedDiff;
 
     // --- Rot6d blending using normalized weights
     std::vector<Vector3> blendedLocalPositions(jc); // only root will be blended, others are static offsets
@@ -1028,6 +1096,11 @@ static void ControlledCharacterUpdate(
     const float toeAlpha = dt / lookaheadTime;
     assert(toeAlpha <= 1.0f);
 
+    // determine which foot should be faster from blended velocities
+    const float leftBlendedSpeed = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
+    const float rightBlendedSpeed = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
+    const int fastSide = (leftBlendedSpeed >= rightBlendedSpeed) ? SIDE_LEFT : SIDE_RIGHT;
+
     for (int side : sides)
     {
         if (!cc->lookaheadDragToePosInitialized)
@@ -1087,6 +1160,23 @@ static void ControlledCharacterUpdate(
                         newVirtualToePos.x = prevVirtualToePos.x + displacement.x * scale;
                         newVirtualToePos.z = prevVirtualToePos.z + displacement.z * scale;
                         // Y is NOT clamped - height should track target directly
+                    }
+
+                    // speed floor: fast foot must move at least toeSpeedDiff faster than slow foot
+                    // since slow foot is typically near-stationary, floor ≈ toeSpeedDiff
+                    constexpr bool doFastFootVelFloor = false;
+                    if (doFastFootVelFloor && side == fastSide && cc->blendedToeSpeedDiff > 0.1f)
+                    {
+                        const Vector3 postClampDisp = Vector3Subtract(newVirtualToePos, prevVirtualToePos);
+                        const float postClampDistXZ = Vector3Length2D(postClampDisp);
+                        const float minDistXZ = cc->blendedToeSpeedDiff * dt;
+                        if (postClampDistXZ < minDistXZ)
+                        {
+                            // scale in original target direction to enforce minimum speed
+                            const float scale = minDistXZ / distXZ;
+                            newVirtualToePos.x = prevVirtualToePos.x + displacement.x * scale;
+                            newVirtualToePos.z = prevVirtualToePos.z + displacement.z * scale;
+                        }
                     }
                 }
             }

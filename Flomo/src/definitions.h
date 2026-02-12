@@ -9,6 +9,7 @@ enum class AnimationMode : int
     RandomSwitch = 0,              // randomly switch between animations
     MotionMatching,                // use motion matching to find best animation
     AverageLatentPredictor,            // features -> predictor -> decoded pose segment
+    FlowSampled,                       // flow matching: diverse pose sampling
     COUNT
 };
 
@@ -19,6 +20,7 @@ static inline const char* AnimationModeName(AnimationMode mode)
     case AnimationMode::RandomSwitch: return "Random Switch";
     case AnimationMode::MotionMatching: return "Motion Matching";
     case AnimationMode::AverageLatentPredictor: return "Average Latent Predictor";
+    case AnimationMode::FlowSampled: return "Flow Sampled";
     default: return "Unknown";
     }
 }
@@ -54,6 +56,7 @@ enum class FeatureType : int
     PastPosition,        // past hip position (XZ) in current hip horizontal frame => 2 dims
     AimDirection,        // aim direction (head→rightHand) at trajectory times => 2 * points
     HeadToSlowestToe,    // head to slowest foot vector (XZ) in root space => 2 dims
+    HeadToToeAverage,    // head to average of both toe positions (XZ) in root space => 2 dims
     FutureAccelClamped,  // future root acceleration clamped: dead zone below 1m/s2, capped at 3m/s2 => 2 * points
 
     COUNT                // Must be last - used for array sizing
@@ -73,6 +76,7 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::PastPosition: return "Past Position";
     case FeatureType::AimDirection: return "Aim Direction";
     case FeatureType::HeadToSlowestToe: return "Head To Slowest Toe";
+    case FeatureType::HeadToToeAverage: return "Head To Toe Average";
     case FeatureType::FutureAccelClamped: return "Future Accel Clamped";
     default: return "Unknown";
     }
@@ -266,17 +270,28 @@ struct PoseFeatures
     Vector3 lookaheadToePositionsRootSpace[SIDES_COUNT];  // [left, right]
     Vector3 toeVelocitiesRootSpace[SIDES_COUNT];          // [left, right] current velocities
 
-    // flat layout: [jc*6 rotations] [3 rootPos] [3 rootVel] [1 yawRate] [6 toePos] [6 toeVel]
+    // 2D (XZ) difference between left and right toe positions in root space (current frame)
+    // crisp direct signal from joint world positions — doesn't go through FK chain
+    Vector3 toePosDiffRootSpace;                              // only x,z used; serialized as 2 floats
+
+    // magnitude of XZ speed difference between left and right toes in root space
+    // always >= 0, so the network can't regress it to zero without penalty
+    // at runtime we pick the fast foot from blended velocities, then enforce this contrast
+    float toeSpeedDiff = 0.0f;
+
+    // flat layout: [jc*6 rotations] [3 rootPos] [2 rootVelXZ] [1 yawRate] [6 toePos] [6 toeVel] [2 toeDiff] [1 toeSpeedDiff]
     static int GetDim(int jointCount)
     {
         int dim = 0;
         dim += jointCount * 6;  // lookaheadLocalRotations (Rot6d per joint)
         dim += 3;               // rootLocalPosition (bone 0 only)
-        dim += 3;               // lookaheadRootVelocity (Vector3)
+        dim += 2;               // lookaheadRootVelocity (horizontal XZ only)
         dim += 1;               // rootYawRate (float)
         dim += 3 * 2;           // lookaheadToePositionsRootSpace (Vector3 x 2 sides)
         dim += 3 * 2;           // toeVelocitiesRootSpace (Vector3 x 2 sides)
-        return dim;             // = jc*6 + 19
+        dim += 2;               // toePosDiffRootSpace (XZ only)
+        dim += 1;               // toeSpeedDiff (scalar)
+        return dim;             // = jc*6 + 21
     }
 
     void Resize(int jointCount)
@@ -290,6 +305,8 @@ struct PoseFeatures
             lookaheadToePositionsRootSpace[side] = Vector3Zero();
             toeVelocitiesRootSpace[side] = Vector3Zero();
         }
+        toePosDiffRootSpace = Vector3Zero();
+        toeSpeedDiff = 0.0f;
     }
 
     void SerializeTo(std::span<float> dest) const
@@ -311,7 +328,6 @@ struct PoseFeatures
         dest[idx++] = rootLocalPosition.z;
 
         dest[idx++] = lookaheadRootVelocity.x;
-        dest[idx++] = lookaheadRootVelocity.y;
         dest[idx++] = lookaheadRootVelocity.z;
 
         dest[idx++] = rootYawRate;
@@ -329,6 +345,11 @@ struct PoseFeatures
             dest[idx++] = toeVelocitiesRootSpace[side].y;
             dest[idx++] = toeVelocitiesRootSpace[side].z;
         }
+
+        dest[idx++] = toePosDiffRootSpace.x;
+        dest[idx++] = toePosDiffRootSpace.z;
+
+        dest[idx++] = toeSpeedDiff;
 
         assert(idx == GetDim((int)lookaheadLocalRotations.size()));
     }
@@ -354,7 +375,7 @@ struct PoseFeatures
         rootLocalPosition.z = src[idx++];
 
         lookaheadRootVelocity.x = src[idx++];
-        lookaheadRootVelocity.y = src[idx++];
+        lookaheadRootVelocity.y = 0.0f;
         lookaheadRootVelocity.z = src[idx++];
 
         rootYawRate = src[idx++];
@@ -372,6 +393,12 @@ struct PoseFeatures
             toeVelocitiesRootSpace[side].y = src[idx++];
             toeVelocitiesRootSpace[side].z = src[idx++];
         }
+
+        toePosDiffRootSpace.x = src[idx++];
+        toePosDiffRootSpace.y = 0.0f;
+        toePosDiffRootSpace.z = src[idx++];
+
+        toeSpeedDiff = src[idx++];
 
         assert(idx == GetDim((int)lookaheadLocalRotations.size()));
 
@@ -488,7 +515,7 @@ struct AnimDatabase
     // This is what the network should output given the motion matching features as input
     int poseGenFeaturesComputeDim = -1;        
     Array2D<float> poseGenFeatures;            // [motionFrameCount x poseGenFeaturesComputeDim]
-    float poseGenFeaturesSegmentLength = 0.5f; // how many seconds of poseGenFeatures a cursor copies
+    float poseGenFeaturesSegmentLength = 0.4f; // how many seconds of poseGenFeatures a cursor copies
 
     // normalization for poseGenFeatures (for segment autoencoder training)
     std::vector<float> poseGenFeaturesMean;    // per-dim mean [poseGenFeaturesComputeDim]
@@ -499,6 +526,11 @@ struct AnimDatabase
     // segment autoencoder sizing (computed at build time from frame rate and segmentLength)
     int poseGenSegmentFrameCount = -1;         // how many frames in a segment
     int poseGenSegmentFlatDim = -1;            // poseGenSegmentFrameCount * poseGenFeaturesComputeDim
+
+    // k-means clusters on normalizedFeatures for stratified training sampling
+    // clusterFrames[c] holds the global frame indices belonging to cluster c
+    int clusterCount = 0;
+    std::vector<std::vector<int>> clusterFrames;
 };
 
 
@@ -556,6 +588,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->normalizedPoseGenFeatures.clear();
     db->poseGenSegmentFrameCount = -1;
     db->poseGenSegmentFlatDim = -1;
+    db->clusterCount = 0;
+    db->clusterFrames.clear();
 }
 
 
@@ -771,6 +805,8 @@ struct ControlledCharacter {
     Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
     Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities
     Vector3 toeBlendedPositionWorld[SIDES_COUNT];      // blended from cursor toe positions
+    float blendedToeSpeedDiff = 0.0f;                 // from network-predicted pose features
+    Vector3 toeBlendedPosDiffRootSpace;                // blended (left-right) toe diff from segments
     bool toeTrackingPreIKInitialized = false;
 
     Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)
@@ -800,6 +836,23 @@ struct ControlledCharacter {
 };
 
 //----------------------------------------------------------------------------------
+// Flow Model with Residual Connections
+//----------------------------------------------------------------------------------
+
+struct FlowModelImpl : torch::nn::Module
+{
+    torch::nn::Linear inputProj{ nullptr };
+    torch::nn::Linear res1a{ nullptr }, res1b{ nullptr };
+    torch::nn::Linear res2a{ nullptr }, res2b{ nullptr };
+    torch::nn::Linear res3a{ nullptr }, res3b{ nullptr };
+    torch::nn::Linear outputProj{ nullptr };
+
+    FlowModelImpl(int inputDim, int hiddenDim, int outputDim);
+    torch::Tensor forward(const torch::Tensor& x);
+};
+TORCH_MODULE(FlowModel);
+
+//----------------------------------------------------------------------------------
 // Neural Network state
 //----------------------------------------------------------------------------------
 
@@ -812,6 +865,7 @@ struct NetworkState {
     std::shared_ptr<torch::optim::Adam> featureAEOptimizer =
         nullptr;
     float featureAELoss = 0.0f;
+    float featureAELossSmoothed = 0.0f;
     int featureAEIterations = 0;
 
     // segment autoencoder
@@ -819,6 +873,7 @@ struct NetworkState {
     std::shared_ptr<torch::optim::Adam> segmentOptimizer =
         nullptr;
     float segmentAELoss = 0.0f;
+    float segmentAELossSmoothed = 0.0f;
     int segmentAEIterations = 0;
 
     // segment latent average predictor
@@ -827,7 +882,33 @@ struct NetworkState {
     std::shared_ptr<torch::optim::Adam> predictorOptimizer =
         nullptr;
     float predictorLoss = 0.0f;
+    float predictorLossSmoothed = 0.0f;
     int predictorIterations = 0;
+
+
+    // latent flow matching
+    FlowModel latentFlowModel = nullptr;
+//    torch::nn::Sequential latentFlowModel = nullptr;
+    std::shared_ptr<torch::optim::Adam> flowOptimizer =
+        nullptr;
+    float flowLoss = 0.0f;
+    float flowLossSmoothed = 0.0f;
+    int flowIterations = 0;
+
+    // end-to-end training (features → encode → predict → decode → segment)
+    float e2eLoss = 0.0f;
+    float e2eLossSmoothed = 0.0f;
+    int e2eIterations = 0;
+
+    // loss history — one sample every LOSS_LOG_INTERVAL_SECONDS,
+    // all networks logged at the same time so curves are directly comparable
+    std::vector<float> lossHistoryTime;         // training elapsed seconds
+    std::vector<float> featureAELossHistory;
+    std::vector<float> segmentAELossHistory;
+    std::vector<float> predictorLossHistory;
+    std::vector<float> flowLossHistory;
+    std::vector<float> e2eLossHistory;
+    double timeSinceLastLossLog = 0.0;
 
     // unified training timing
     double trainingElapsedSeconds = 0.0;

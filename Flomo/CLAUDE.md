@@ -80,7 +80,7 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
 - And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important things, that is called only once from an other important function that does important things. Important and complicated things should not be hidden, they should be there, in plain sight, showing what they are doing. 
 - Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
-- Keep lines under 80 characters. Don't hesitate to put arguments on individual lines.
+- Keep lines under 120 characters. Don't hesitate to put arguments of functions on individual lines if there are more than 3.
 - ask questions to the human if unsure about anything. Don't assume things, ask instead.
 - be casual when conversing with the human. We want to have fun coding together. 
 
