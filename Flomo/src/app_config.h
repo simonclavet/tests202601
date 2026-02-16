@@ -41,6 +41,9 @@ static inline void MotionMatchingConfigFromJson(const char* jsonBuffer, MotionMa
         ParseIntValue(jsonBuffer, "blendRootModePosition", static_cast<int>(config.blendRootModePosition)));
     config.blendRootModeRotation = static_cast<BlendRootModeRotation>(
         ParseIntValue(jsonBuffer, "blendRootModeRotation", static_cast<int>(config.blendRootModeRotation)));
+    config.aimDirectionMode = static_cast<AimDirectionMode>(
+        ParseIntValue(jsonBuffer, "aimDirectionMode",
+            static_cast<int>(config.aimDirectionMode)));
 
     // Parse future trajectory times array
     // Look for "futureTrajPointTimes": [0.2, 0.4, 0.8]
@@ -100,6 +103,7 @@ static inline std::string MotionMatchingConfigToJson(const MotionMatchingFeature
     oss << "  \"poseDragLookaheadTime\": " << config.poseDragLookaheadTime << ",\n";
     oss << "  \"blendRootModePosition\": " << static_cast<int>(config.blendRootModePosition) << ",\n";
     oss << "  \"blendRootModeRotation\": " << static_cast<int>(config.blendRootModeRotation) << ",\n";
+    oss << "  \"aimDirectionMode\": " << static_cast<int>(config.aimDirectionMode) << ",\n";
 
     oss << "  \"futureTrajPointTimes\": [";
     for (size_t i = 0; i < config.futureTrajPointTimes.size(); ++i)

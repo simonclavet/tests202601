@@ -10,6 +10,11 @@ enum class AnimationMode : int
     MotionMatching,                // use motion matching to find best animation
     AverageLatentPredictor,            // features -> predictor -> decoded pose segment
     FlowSampled,                       // flow matching: diverse pose sampling
+    FullFlowSampled,                   // full-space flow matching (no AEs)
+    FridayFlow,                        // frame-by-frame flow in pose latent space
+    SinglePosePredictor,               // deterministic: features -> pose latent -> decoded pose
+    UnconditionedAdvance,              // hybrid: conditioned search + unconditioned latent advance
+    MondayPredictor,                   // conditioned delta: (features, pose latent) → pose latent delta
     COUNT
 };
 
@@ -21,6 +26,11 @@ static inline const char* AnimationModeName(AnimationMode mode)
     case AnimationMode::MotionMatching: return "Motion Matching";
     case AnimationMode::AverageLatentPredictor: return "Average Latent Predictor";
     case AnimationMode::FlowSampled: return "Flow Sampled";
+    case AnimationMode::FullFlowSampled: return "Full Flow Sampled";
+    case AnimationMode::FridayFlow: return "Friday Flow";
+    case AnimationMode::SinglePosePredictor: return "Single Pose Predictor";
+    case AnimationMode::UnconditionedAdvance: return "Unconditioned Advance";
+    case AnimationMode::MondayPredictor: return "Monday Predictor";
     default: return "Unknown";
     }
 }
@@ -49,7 +59,7 @@ enum class FeatureType : int
 {
     ToePos = 0,          // left+right toe positions (X,Z) => 4 dims
     ToeVel,              // left+right toe velocities (X,Z) => 4 dims
-    ToeDiff,             // left-right difference (X,Z) => 2 dims
+    ToePosDiff,          // left-right difference (X,Z) => 2 dims
     FutureVel,           // future root velocity (XZ) at sample points => 2 * points
     FutureVelClamped,    // future root velocity clamped to max magnitude (XZ) => 2 * points
     FutureSpeed,         // future root speed (scalar) at sample points => 1 * points
@@ -69,7 +79,7 @@ static inline const char* FeatureTypeName(FeatureType type)
     {
     case FeatureType::ToePos: return "Toe Position";
     case FeatureType::ToeVel: return "Toe Velocity";
-    case FeatureType::ToeDiff: return "Toe Difference";
+    case FeatureType::ToePosDiff: return "Toe Pos Difference";
     case FeatureType::FutureVel: return "Future Velocity";
     case FeatureType::FutureVelClamped: return "Future Vel Clamped";
     case FeatureType::FutureSpeed: return "Future Speed";
@@ -118,6 +128,29 @@ static inline const char* BlendRootModeRotationName(BlendRootModeRotation mode)
     }
 }
 
+enum class AimDirectionMode : int
+{
+    HeadToRightHand = 0,
+    HeadDirection,
+    HipsDirection,
+    COUNT
+};
+
+static inline const char* AimDirectionModeName(
+    AimDirectionMode mode)
+{
+    switch (mode)
+    {
+    case AimDirectionMode::HeadToRightHand:
+        return "Head to Right Hand";
+    case AimDirectionMode::HeadDirection:
+        return "Head Direction";
+    case AimDirectionMode::HipsDirection:
+        return "Hips Direction";
+    default: return "Unknown";
+    }
+}
+
 struct MotionMatchingFeaturesConfig
 {
     float featureTypeWeights[static_cast<int>(FeatureType::COUNT)];
@@ -130,6 +163,10 @@ struct MotionMatchingFeaturesConfig
     // Blend root mode settings
     BlendRootModePosition blendRootModePosition = BlendRootModePosition::Hips;
     BlendRootModeRotation blendRootModeRotation = BlendRootModeRotation::Hips;
+
+    // What direction the AimDirection feature tracks
+    AimDirectionMode aimDirectionMode =
+        AimDirectionMode::HeadToRightHand;
 
     MotionMatchingFeaturesConfig()
     {
@@ -230,6 +267,7 @@ struct AppConfig {
     // Neural Network settings
     bool useMMFeatureDenoiser = false;
     bool testSegmentAutoEncoder = false;
+    bool testPoseAutoEncoder = false;
 
     // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
@@ -269,17 +307,19 @@ struct PoseFeatures
     // Foot IK data (lookahead positions, current velocities for speed clamping)
     Vector3 lookaheadToePositionsRootSpace[SIDES_COUNT];  // [left, right]
     Vector3 toeVelocitiesRootSpace[SIDES_COUNT];          // [left, right] current velocities
+    Vector3 nextToeVelocitiesRootSpace[SIDES_COUNT];      // [left, right] next-frame velocities (for MM query)
 
     // 2D (XZ) difference between left and right toe positions in root space (current frame)
     // crisp direct signal from joint world positions — doesn't go through FK chain
     Vector3 toePosDiffRootSpace;                              // only x,z used; serialized as 2 floats
+    Vector3 nextToePosDiffRootSpace;                          // next-frame toe pos diff (for MM query)
 
     // magnitude of XZ speed difference between left and right toes in root space
     // always >= 0, so the network can't regress it to zero without penalty
     // at runtime we pick the fast foot from blended velocities, then enforce this contrast
     float toeSpeedDiff = 0.0f;
 
-    // flat layout: [jc*6 rotations] [3 rootPos] [2 rootVelXZ] [1 yawRate] [6 toePos] [6 toeVel] [2 toeDiff] [1 toeSpeedDiff]
+    // flat layout: [jc*6 rotations] [3 rootPos] [2 rootVelXZ] [1 yawRate] [6 toePos] [6 toeVel] [6 nextToeVel] [2 toePosDiff] [2 nextToePosDiff] [1 toeSpeedDiff]
     static int GetDim(int jointCount)
     {
         int dim = 0;
@@ -289,9 +329,11 @@ struct PoseFeatures
         dim += 1;               // rootYawRate (float)
         dim += 3 * 2;           // lookaheadToePositionsRootSpace (Vector3 x 2 sides)
         dim += 3 * 2;           // toeVelocitiesRootSpace (Vector3 x 2 sides)
+        dim += 3 * 2;           // nextToeVelocitiesRootSpace (Vector3 x 2 sides)
         dim += 2;               // toePosDiffRootSpace (XZ only)
+        dim += 2;               // nextToePosDiffRootSpace (XZ only)
         dim += 1;               // toeSpeedDiff (scalar)
-        return dim;             // = jc*6 + 21
+        return dim;             // = jc*6 + 29
     }
 
     void Resize(int jointCount)
@@ -304,8 +346,10 @@ struct PoseFeatures
         {
             lookaheadToePositionsRootSpace[side] = Vector3Zero();
             toeVelocitiesRootSpace[side] = Vector3Zero();
+            nextToeVelocitiesRootSpace[side] = Vector3Zero();
         }
         toePosDiffRootSpace = Vector3Zero();
+        nextToePosDiffRootSpace = Vector3Zero();
         toeSpeedDiff = 0.0f;
     }
 
@@ -346,8 +390,18 @@ struct PoseFeatures
             dest[idx++] = toeVelocitiesRootSpace[side].z;
         }
 
+        for (int side : sides)
+        {
+            dest[idx++] = nextToeVelocitiesRootSpace[side].x;
+            dest[idx++] = nextToeVelocitiesRootSpace[side].y;
+            dest[idx++] = nextToeVelocitiesRootSpace[side].z;
+        }
+
         dest[idx++] = toePosDiffRootSpace.x;
         dest[idx++] = toePosDiffRootSpace.z;
+
+        dest[idx++] = nextToePosDiffRootSpace.x;
+        dest[idx++] = nextToePosDiffRootSpace.z;
 
         dest[idx++] = toeSpeedDiff;
 
@@ -394,9 +448,20 @@ struct PoseFeatures
             toeVelocitiesRootSpace[side].z = src[idx++];
         }
 
+        for (int side : sides)
+        {
+            nextToeVelocitiesRootSpace[side].x = src[idx++];
+            nextToeVelocitiesRootSpace[side].y = src[idx++];
+            nextToeVelocitiesRootSpace[side].z = src[idx++];
+        }
+
         toePosDiffRootSpace.x = src[idx++];
         toePosDiffRootSpace.y = 0.0f;
         toePosDiffRootSpace.z = src[idx++];
+
+        nextToePosDiffRootSpace.x = src[idx++];
+        nextToePosDiffRootSpace.y = 0.0f;
+        nextToePosDiffRootSpace.z = src[idx++];
 
         toeSpeedDiff = src[idx++];
 
@@ -507,6 +572,8 @@ struct AnimDatabase
     std::vector<FeatureType> featureTypes;      // which FeatureType each feature dimension belongs to
 
     std::vector<float> featuresMean;            // mean of each feature dimension [featureDim]
+    std::vector<float> featuresMin;             // per-dim min from mocap data [featureDim]
+    std::vector<float> featuresMax;             // per-dim max from mocap data [featureDim]
     float featureTypesStd[static_cast<int>(FeatureType::COUNT)] = {};  // std shared by all features of same type
     Array2D<float> normalizedFeatures;          // normalized features [motionFrameCount x featureDim]
 
@@ -520,6 +587,8 @@ struct AnimDatabase
     // normalization for poseGenFeatures (for segment autoencoder training)
     std::vector<float> poseGenFeaturesMean;    // per-dim mean [poseGenFeaturesComputeDim]
     std::vector<float> poseGenFeaturesStd;     // per-dim std [poseGenFeaturesComputeDim]
+    std::vector<float> poseGenFeaturesMin;     // per-dim min from mocap data [poseGenFeaturesComputeDim]
+    std::vector<float> poseGenFeaturesMax;     // per-dim max from mocap data [poseGenFeaturesComputeDim]
     std::vector<float> poseGenFeaturesWeight;  // per-dim bone weight [poseGenFeaturesComputeDim]
     Array2D<float> normalizedPoseGenFeatures;  // (raw - mean) / std * weight [motionFrameCount x poseGenFeaturesComputeDim]
 
@@ -578,12 +647,16 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->featureNames.clear();
     db->featureTypes.clear();
     db->featuresMean.clear();
+    db->featuresMin.clear();
+    db->featuresMax.clear();
     for (int i = 0; i < static_cast<int>(FeatureType::COUNT); ++i) db->featureTypesStd[i] = 0.0f;
     db->normalizedFeatures.clear();
     db->poseGenFeaturesComputeDim = -1;
     db->poseGenFeatures.clear();
     db->poseGenFeaturesMean.clear();
     db->poseGenFeaturesStd.clear();
+    db->poseGenFeaturesMin.clear();
+    db->poseGenFeaturesMax.clear();
     db->poseGenFeaturesWeight.clear();
     db->normalizedPoseGenFeatures.clear();
     db->poseGenSegmentFrameCount = -1;
@@ -803,10 +876,12 @@ struct ControlledCharacter {
     // Toe velocity tracking
     Vector3 prevToeGlobalPosPreIK[SIDES_COUNT];   // previous frame positions (before IK)
     Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
-    Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities
+    Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities (current frame)
+    Vector3 nextToeBlendedVelocityWorld[SIDES_COUNT];  // blended from cursor next-frame toe velocities (for MM query)
     Vector3 toeBlendedPositionWorld[SIDES_COUNT];      // blended from cursor toe positions
     float blendedToeSpeedDiff = 0.0f;                 // from network-predicted pose features
     Vector3 toeBlendedPosDiffRootSpace;                // blended (left-right) toe diff from segments
+    Vector3 nextToeBlendedPosDiffRootSpace;            // blended next-frame toe pos diff (for MM query)
     bool toeTrackingPreIKInitialized = false;
 
     Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)
@@ -833,6 +908,17 @@ struct ControlledCharacter {
     std::vector<HistoryPoint> positionHistory;
     double lastHistorySampleTime = 0.0f;
 
+    // FridayFlow: frame-by-frame latent state
+    std::vector<float> fridayFlowLatent;
+    bool fridayFlowInitialized = false;
+
+    // UnconditionedAdvance: pose latent state
+    std::vector<float> uncondAdvanceLatent;
+    bool uncondAdvanceInitialized = false;
+
+    // MondayPredictor: pose latent state
+    std::vector<float> mondayLatent;
+    bool mondayInitialized = false;
 };
 
 //----------------------------------------------------------------------------------
@@ -853,6 +939,37 @@ struct FlowModelImpl : torch::nn::Module
 TORCH_MODULE(FlowModel);
 
 //----------------------------------------------------------------------------------
+// Full-space Flow Model (condition re-injected at each layer)
+//----------------------------------------------------------------------------------
+
+struct FullFlowModelImpl : torch::nn::Module
+{
+    torch::nn::Linear layer1{nullptr};
+    torch::nn::Linear layer2{nullptr};
+    torch::nn::Linear outputLayer{nullptr};
+    int condTimeDim = 0;
+
+    FullFlowModelImpl(int featureDim, int flatDim);
+    torch::Tensor forward(const torch::Tensor& xt,
+                          const torch::Tensor& condTime);
+};
+TORCH_MODULE(FullFlowModel);
+
+// frame-by-frame flow matching in pose latent space
+struct FridayFlowModelImpl : torch::nn::Module
+{
+    torch::nn::Linear layer1{nullptr};
+    torch::nn::Linear layer2{nullptr};
+    torch::nn::Linear outputLayer{nullptr};
+    int condTimeDim = 0;
+
+    FridayFlowModelImpl(int featureDim, int poseLatentDim);
+    torch::Tensor forward(const torch::Tensor& xt,
+                          const torch::Tensor& condTime);
+};
+TORCH_MODULE(FridayFlowModel);
+
+//----------------------------------------------------------------------------------
 // Neural Network state
 //----------------------------------------------------------------------------------
 
@@ -867,6 +984,15 @@ struct NetworkState {
     float featureAELoss = 0.0f;
     float featureAELossSmoothed = 0.0f;
     int featureAEIterations = 0;
+    std::vector<float> featureAELossHistory;
+
+    // pose autoencoder (single frame)
+    torch::nn::Sequential poseAutoEncoder = nullptr;
+    std::shared_ptr<torch::optim::Adam> poseAEOptimizer = nullptr;
+    float poseAELoss = 0.0f;
+    float poseAELossSmoothed = 0.0f;
+    int poseAEIterations = 0;
+    std::vector<float> poseAELossHistory;
 
     // segment autoencoder
     torch::nn::Sequential segmentAutoEncoder = nullptr;
@@ -875,16 +1001,25 @@ struct NetworkState {
     float segmentAELoss = 0.0f;
     float segmentAELossSmoothed = 0.0f;
     int segmentAEIterations = 0;
+    std::vector<float> segmentAELossHistory;
 
     // segment latent average predictor
     torch::nn::Sequential segmentLatentAveragePredictor =
         nullptr;
-    std::shared_ptr<torch::optim::Adam> predictorOptimizer =
+    std::shared_ptr<torch::optim::Adam> latentSegmentPredictorOptimizer =
         nullptr;
-    float predictorLoss = 0.0f;
-    float predictorLossSmoothed = 0.0f;
-    int predictorIterations = 0;
+    float latentSegmentPredictorLoss = 0.0f;
+    float latentSegmentPredictorLossSmoothed = 0.0f;
+    int latentSegmentPredictorIterations = 0;
+    std::vector<float> latentSegmentPredictorLossHistory;
 
+    // single pose latent predictor (features -> pose latent, deterministic)
+    torch::nn::Sequential singlePosePredictor = nullptr;
+    std::shared_ptr<torch::optim::Adam> singlePosePredictorOptimizer = nullptr;
+    float singlePosePredictorLoss = 0.0f;
+    float singlePosePredictorLossSmoothed = 0.0f;
+    int singlePosePredictorIterations = 0;
+    std::vector<float> singlePosePredictorLossHistory;
 
     // latent flow matching
     FlowModel latentFlowModel = nullptr;
@@ -894,20 +1029,60 @@ struct NetworkState {
     float flowLoss = 0.0f;
     float flowLossSmoothed = 0.0f;
     int flowIterations = 0;
+    std::vector<float> flowLossHistory;
 
-    // end-to-end training (features → encode → predict → decode → segment)
-    float e2eLoss = 0.0f;
-    float e2eLossSmoothed = 0.0f;
-    int e2eIterations = 0;
+    // full-space flow matching (bypasses autoencoders)
+    FullFlowModel fullFlowModel = nullptr;
+    std::shared_ptr<torch::optim::Adam> fullFlowOptimizer = nullptr;
+    float fullFlowLoss = 0.0f;
+    float fullFlowLossSmoothed = 0.0f;
+    int fullFlowIterations = 0;
+    std::vector<float> fullFlowLossHistory;
+
+    // friday flow: frame-by-frame flow in pose latent space
+    FridayFlowModel fridayFlowModel = nullptr;
+    std::shared_ptr<torch::optim::Adam> fridayFlowOptimizer =
+        nullptr;
+    float fridayFlowLoss = 0.0f;
+    float fridayFlowLossSmoothed = 0.0f;
+    int fridayFlowIterations = 0;
+    std::vector<float> fridayFlowLossHistory;
+    std::vector<float> poseLatentStd;  // per-dim std of pose latent codes [POSE_AE_LATENT_DIM]
+
+    // segment end-to-end training (features → encode → predict → decode → segment)
+    float segmentE2eLoss = 0.0f;
+    float segmentE2eLossSmoothed = 0.0f;
+    int segmentE2eIterations = 0;
+    std::vector<float> segmentE2eLossHistory;
+
+    // single pose end-to-end training (features → featureAE encode → predict → poseAE decode → pose)
+    float singlePoseE2eLoss = 0.0f;
+    float singlePoseE2eLossSmoothed = 0.0f;
+    int singlePoseE2eIterations = 0;
+    std::vector<float> singlePoseE2eLossHistory;
+
+    // unconditioned pose advance: pose latent → next pose latent
+    torch::nn::Sequential uncondAdvancePredictor = nullptr;
+    std::shared_ptr<torch::optim::Adam> uncondAdvanceOptimizer = nullptr;
+    float uncondAdvanceLoss = 0.0f;
+    float uncondAdvanceLossSmoothed = 0.0f;
+    int uncondAdvanceIterations = 0;
+    std::vector<float> uncondAdvanceLossHistory;
+
+    // monday predictor: (features, pose latent) → pose latent delta
+    torch::nn::Sequential mondayPredictor = nullptr;
+    std::shared_ptr<torch::optim::Adam> mondayOptimizer = nullptr;
+    float mondayLoss = 0.0f;
+    float mondayLossSmoothed = 0.0f;
+    int mondayIterations = 0;
+    std::vector<float> mondayLossHistory;
+    std::vector<float> mondayDeltaMean;   // per-dim mean of latent deltas [POSE_AE_LATENT_DIM]
+    std::vector<float> mondayDeltaStd;    // per-dim std of latent deltas [POSE_AE_LATENT_DIM]
+    double mondayDeltaStatsTimer = 0.0;   // time since last stats recomputation
 
     // loss history — one sample every LOSS_LOG_INTERVAL_SECONDS,
     // all networks logged at the same time so curves are directly comparable
     std::vector<float> lossHistoryTime;         // training elapsed seconds
-    std::vector<float> featureAELossHistory;
-    std::vector<float> segmentAELossHistory;
-    std::vector<float> predictorLossHistory;
-    std::vector<float> flowLossHistory;
-    std::vector<float> e2eLossHistory;
     double timeSinceLastLossLog = 0.0;
 
     // unified training timing

@@ -26,9 +26,12 @@
                       << "\nLine: " << __LINE__ \
                       << "\nFunction: " << ASSERT_EVEN_IN_RELEASE_FUNCTION \
                       << std::endl; \
-            std::abort(); \
+            __debugbreak(); \
         } \
     } while (false)
+
+
+//std::abort(); \
 
 
 

@@ -70,17 +70,17 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - Never modify non-const value arguments of functions.
 - don't use pairs and tuples, make small structs instead
 - don't use smart pointers, except when using things like libtorch that really like it.
-- place arguments on separate lines when they don't fit in 80 character lines
+- Keep lines under 120 characters.
+- place arguments of function definition or call on separate lines when there are more than 4 or they don't fit in 120 character lines (be smart about this one. Sometimes it is ok to use common sense)
 - don't use complicated oop concepts like inheritance and polymorphism, unless absolutely necessary
 - don't use exceptions, use assertions defensively. Don't use the keyword noexcept, catch, try, unless absolutely necessary
 - use linebreaks before opening braces for functions and control blocks
-- always use braces for if/for/while, except when it is verysimple single-line statements
+- always use braces for if/for/while
 - when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
 - no need for private and public. Use structs only, unless when we really want to.
 - I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
 - And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important things, that is called only once from an other important function that does important things. Important and complicated things should not be hidden, they should be there, in plain sight, showing what they are doing. 
 - Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.
-- Keep lines under 120 characters. Don't hesitate to put arguments of functions on individual lines if there are more than 3.
 - ask questions to the human if unsure about anything. Don't assume things, ask instead.
 - be casual when conversing with the human. We want to have fun coding together. 
 

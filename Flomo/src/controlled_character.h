@@ -147,7 +147,7 @@ static void SpawnBlendCursor(
     float animTime,
     float blendTime,
     bool immediate,
-    bool testSegmentAE)
+    const AppConfig* config)
 {
     // fade out existing cursors
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
@@ -212,9 +212,20 @@ static void SpawnBlendCursor(
     }
 
     // optionally pass through the segment autoencoder to test reconstruction quality
-    if (testSegmentAE)
+    if (config->testSegmentAutoEncoder)
     {
         NetworkApplySegmentAE(networkState, db, &cursor->segment);
+    }
+
+    if (config->testPoseAutoEncoder)
+    {
+        const int segFrames = cursor->segment.rows();
+        //const int poseDim = cursor->segment.cols();
+        for (int f = 0; f < segFrames; ++f)
+        {
+            std::span<float> pose = cursor->segment.row_view(f);
+            NetworkApplyPoseAE(networkState, db, pose);
+        }
     }
 
     // animTime is now relative to segment start
@@ -324,6 +335,53 @@ static void SpawnBlendCursorFromFlow(
     cursor->segmentAnimTime = 0.0f;
 }
 
+static void SpawnBlendCursorFromFullFlow(
+    ControlledCharacter* cc,
+    const AnimDatabase* db,
+    NetworkState* networkState,
+    const std::vector<float>& query,
+    float blendTime,
+    bool immediate)
+{
+    for (int i = 0;
+        i < ControlledCharacter::MAX_BLEND_CURSORS;
+        ++i)
+    {
+        if (cc->cursors[i].active)
+            cc->cursors[i].targetWeight = 0.0f;
+    }
+
+    BlendCursor* cursor = FindAvailableCursor(cc);
+    assert(cursor != nullptr);
+    if (!cursor) return;
+
+    cursor->active = true;
+    cursor->animIndex = -1;
+    cursor->weightSpring = {};
+    cursor->fastWeightSpring = {};
+
+    if (immediate)
+    {
+        cursor->weightSpring.x = 1.0f;
+        cursor->weightSpring.xi = 1.0f;
+        cursor->fastWeightSpring.x = 1.0f;
+        cursor->fastWeightSpring.xi = 1.0f;
+    }
+
+    cursor->targetWeight = 1.0f;
+    cursor->blendTime = blendTime;
+    cursor->segmentFrameTime = db->animFrameTime[0];
+
+    if (!NetworkPredictFullFlow(
+        networkState, db, query, cursor->segment))
+    {
+        cursor->active = false;
+        return;
+    }
+
+    cursor->segmentAnimTime = 0.0f;
+}
+
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
 // - uses db->localJointPositions / localJointRotations6d for sampling (no per-frame global->local conversion)
 // - blends per-cursor root deltas in world-space (XZ + yaw) and applies to cc->world*
@@ -376,7 +434,12 @@ static void ControlledCharacterUpdate(
     // and bring the next search forward
     if (cc->animMode == AnimationMode::MotionMatching
         || cc->animMode == AnimationMode::AverageLatentPredictor
-        || cc->animMode == AnimationMode::FlowSampled)
+        || cc->animMode == AnimationMode::FlowSampled
+        || cc->animMode == AnimationMode::FullFlowSampled
+        || cc->animMode == AnimationMode::FridayFlow
+        || cc->animMode == AnimationMode::SinglePosePredictor
+        || cc->animMode == AnimationMode::UnconditionedAdvance
+        || cc->animMode == AnimationMode::MondayPredictor)
     {
         cc->inputDecidedSearchCooldown -= dt;
         const Vector3 velDiff = Vector3Subtract(
@@ -420,7 +483,7 @@ static void ControlledCharacterUpdate(
         cc->lookaheadDragInitialized = false;
         SpawnBlendCursor(cc, db, networkState, 
             newAnim, startTime, 
-            config.defaultBlendTime, true, config.testSegmentAutoEncoder);
+            config.defaultBlendTime, true, &config);
         cc->switchTimer = config.switchInterval;
     }
     else if (cc->animMode == AnimationMode::RandomSwitch)
@@ -440,7 +503,8 @@ static void ControlledCharacterUpdate(
             const int localFrame = selectedGlobalFrame - clipStart;
             const float startTime = localFrame * db->animFrameTime[newAnimIdx];
 
-            SpawnBlendCursor(cc, db, networkState, newAnimIdx, startTime, config.defaultBlendTime, false, config.testSegmentAutoEncoder);
+            SpawnBlendCursor(cc, db, networkState, newAnimIdx, startTime, 
+                config.defaultBlendTime, false, &config);
             
             cc->switchTimer = config.switchInterval;
         }
@@ -456,7 +520,8 @@ static void ControlledCharacterUpdate(
             ComputeMotionFeatures(
                 db,
                 cc,
-                cc->mmQuery);
+                cc->mmQuery,
+                true, 1.0f);
 
             cc->mmSearchTimer = config.mmSearchPeriod;
 
@@ -505,7 +570,9 @@ static void ControlledCharacterUpdate(
 
                     if (spawnNewCursor)
                     {
-                        SpawnBlendCursor(cc, db, networkState, clipIdx, targetTime, config.defaultBlendTime, false, config.testSegmentAutoEncoder);
+                        SpawnBlendCursor(cc, db, networkState, clipIdx, 
+                            targetTime, config.defaultBlendTime, 
+                            false, &config);
                     }
                 }
             }
@@ -517,7 +584,7 @@ static void ControlledCharacterUpdate(
         if (cc->mmSearchTimer <= 0.0f)
         {
             ComputeMotionFeatures(
-                db, cc, cc->mmQuery);
+                db, cc, cc->mmQuery, true, 1.0f);
             cc->mmSearchTimer = config.mmSearchPeriod;
 
             SpawnBlendCursorFromPredictor(
@@ -532,12 +599,305 @@ static void ControlledCharacterUpdate(
         cc->mmSearchTimer -= dt;
         if (cc->mmSearchTimer <= 0.0f)
         {
-            ComputeMotionFeatures(db, cc, cc->mmQuery);
+            ComputeMotionFeatures(db, cc, cc->mmQuery, true, 1.0f);
             cc->mmSearchTimer = config.mmSearchPeriod;
 
             SpawnBlendCursorFromFlow(
                 cc, db, networkState, cc->mmQuery,
                 config.defaultBlendTime, false);
+        }
+    }
+    else if (cc->animMode == AnimationMode::FullFlowSampled)
+    {
+        cc->mmSearchTimer -= dt;
+        if (cc->mmSearchTimer <= 0.0f)
+        {
+            ComputeMotionFeatures(db, cc, cc->mmQuery, true, 1.0f);
+            cc->mmSearchTimer = config.mmSearchPeriod;
+
+            SpawnBlendCursorFromFullFlow(
+                cc, db, networkState, cc->mmQuery,
+                config.defaultBlendTime, false);
+        }
+    }
+    else if (cc->animMode == AnimationMode::FridayFlow)
+    {
+        // frame-by-frame flow in pose latent space
+        // we write decoded poses into a 1-row cursor segment so the rest of the
+        // cursor pipeline (blending, virtual toes, IK) just works
+        // pose features update every frame, future features only at search rate
+        cc->mmSearchTimer -= dt;
+        const bool updateFuture = cc->mmSearchTimer <= 0.0f;
+        if (updateFuture) cc->mmSearchTimer = config.mmSearchPeriod;
+
+        const float poseAlpha = Min(1.0f, dt / db->animFrameTime[0]);
+        ComputeMotionFeatures(db, cc, cc->mmQuery, updateFuture, poseAlpha);
+
+        const int poseDim = PoseFeatures::GetDim(jc);
+
+        // seed latent from database frame 0 on first use
+        if (!cc->fridayFlowInitialized)
+        {
+            std::span<const float> frame0 = db->poseGenFeatures.row_view(0);
+            std::vector<float> rawPose(frame0.begin(), frame0.end());
+            NetworkEncodePoseToLatent(networkState, db, rawPose, /*out*/ cc->fridayFlowLatent);
+            cc->fridayFlowInitialized = true;
+        }
+
+        // predict next latent directly via flow matching
+        // the network was trained on consecutive frames, so the prediction is one
+        // database frame step ahead. Lerp to handle varying runtime dt:
+        // alpha < 1 interpolates (dt shorter than frame), alpha > 1 extrapolates
+        std::vector<float> predictedNextLatent;
+        const bool predicted = NetworkPredictFridayFlow(
+            networkState, db, cc->mmQuery, cc->fridayFlowLatent, /*out*/ predictedNextLatent);
+
+        if (predicted)
+        {
+            const float alpha = Max(1.0f, dt / db->animFrameTime[0]); // don't extrapolate
+            for (int d = 0; d < (int)cc->fridayFlowLatent.size(); ++d)
+            {
+                cc->fridayFlowLatent[d] += alpha * (predictedNextLatent[d] - cc->fridayFlowLatent[d]);
+            }
+        }
+
+        // decode latent to raw poseGenFeatures, write into cursor segment
+        std::vector<float> rawPose;
+        const bool decoded = NetworkDecodeFridayFlowLatent(
+            networkState, db, cc->fridayFlowLatent, /*out*/ rawPose);
+
+        if (decoded)
+        {
+            // kill existing cursors
+            for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
+            {
+                if (cc->cursors[i].active)
+                {
+                    cc->cursors[i].active = false;
+                }
+            }
+
+            // find or init our single cursor
+            BlendCursor& cursor = cc->cursors[0];
+            cursor.active = true;
+            cursor.animIndex = -1;
+            cursor.weightSpring = { 1.0f, 1.0f };
+            cursor.fastWeightSpring = { 1.0f, 1.0f };
+            cursor.targetWeight = 1.0f;
+            cursor.blendTime = 0.01f;
+            cursor.segmentFrameTime = db->animFrameTime[0];            
+
+            // overwrite segment with a single decoded frame
+            cursor.segment.resize(1, poseDim);
+            std::span<float> row = cursor.segment.row_view(0);
+            for (int d = 0; d < poseDim; ++d)
+                row[d] = rawPose[d];
+            cursor.segmentAnimTime = 0.0f;
+        }
+    }
+    else if (cc->animMode == AnimationMode::SinglePosePredictor)
+    {
+        // deterministic single-pose prediction: features -> pose latent -> decoded pose
+        // pose features update every frame, future features only at search rate
+        cc->mmSearchTimer -= dt;
+        const bool updateFuture = cc->mmSearchTimer <= 0.0f;
+        if (updateFuture)
+        {
+            cc->mmSearchTimer = config.mmSearchPeriod;
+        }
+        const float poseAlpha = Min(1.0f, dt / db->animFrameTime[0]);
+        ComputeMotionFeatures(db, cc, cc->mmQuery, updateFuture, poseAlpha);
+        const int poseDim = PoseFeatures::GetDim(jc);
+
+        std::vector<float> rawPose;
+        const bool decoded = NetworkPredictSinglePose(
+            networkState, db, cc->mmQuery, /*out*/ rawPose);
+
+        if (decoded)
+        {
+            for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
+            {
+                if (cc->cursors[i].active)
+                {
+                    cc->cursors[i].active = false;
+                }
+            }
+
+            BlendCursor& cursor = cc->cursors[0];
+            cursor.active = true;
+            cursor.animIndex = -1;
+            cursor.weightSpring = { 1.0f, 1.0f };
+            cursor.fastWeightSpring = { 1.0f, 1.0f };
+            cursor.targetWeight = 1.0f;
+            cursor.blendTime = 0.01f;
+            cursor.segmentFrameTime = db->animFrameTime[0];
+
+            cursor.segment.resize(1, poseDim);
+            std::span<float> row = cursor.segment.row_view(0);
+            for (int d = 0; d < poseDim; ++d)
+            {
+                row[d] = rawPose[d];
+            }
+            cursor.segmentAnimTime = 0.0f;
+        }
+    }
+    else if (cc->animMode == AnimationMode::UnconditionedAdvance)
+    {
+        // hybrid: conditioned search (SinglePosePredictor) on search frames,
+        // unconditioned advance (pose latent → next pose latent) between searches
+        cc->mmSearchTimer -= dt;
+        const bool searchThisFrame = cc->mmSearchTimer <= 0.0f;
+        if (searchThisFrame)
+        {
+            cc->mmSearchTimer = config.mmSearchPeriod;
+        }
+
+        const float poseAlpha = Min(1.0f, dt / db->animFrameTime[0]);
+        ComputeMotionFeatures(db, cc, cc->mmQuery, searchThisFrame, poseAlpha);
+
+        const int poseDim = PoseFeatures::GetDim(jc);
+
+        // seed latent from database frame 0 on first use
+        if (!cc->uncondAdvanceInitialized)
+        {
+            std::span<const float> frame0 = db->poseGenFeatures.row_view(0);
+            std::vector<float> rawPose(frame0.begin(), frame0.end());
+            NetworkEncodePoseToLatent(networkState, db, rawPose, /*out*/ cc->uncondAdvanceLatent);
+            cc->uncondAdvanceInitialized = true;
+        }
+
+        if (searchThisFrame)
+        {
+            // conditioned path: use SinglePosePredictor to anchor pose to current input
+            std::vector<float> conditionedLatent;
+            const bool gotLatent = NetworkPredictSinglePoseLatent(
+                networkState, db, cc->mmQuery, /*out*/ conditionedLatent);
+            if (gotLatent)
+            {
+                cc->uncondAdvanceLatent = conditionedLatent;
+            }
+        }
+        else
+        {
+            // unconditioned path: advance pose latent without feature conditioning
+            std::vector<float> predictedNext;
+            const bool predicted = NetworkPredictUncondAdvance(
+                networkState, cc->uncondAdvanceLatent, /*out*/ predictedNext);
+            if (predicted)
+            {
+                const float alpha = Min(1.0f, dt / db->animFrameTime[0]);
+                for (int d = 0; d < (int)cc->uncondAdvanceLatent.size(); ++d)
+                {
+                    cc->uncondAdvanceLatent[d] +=
+                        alpha * (predictedNext[d] - cc->uncondAdvanceLatent[d]);
+                }
+            }
+        }
+
+        // decode latent to raw pose and write into cursor
+        std::vector<float> rawPose;
+        const bool decoded = NetworkDecodeFridayFlowLatent(
+            networkState, db, cc->uncondAdvanceLatent, /*out*/ rawPose);
+
+        if (decoded)
+        {
+            for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
+            {
+                if (cc->cursors[i].active)
+                {
+                    cc->cursors[i].active = false;
+                }
+            }
+
+            BlendCursor& cursor = cc->cursors[0];
+            cursor.active = true;
+            cursor.animIndex = -1;
+            cursor.weightSpring = { 1.0f, 1.0f };
+            cursor.fastWeightSpring = { 1.0f, 1.0f };
+            cursor.targetWeight = 1.0f;
+            cursor.blendTime = 0.01f;
+            cursor.segmentFrameTime = db->animFrameTime[0];
+
+            cursor.segment.resize(1, poseDim);
+            std::span<float> row = cursor.segment.row_view(0);
+            for (int d = 0; d < poseDim; ++d)
+            {
+                row[d] = rawPose[d];
+            }
+            cursor.segmentAnimTime = 0.0f;
+        }
+    }
+    else if (cc->animMode == AnimationMode::MondayPredictor)
+    {
+        // conditioned delta advance: features + pose latent → delta every frame
+        cc->mmSearchTimer -= dt;
+        const bool updateFuture = cc->mmSearchTimer <= 0.0f;
+        if (updateFuture)
+        {
+            cc->mmSearchTimer = config.mmSearchPeriod;
+        }
+
+        const float poseAlpha = Min(1.0f, dt / db->animFrameTime[0]);
+        ComputeMotionFeatures(db, cc, cc->mmQuery, updateFuture, poseAlpha);
+
+        const int poseDim = PoseFeatures::GetDim(jc);
+
+        // seed latent from database frame 0 on first use
+        if (!cc->mondayInitialized)
+        {
+            std::span<const float> frame0 = db->poseGenFeatures.row_view(0);
+            std::vector<float> rawPose(frame0.begin(), frame0.end());
+            NetworkEncodePoseToLatent(networkState, db, rawPose, /*out*/ cc->mondayLatent);
+            cc->mondayInitialized = true;
+        }
+
+        // predict delta and advance latent
+        std::vector<float> delta;
+        const bool predicted = NetworkPredictMonday(
+            networkState, db, cc->mmQuery, cc->mondayLatent, /*out*/ delta);
+
+        if (predicted)
+        {
+            const float alpha = Min(1.0f, dt / db->animFrameTime[0]);
+            for (int d = 0; d < (int)cc->mondayLatent.size(); ++d)
+            {
+                cc->mondayLatent[d] += alpha * delta[d];
+            }
+        }
+
+        // decode latent to raw pose, then re-encode back to snap onto the AE manifold
+        std::vector<float> rawPose;
+        const bool decoded = NetworkDecodeFridayFlowLatent(
+            networkState, db, cc->mondayLatent, /*out*/ rawPose);
+
+        if (decoded)
+        {
+            NetworkEncodePoseToLatent(networkState, db, rawPose, /*out*/ cc->mondayLatent);
+
+            for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i)
+            {
+                if (cc->cursors[i].active)
+                {
+                    cc->cursors[i].active = false;
+                }
+            }
+
+            BlendCursor& cursor = cc->cursors[0];
+            cursor.active = true;
+            cursor.animIndex = -1;
+            cursor.weightSpring = { 1.0f, 1.0f };
+            cursor.fastWeightSpring = { 1.0f, 1.0f };
+            cursor.targetWeight = 1.0f;
+            cursor.blendTime = 0.01f;
+            cursor.segmentFrameTime = db->animFrameTime[0];
+
+            cursor.segment.resize(1, poseDim);
+            std::span<float> row = cursor.segment.row_view(0);
+            for (int d = 0; d < poseDim; ++d)
+            {
+                row[d] = rawPose[d];
+            }
+            cursor.segmentAnimTime = 0.0f;
         }
     }
 
@@ -662,7 +1022,9 @@ static void ControlledCharacterUpdate(
     Vector3 toeBlendedPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedLookaheadPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
+    Vector3 nextToeBlendedVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedPosDiffRootSpace = Vector3Zero();
+    Vector3 nextToeBlendedPosDiffRootSpace = Vector3Zero();
     float blendedToeSpeedDiff = 0.0f;
     
     Vector3 blendedRootVelocityRootSpace = Vector3Zero();
@@ -749,12 +1111,21 @@ static void ControlledCharacterUpdate(
                 poseFeat0.toeVelocitiesRootSpace[side],
                 poseFeat1.toeVelocitiesRootSpace[side], sAlpha);
             toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(toeVel, w));
+
+            const Vector3 nextToeVel = Vector3Lerp(
+                poseFeat0.nextToeVelocitiesRootSpace[side],
+                poseFeat1.nextToeVelocitiesRootSpace[side], sAlpha);
+            nextToeBlendedVelocityRootSpace[side] = Vector3Add(nextToeBlendedVelocityRootSpace[side], Vector3Scale(nextToeVel, w));
         }
 
         // toe position difference (left - right) in root space
         const Vector3 toePosDiff = Vector3Lerp(
             poseFeat0.toePosDiffRootSpace, poseFeat1.toePosDiffRootSpace, sAlpha);
         toeBlendedPosDiffRootSpace = Vector3Add(toeBlendedPosDiffRootSpace, Vector3Scale(toePosDiff, w));
+
+        const Vector3 nextToePosDiff = Vector3Lerp(
+            poseFeat0.nextToePosDiffRootSpace, poseFeat1.nextToePosDiffRootSpace, sAlpha);
+        nextToeBlendedPosDiffRootSpace = Vector3Add(nextToeBlendedPosDiffRootSpace, Vector3Scale(nextToePosDiff, w));
 
         // toe speed difference magnitude (always positive)
         const float speedDiff = Lerp(poseFeat0.toeSpeedDiff, poseFeat1.toeSpeedDiff, sAlpha);
@@ -767,12 +1138,14 @@ static void ControlledCharacterUpdate(
     {
         // toes velocity in world space from blended toe velocities in root space
         cc->toeBlendedVelocityWorld[side] = Vector3RotateByQuaternion(toeBlendedVelocityRootSpace[side], cc->worldRotation);
+        cc->nextToeBlendedVelocityWorld[side] = Vector3RotateByQuaternion(nextToeBlendedVelocityRootSpace[side], cc->worldRotation);
         // toes position in world space from blended toe positions in root space
         cc->toeBlendedPositionWorld[side] = Vector3Add(
             Vector3RotateByQuaternion(toeBlendedPositionRootSpace[side], cc->worldRotation),
             cc->worldPosition);
     }
     cc->toeBlendedPosDiffRootSpace = toeBlendedPosDiffRootSpace;
+    cc->nextToeBlendedPosDiffRootSpace = nextToeBlendedPosDiffRootSpace;
     cc->blendedToeSpeedDiff = blendedToeSpeedDiff;
 
     // --- Rot6d blending using normalized weights
@@ -817,7 +1190,13 @@ static void ControlledCharacterUpdate(
         // normalize current rotations
         Rot6d blended = blendedLocalRotations[j];
         const float lenA = sqrtf(blended.ax * blended.ax + blended.ay * blended.ay + blended.az * blended.az);
-        assertEvenInRelease(lenA > 1e-6f);
+
+        if (lenA < 1e-6f)
+        {
+            blendedLocalRotations[j] = Rot6dIdentity();
+            //assertEvenInRelease(false);
+        }
+
         Rot6dNormalize(blendedLocalRotations[j]);
     }
 
@@ -999,7 +1378,7 @@ static void ControlledCharacterUpdate(
         break;
     }
     } // end switch on blend mode
-        
+
     // Compute position and rotation deltas for this timestep
     const Vector3 positionDelta = Vector3Scale(cc->rootVelocityWorld, dt);
     const float yawDelta = cc->rootYawRate * dt;
@@ -1024,29 +1403,20 @@ static void ControlledCharacterUpdate(
         cc->xformData.globalRotations[i] = QuaternionMultiply(cc->worldRotation, cc->xformData.globalRotations[i]);
     }
 
-    //// Compute FK for each active cursor (for debug visualization)
-    //// We do this with root zeroed (same treatment as final blended pose)
+    // per-cursor FK for debug visualization
     for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
     {
         BlendCursor& cur = cc->cursors[ci];
         if (!cur.active) continue;
 
-        // Copy local pose to global (we'll compute FK in-place)
-        // Convert from Rot6d to Quaternion for FK computation
         for (int j = 0; j < jc; ++j)
         {
             if (j == 0)
-            {
                 cur.globalPositions[j] = cur.rootLocalPosition;
-            }
             else
-            {
                 cur.globalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
-            }
             Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
         }
-
-        // NOTE: No longer zeroing root XZ - hip position is relative to Magic anchor
 
         // Forward kinematics
         for (int j = 1; j < jc; ++j)
@@ -1089,6 +1459,7 @@ static void ControlledCharacterUpdate(
     }
     cc->toeTrackingPreIKInitialized = true;
 
+    // Update virtual toe positions
     // Update virtual toe positions using lookahead dragging
     // lookaheadDragToePos: drags toward blended lookahead target (unconstrained, for unlock detection)
     // virtualToePos: speed-clamped for IK (constrained)
@@ -1236,9 +1607,7 @@ static void ControlledCharacterUpdate(
         }
     }
 
-    cc->lookaheadDragToePosInitialized = true;   
-    
-
+    cc->lookaheadDragToePosInitialized = true;
 
     // Update position history every HISTORY_SAMPLE_INTERVAL seconds
     // This maintains a ring buffer of recent positions for motion matching past position feature

@@ -7,10 +7,10 @@ if not exist build (
 )
 
 cd build
-cmake --build . --config Release
+cmake --build . --config Debug
 
 echo.
 echo Build complete!
-echo Executable: build\Release\flomo.exe
+echo Executable: build\Debug\flomo.exe
 echo.
 pause

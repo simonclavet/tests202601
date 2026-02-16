@@ -10,17 +10,26 @@ extern "C" void cuda_init_context();
 
 constexpr int FEATURE_AE_LATENT_DIM = 16;
 constexpr int SEGMENT_AE_LATENT_DIM = 128;
+constexpr int POSE_AE_LATENT_DIM = 16;
 constexpr double HEADSTART_SECONDS = 5.0;
+constexpr double FRIDAY_FLOW_HEADSTART = 20.0;
 constexpr double AUTOSAVE_INTERVAL_SECONDS = 300.0;
 constexpr int FLOW_INFERENCE_STEPS = 8;
 constexpr double LOSS_LOG_INTERVAL_SECONDS = 5.0;
 
 // training time budget weights (relative, get normalized per phase)
 constexpr float BUDGET_WEIGHT_FEATURE_AE = 1.0f;
-constexpr float BUDGET_WEIGHT_SEGMENT_AE = 2.0f;
-constexpr float BUDGET_WEIGHT_PREDICTOR  = 1.0f;
-constexpr float BUDGET_WEIGHT_E2E        = 5.0f;
-constexpr float BUDGET_WEIGHT_FLOW       = 5.0f;
+constexpr float BUDGET_WEIGHT_SEGMENT_AE = 0.1f;
+constexpr float BUDGET_WEIGHT_LATENT_SEGMENT_PREDICTOR = 0.1f;
+constexpr float BUDGET_WEIGHT_SEGMENT_E2E = 0.1f;
+constexpr float BUDGET_WEIGHT_POSE_E2E = 1.0f;
+constexpr float BUDGET_WEIGHT_SEGMENT_FLOW = 0.1f;
+constexpr float BUDGET_WEIGHT_POSE_AE = 1.0f;
+constexpr float BUDGET_WEIGHT_FULL_FLOW = 0.1f;
+constexpr float BUDGET_WEIGHT_FRIDAY_FLOW = 0.1f;
+constexpr float BUDGET_WEIGHT_SINGLE_POSE_PREDICTOR = 3.0f;
+constexpr float BUDGET_WEIGHT_UNCOND_ADVANCE = 0.5f;
+constexpr float BUDGET_WEIGHT_MONDAY = 1.0f;
 
 // switch between ReLU and GELU for all networks
 #define USE_GELU
@@ -39,6 +48,10 @@ constexpr float BUDGET_WEIGHT_FLOW       = 5.0f;
 // Flow matching parameterization: if defined, predict endpoint x1 directly
 // if undefined, predict velocity field v = (x1 - xt) / (1 - t)
 //#define FLOW_PREDICT_X1
+
+constexpr float FRIDAY_FLOW_POSE_NOISE = 0.5f;  // noise added to z0 conditioning during training (robustness)
+constexpr float POSE_AE_STRAIGHT_WEIGHT = 0.1f;  // weight for latent trajectory straightness loss
+constexpr float POSE_AE_TIGHT_WEIGHT = 0.1f;     // weight for latent trajectory tightness loss (small steps)
 
 constexpr float LOSS_SMOOTHING_FACTOR = 0.1f;  // lerp factor: new loss weight (0=fully smoothed, 1=no smoothing)
 
@@ -104,6 +117,41 @@ static inline torch::Tensor DecodeWithAE(
     x = nn_activate(l5->forward(x));
     x = nn_activate(l7->forward(x));
     x = l9->forward(x);
+    return x;
+}
+
+// PoseAE encoder: runs the first half of the sequential (layers 0..N/2-1)
+static inline torch::Tensor PoseAEEncode(torch::nn::Sequential& ae, const torch::Tensor& input)
+{
+    std::vector<std::shared_ptr<torch::nn::Module>> children = ae->children();
+    const int half = (int)children.size() / 2;
+    torch::Tensor x = input;
+    for (int i = 0; i < half; ++i)
+    {
+        torch::nn::LinearImpl* lin = children[i]->as<torch::nn::LinearImpl>();
+        if (lin)
+        {
+            x = (i < half - 1) ? nn_activate(lin->forward(x)) : lin->forward(x);
+        }
+    }
+    return x;
+}
+
+// PoseAE decoder: runs the second half of the sequential (layers N/2..N-1)
+static inline torch::Tensor PoseAEDecode(torch::nn::Sequential& ae, const torch::Tensor& latent)
+{
+    std::vector<std::shared_ptr<torch::nn::Module>> children = ae->children();
+    const int n = (int)children.size();
+    const int half = n / 2;
+    torch::Tensor x = latent;
+    for (int i = half; i < n; ++i)
+    {
+        torch::nn::LinearImpl* lin = children[i]->as<torch::nn::LinearImpl>();
+        if (lin)
+        {
+            x = (i < n - 1) ? nn_activate(lin->forward(x)) : lin->forward(x);
+        }
+    }
     return x;
 }
 
@@ -240,6 +288,93 @@ static inline void NetworkLoadFeatureAE(
     }
 }
 
+
+//---------------------------------------------------------
+// pose autoencoder
+//---------------------------------------------------------
+
+static inline void NetworkInitPoseAE(
+    NetworkState* state,
+    int inputDim,
+    int latentDim)
+{
+    if (inputDim <= 0) return;
+
+    NetworkEnsureDevice(state);
+
+    // D -> 256 -> 256 -> 16 -> 256 -> 256 -> D
+    state->poseAutoEncoder = torch::nn::Sequential(
+        torch::nn::Linear(inputDim, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, latentDim),
+        torch::nn::Linear(latentDim, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, inputDim)
+    );
+
+    state->poseAutoEncoder->to(state->device);
+
+    state->poseAEOptimizer =
+        std::make_shared<torch::optim::Adam>(
+            state->poseAutoEncoder->parameters(),
+            torch::optim::AdamOptions(1e-3));
+
+    state->poseAELoss = 0.0f;
+    state->poseAEIterations = 0;
+
+    TraceLog(LOG_INFO,
+        "Pose AE initialized: %d -> 256 -> 256 -> %d -> 256 -> 256 -> %d",
+        inputDim, latentDim, inputDim);
+}
+
+static inline void NetworkSavePoseAE(
+    const NetworkState* state,
+    const std::string& folderPath)
+{
+    if (!state->poseAutoEncoder) return;
+
+    const std::string path =
+        folderPath + "/poseAutoEncoder.bin";
+    try
+    {
+        torch::save(state->poseAutoEncoder, path);
+        TraceLog(LOG_INFO,
+            "Saved Pose AE to: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR,
+            "Failed to save Pose AE: %s", e.what());
+    }
+}
+static inline void NetworkLoadPoseAE(
+    NetworkState* state,
+    int inputDim,
+    int latentDim,
+    const std::string& folderPath)
+{
+    const std::string path =
+        folderPath + "/poseAutoEncoder.bin";
+    if (!std::filesystem::exists(path)) return;
+
+    try
+    {
+        NetworkInitPoseAE(state, inputDim, latentDim);
+        torch::load(state->poseAutoEncoder, path);
+        state->poseAutoEncoder->to(state->device);
+        TraceLog(LOG_INFO,
+            "Loaded Pose AE from: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR,
+            "Failed to load Pose AE: %s", e.what());
+    }
+}
 //---------------------------------------------------------
 // segment autoencoder
 //---------------------------------------------------------
@@ -333,7 +468,7 @@ static inline void NetworkLoadSegmentAE(
 // segment latent average predictor
 //---------------------------------------------------------
 
-static inline void NetworkInitPredictor(
+static inline void NetworkInitLatentSegmentPredictor(
     NetworkState* state,
     int featureLatentDim,
     int segmentLatentDim)
@@ -355,14 +490,14 @@ static inline void NetworkInitPredictor(
     state->segmentLatentAveragePredictor->to(
         state->device);
 
-    state->predictorOptimizer =
+    state->latentSegmentPredictorOptimizer =
         std::make_shared<torch::optim::Adam>(
             state->segmentLatentAveragePredictor
                 ->parameters(),
             torch::optim::AdamOptions(1e-3));
 
-    state->predictorLoss = 0.0f;
-    state->predictorIterations = 0;
+    state->latentSegmentPredictorLoss = 0.0f;
+    state->latentSegmentPredictorIterations = 0;
 
     TraceLog(LOG_INFO,
         "Latent Predictor initialized: %d -> 128 -> 256"
@@ -370,7 +505,7 @@ static inline void NetworkInitPredictor(
         featureLatentDim, segmentLatentDim);
 }
 
-static inline void NetworkSavePredictor(
+static inline void NetworkSaveLatentSegmentPredictor(
     const NetworkState* state,
     const std::string& folderPath)
 {
@@ -393,7 +528,7 @@ static inline void NetworkSavePredictor(
     }
 }
 
-static inline void NetworkLoadPredictor(
+static inline void NetworkLoadLatentSegmentPredictor(
     NetworkState* state,
     int featureLatentDim,
     int segmentLatentDim,
@@ -405,7 +540,7 @@ static inline void NetworkLoadPredictor(
 
     try
     {
-        NetworkInitPredictor(
+        NetworkInitLatentSegmentPredictor(
             state, featureLatentDim, segmentLatentDim);
         torch::load(
             state->segmentLatentAveragePredictor, path);
@@ -423,6 +558,335 @@ static inline void NetworkLoadPredictor(
     }
 }
 
+//---------------------------------------------------------
+// single pose latent predictor: features -> pose latent
+//---------------------------------------------------------
+
+static inline void NetworkInitSinglePosePredictor(
+    NetworkState* state,
+    int featureLatentDim,
+    int poseLatentDim)
+{
+    NetworkEnsureDevice(state);
+
+    state->singlePosePredictor =
+        torch::nn::Sequential(
+            torch::nn::Linear(featureLatentDim, 128),
+            NN_ACTIVATION(),
+            torch::nn::Linear(128, 256),
+            NN_ACTIVATION(),
+            torch::nn::Linear(256, 256),
+            NN_ACTIVATION(),
+            torch::nn::Linear(256, poseLatentDim)
+        );
+
+    state->singlePosePredictor->to(state->device);
+
+    state->singlePosePredictorOptimizer =
+        std::make_shared<torch::optim::Adam>(
+            state->singlePosePredictor->parameters(),
+            torch::optim::AdamOptions(1e-3));
+
+    state->singlePosePredictorLoss = 0.0f;
+    state->singlePosePredictorIterations = 0;
+
+    TraceLog(LOG_INFO,
+        "SinglePosePredictor initialized: %d -> 128 -> 256 -> 256 -> %d",
+        featureLatentDim, poseLatentDim);
+}
+
+static inline void NetworkInitUncondAdvance(
+    NetworkState* state,
+    int poseLatentDim)
+{
+    NetworkEnsureDevice(state);
+
+    state->uncondAdvancePredictor =
+        torch::nn::Sequential(
+            torch::nn::Linear(poseLatentDim, 128),
+            NN_ACTIVATION(),
+            torch::nn::Linear(128, 256),
+            NN_ACTIVATION(),
+            torch::nn::Linear(256, 256),
+            NN_ACTIVATION(),
+            torch::nn::Linear(256, poseLatentDim)
+        );
+
+    state->uncondAdvancePredictor->to(state->device);
+
+    state->uncondAdvanceOptimizer =
+        std::make_shared<torch::optim::Adam>(
+            state->uncondAdvancePredictor->parameters(),
+            torch::optim::AdamOptions(1e-3));
+
+    state->uncondAdvanceLoss = 0.0f;
+    state->uncondAdvanceIterations = 0;
+
+    TraceLog(LOG_INFO,
+        "UncondAdvance initialized: %d -> 128 -> 256 -> 256 -> %d",
+        poseLatentDim, poseLatentDim);
+}
+
+static inline void NetworkSaveSinglePosePredictor(
+    const NetworkState* state,
+    const std::string& folderPath)
+{
+    if (!state->singlePosePredictor) return;
+
+    const std::string path = folderPath + "/singlePosePredictor.bin";
+    try
+    {
+        torch::save(state->singlePosePredictor, path);
+        TraceLog(LOG_INFO, "Saved SinglePosePredictor to: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to save SinglePosePredictor: %s", e.what());
+    }
+}
+
+static inline void NetworkLoadSinglePosePredictor(
+    NetworkState* state,
+    int featureLatentDim,
+    int poseLatentDim,
+    const std::string& folderPath)
+{
+    const std::string path = folderPath + "/singlePosePredictor.bin";
+    if (!std::filesystem::exists(path)) return;
+
+    try
+    {
+        NetworkInitSinglePosePredictor(state, featureLatentDim, poseLatentDim);
+        torch::load(state->singlePosePredictor, path);
+        state->singlePosePredictor->to(state->device);
+        TraceLog(LOG_INFO, "Loaded SinglePosePredictor from: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to load SinglePosePredictor: %s", e.what());
+    }
+}
+
+static inline void NetworkSaveUncondAdvance(
+    const NetworkState* state,
+    const std::string& folderPath)
+{
+    if (!state->uncondAdvancePredictor) return;
+
+    const std::string path = folderPath + "/uncondAdvance.bin";
+    try
+    {
+        torch::save(state->uncondAdvancePredictor, path);
+        TraceLog(LOG_INFO, "Saved UncondAdvance to: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to save UncondAdvance: %s", e.what());
+    }
+}
+
+static inline void NetworkLoadUncondAdvance(
+    NetworkState* state,
+    int poseLatentDim,
+    const std::string& folderPath)
+{
+    const std::string path = folderPath + "/uncondAdvance.bin";
+    if (!std::filesystem::exists(path)) return;
+
+    try
+    {
+        NetworkInitUncondAdvance(state, poseLatentDim);
+        torch::load(state->uncondAdvancePredictor, path);
+        state->uncondAdvancePredictor->to(state->device);
+        TraceLog(LOG_INFO, "Loaded UncondAdvance from: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to load UncondAdvance: %s", e.what());
+    }
+}
+
+//---------------------------------------------------------
+// monday predictor: (features, pose latent) → pose latent delta
+//---------------------------------------------------------
+
+static inline void NetworkInitMonday(
+    NetworkState* state,
+    int featureLatentDim,
+    int poseLatentDim)
+{
+    NetworkEnsureDevice(state);
+
+    const int inputDim = featureLatentDim + poseLatentDim;
+    state->mondayPredictor = torch::nn::Sequential(
+        torch::nn::Linear(inputDim, 128),
+        NN_ACTIVATION(),
+        torch::nn::Linear(128, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, 256),
+        NN_ACTIVATION(),
+        torch::nn::Linear(256, poseLatentDim)
+    );
+
+    state->mondayPredictor->to(state->device);
+
+    state->mondayOptimizer =
+        std::make_shared<torch::optim::Adam>(
+            state->mondayPredictor->parameters(),
+            torch::optim::AdamOptions(1e-3));
+
+    state->mondayLoss = 0.0f;
+    state->mondayIterations = 0;
+
+    TraceLog(LOG_INFO,
+        "Monday initialized: (%d+%d) -> 128 -> 256 -> 256 -> %d",
+        featureLatentDim, poseLatentDim, poseLatentDim);
+}
+
+constexpr double MONDAY_DELTA_STATS_INTERVAL = 20.0;
+
+// sample consecutive frame pairs, encode through PoseAE, compute per-dim mean/std of deltas
+static inline void ComputeMondayDeltaStats(
+    NetworkState* state,
+    const AnimDatabase* db)
+{
+    if (!state->poseAutoEncoder) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int sampleCount = std::min(2000, (int)db->legalStartFrames.size());
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->poseAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // encode consecutive frame pairs
+    torch::Tensor poseBatch0 = torch::empty({sampleCount, poseDim});
+    torch::Tensor poseBatch1 = torch::empty({sampleCount, poseDim});
+    float* p0Ptr = poseBatch0.data_ptr<float>();
+    float* p1Ptr = poseBatch1.data_ptr<float>();
+
+    for (int i = 0; i < sampleCount; ++i)
+    {
+        const int frame = SampleLegalFrame(db);
+        std::span<const float> row0 = db->normalizedPoseGenFeatures.row_view(frame);
+        std::copy(row0.begin(), row0.end(), p0Ptr + i * poseDim);
+        std::span<const float> row1 = db->normalizedPoseGenFeatures.row_view(frame + 1);
+        std::copy(row1.begin(), row1.end(), p1Ptr + i * poseDim);
+    }
+
+    poseBatch0 = poseBatch0.to(state->device);
+    poseBatch1 = poseBatch1.to(state->device);
+
+    torch::Tensor z0 = PoseAEEncode(state->poseAutoEncoder, poseBatch0);
+    torch::Tensor z1 = PoseAEEncode(state->poseAutoEncoder, poseBatch1);
+    torch::Tensor deltas = (z1 - z0).to(torch::kCPU);
+
+    torch::Tensor meanTensor = deltas.mean(0);
+    torch::Tensor stdTensor = deltas.std(0);
+
+    // clamp std to avoid division by zero
+    stdTensor = torch::clamp(stdTensor, 1e-6f);
+
+    state->mondayDeltaMean.resize(latentDim);
+    state->mondayDeltaStd.resize(latentDim);
+    const float* mPtr = meanTensor.data_ptr<float>();
+    const float* sPtr = stdTensor.data_ptr<float>();
+    for (int d = 0; d < latentDim; ++d)
+    {
+        state->mondayDeltaMean[d] = mPtr[d];
+        state->mondayDeltaStd[d] = sPtr[d];
+    }
+
+    TraceLog(LOG_INFO,
+        "Monday delta stats: %d samples, mean_std=%.6f, mean_mean=%.6f",
+        sampleCount, stdTensor.mean().item<float>(), meanTensor.mean().item<float>());
+}
+
+static inline void SaveMondayDeltaStats(
+    const NetworkState* state,
+    const std::string& folder)
+{
+    if (state->mondayDeltaMean.empty()) return;
+    const std::string path = folder + "/mondayDeltaStats.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    const int n = (int)state->mondayDeltaMean.size();
+    fwrite(&n, sizeof(int), 1, f);
+    fwrite(state->mondayDeltaMean.data(), sizeof(float), n, f);
+    fwrite(state->mondayDeltaStd.data(), sizeof(float), n, f);
+    fclose(f);
+}
+
+static inline void LoadMondayDeltaStats(
+    NetworkState* state,
+    const std::string& folder)
+{
+    const std::string path = folder + "/mondayDeltaStats.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    int n = 0;
+    if (fread(&n, sizeof(int), 1, f) != 1 || n <= 0 || n > 1024)
+    {
+        fclose(f);
+        return;
+    }
+    state->mondayDeltaMean.resize(n);
+    state->mondayDeltaStd.resize(n);
+    if (fread(state->mondayDeltaMean.data(), sizeof(float), n, f) != (size_t)n
+        || fread(state->mondayDeltaStd.data(), sizeof(float), n, f) != (size_t)n)
+    {
+        state->mondayDeltaMean.clear();
+        state->mondayDeltaStd.clear();
+    }
+    fclose(f);
+    if (!state->mondayDeltaMean.empty())
+    {
+        TraceLog(LOG_INFO, "Loaded Monday delta stats (%d dims)", n);
+    }
+}
+
+static inline void NetworkSaveMonday(
+    const NetworkState* state,
+    const std::string& folderPath)
+{
+    if (!state->mondayPredictor) return;
+
+    const std::string path = folderPath + "/monday.bin";
+    try
+    {
+        torch::save(state->mondayPredictor, path);
+        SaveMondayDeltaStats(state, folderPath);
+        TraceLog(LOG_INFO, "Saved Monday to: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to save Monday: %s", e.what());
+    }
+}
+
+static inline void NetworkLoadMonday(
+    NetworkState* state,
+    int featureLatentDim,
+    int poseLatentDim,
+    const std::string& folderPath)
+{
+    const std::string path = folderPath + "/monday.bin";
+    if (!std::filesystem::exists(path)) return;
+
+    try
+    {
+        NetworkInitMonday(state, featureLatentDim, poseLatentDim);
+        torch::load(state->mondayPredictor, path);
+        state->mondayPredictor->to(state->device);
+        LoadMondayDeltaStats(state, folderPath);
+        TraceLog(LOG_INFO, "Loaded Monday from: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to load Monday: %s", e.what());
+    }
+}
 
 //---------------------------------------------------------
 // latent space statistics (for debugging/analysis)
@@ -599,6 +1063,203 @@ inline torch::Tensor FlowModelImpl::forward(const torch::Tensor& x)
 }
 
 //---------------------------------------------------------
+// full-space flow model (condition re-injected at each layer)
+//---------------------------------------------------------
+
+inline FullFlowModelImpl::FullFlowModelImpl(int featureDim, int flatDim)
+    : layer1(register_module("layer1",
+          torch::nn::Linear(flatDim + featureDim + 1, 256))),
+      layer2(register_module("layer2",
+          torch::nn::Linear(256 + featureDim + 1, 512))),
+      outputLayer(register_module("outputLayer",
+          torch::nn::Linear(512 + featureDim + 1, flatDim))),
+      condTimeDim(featureDim + 1)
+{
+}
+
+inline torch::Tensor FullFlowModelImpl::forward(
+    const torch::Tensor& xt,
+    const torch::Tensor& condTime)
+{
+    torch::Tensor h = nn_activate(
+        layer1->forward(torch::cat({xt, condTime}, 1)));
+    h = nn_activate(
+        layer2->forward(torch::cat({h, condTime}, 1)));
+    return outputLayer->forward(torch::cat({h, condTime}, 1));
+}
+
+//---------------------------------------------------------
+// friday flow: frame-by-frame flow in pose latent space
+//---------------------------------------------------------
+
+inline FridayFlowModelImpl::FridayFlowModelImpl(int featureDim, int poseLatentDim)
+    : layer1(register_module("layer1",
+          torch::nn::Linear(poseLatentDim + featureDim + poseLatentDim + 1, 128))),
+      layer2(register_module("layer2",
+          torch::nn::Linear(128 + featureDim + poseLatentDim + 1, 256))),
+      outputLayer(register_module("outputLayer",
+          torch::nn::Linear(256 + featureDim + poseLatentDim + 1, poseLatentDim))),
+      condTimeDim(featureDim + poseLatentDim + 1)
+{
+}
+
+inline torch::Tensor FridayFlowModelImpl::forward(
+    const torch::Tensor& xt, const torch::Tensor& condTime)
+{
+    torch::Tensor h = nn_activate(layer1->forward(torch::cat({xt, condTime}, 1)));
+    h = nn_activate(layer2->forward(torch::cat({h, condTime}, 1)));
+    return outputLayer->forward(torch::cat({h, condTime}, 1));
+}
+
+// compute per-dimension std of pose latent codes by sampling from the database
+// call after PoseAE is trained (headstart done)
+static inline void ComputePoseLatentStats(
+    NetworkState* state,
+    const AnimDatabase* db)
+{
+    if (!state->poseAutoEncoder) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int sampleCount = std::min(2000, (int)db->legalStartFrames.size());
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->poseAutoEncoder->eval();
+
+    // encode a bunch of poses and collect latent values
+    torch::Tensor allLatents = torch::empty({sampleCount, latentDim});
+
+    {
+        torch::NoGradGuard noGrad;
+        torch::Tensor poseBatch = torch::empty({sampleCount, poseDim});
+        float* pPtr = poseBatch.data_ptr<float>();
+
+        for (int i = 0; i < sampleCount; ++i)
+        {
+            const int frame = db->legalStartFrames[
+                RandomInt((int)db->legalStartFrames.size())];
+            std::span<const float> row =
+                db->normalizedPoseGenFeatures.row_view(frame);
+            std::copy(row.begin(), row.end(), pPtr + i * poseDim);
+        }
+
+        poseBatch = poseBatch.to(state->device);
+        allLatents = PoseAEEncode(state->poseAutoEncoder, poseBatch);
+        allLatents = allLatents.to(torch::kCPU);
+    }
+
+    // compute per-dim std
+    torch::Tensor stdTensor = allLatents.std(0);
+    state->poseLatentStd.resize(latentDim);
+    const float* sPtr = stdTensor.data_ptr<float>();
+    for (int d = 0; d < latentDim; ++d)
+    {
+        state->poseLatentStd[d] = sPtr[d];
+    }
+
+    TraceLog(LOG_INFO,
+        "Pose latent stats computed from %d samples (mean std=%.4f)",
+        sampleCount, stdTensor.mean().item<float>());
+}
+
+static inline void SavePoseLatentStats(
+    const NetworkState* state,
+    const std::string& folder)
+{
+    if (state->poseLatentStd.empty()) return;
+    const std::string path = folder + "/poseLatentStd.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    const int n = (int)state->poseLatentStd.size();
+    fwrite(&n, sizeof(int), 1, f);
+    fwrite(state->poseLatentStd.data(), sizeof(float), n, f);
+    fclose(f);
+}
+
+static inline void LoadPoseLatentStats(
+    NetworkState* state,
+    const std::string& folder)
+{
+    const std::string path = folder + "/poseLatentStd.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    int n = 0;
+    if (fread(&n, sizeof(int), 1, f) != 1 || n <= 0 || n > 1024)
+    {
+        fclose(f);
+        return;
+    }
+    state->poseLatentStd.resize(n);
+    if (fread(state->poseLatentStd.data(), sizeof(float), n, f) != (size_t)n)
+    {
+        state->poseLatentStd.clear();
+    }
+    fclose(f);
+    if (!state->poseLatentStd.empty())
+    {
+        TraceLog(LOG_INFO, "Loaded pose latent stats (%d dims) from: %s",
+            n, path.c_str());
+    }
+}
+
+static inline void NetworkInitFridayFlow(NetworkState* state, int featureDim, int poseLatentDim)
+{
+    if (featureDim <= 0 || poseLatentDim <= 0) return;
+    NetworkEnsureDevice(state);
+
+    state->fridayFlowModel = FridayFlowModel(featureDim, poseLatentDim);
+    state->fridayFlowModel->to(state->device);
+
+    state->fridayFlowOptimizer = std::make_shared<torch::optim::Adam>(
+        state->fridayFlowModel->parameters(), torch::optim::AdamOptions(1e-3));
+
+    state->fridayFlowLoss = 0.0f;
+    state->fridayFlowIterations = 0;
+    TraceLog(LOG_INFO, "FridayFlow initialized: featureDim=%d poseLatentDim=%d",
+        featureDim, poseLatentDim);
+}
+
+static inline void NetworkSaveFridayFlow(const NetworkState* state, const std::string& folder)
+{
+    if (!state->fridayFlowModel) return;
+    const std::string path = folder + "/fridayFlowModel.bin";
+    torch::save(state->fridayFlowModel, path);
+    SavePoseLatentStats(state, folder);
+    TraceLog(LOG_INFO, "Saved FridayFlow to: %s", path.c_str());
+}
+
+static inline void NetworkLoadFridayFlow(
+    NetworkState* state,
+    const std::string& folder,
+    int featureDim,
+    int poseLatentDim,
+    const AnimDatabase* db)
+{
+    const std::string path = folder + "/fridayFlowModel.bin";
+    try
+    {
+        NetworkInitFridayFlow(state, featureDim, poseLatentDim);
+        torch::load(state->fridayFlowModel, path);
+        state->fridayFlowModel->to(state->device);
+        TraceLog(LOG_INFO, "Loaded FridayFlow from: %s", path.c_str());
+
+        // load or recompute pose latent stats
+        LoadPoseLatentStats(state, folder);
+        if (state->poseLatentStd.empty() && db != nullptr)
+        {
+            ComputePoseLatentStats(state, db);
+            SavePoseLatentStats(state, folder);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_WARNING, "Could not load FridayFlow: %s", e.what());
+        state->fridayFlowModel = nullptr;
+        state->fridayFlowOptimizer = nullptr;
+    }
+}
+
+//---------------------------------------------------------
 // latent flow matching model
 //---------------------------------------------------------
 
@@ -694,6 +1355,75 @@ static inline void NetworkLoadFlow(
 }
 
 //---------------------------------------------------------
+// full-space flow model init / save / load
+//---------------------------------------------------------
+
+static inline void NetworkInitFullFlow(
+    NetworkState* state,
+    int featureDim,
+    int flatDim)
+{
+    if (featureDim <= 0 || flatDim <= 0) return;
+
+    NetworkEnsureDevice(state);
+
+    state->fullFlowModel = FullFlowModel(featureDim, flatDim);
+    state->fullFlowModel->to(state->device);
+
+    state->fullFlowOptimizer =
+        std::make_shared<torch::optim::Adam>(
+            state->fullFlowModel->parameters(),
+            torch::optim::AdamOptions(1e-3));
+
+    state->fullFlowLoss = 0.0f;
+    state->fullFlowIterations = 0;
+
+    TraceLog(LOG_INFO,
+        "FullFlow initialized: cond=%d flat=%d "
+        "layers: %d->256->512->%d (cond re-injected)",
+        featureDim, flatDim,
+        flatDim + featureDim + 1, flatDim);
+}
+
+static inline void NetworkSaveFullFlow(
+    const NetworkState* state,
+    const std::string& folderPath)
+{
+    if (!state->fullFlowModel) return;
+    const std::string path = folderPath + "/fullFlowModel.bin";
+    try
+    {
+        torch::save(state->fullFlowModel, path);
+        TraceLog(LOG_INFO, "Saved FullFlow to: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to save FullFlow: %s", e.what());
+    }
+}
+
+static inline void NetworkLoadFullFlow(
+    NetworkState* state,
+    int featureDim,
+    int flatDim,
+    const std::string& folderPath)
+{
+    const std::string path = folderPath + "/fullFlowModel.bin";
+    if (!std::filesystem::exists(path)) return;
+    try
+    {
+        NetworkInitFullFlow(state, featureDim, flatDim);
+        torch::load(state->fullFlowModel, path);
+        state->fullFlowModel->to(state->device);
+        TraceLog(LOG_INFO, "Loaded FullFlow from: %s", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Failed to load FullFlow: %s", e.what());
+    }
+}
+
+//---------------------------------------------------------
 // loss history CSV save/load
 //---------------------------------------------------------
 
@@ -709,17 +1439,24 @@ static inline void LossHistorySave(
         return;
     }
 
-    fprintf(f, "time,featureAE,segmentAE,predictor,flow,e2e\n");
+    fprintf(f, "time,featureAE,poseAE,segmentAE,predictor,flow,segmentE2e,fullFlow,fridayFlow,singlePose,singlePoseE2e,uncondAdvance,monday\n");
     const int n = (int)state->lossHistoryTime.size();
     for (int i = 0; i < n; ++i)
     {
-        fprintf(f, "%.1f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
+        fprintf(f, "%.1f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
             state->lossHistoryTime[i],
             i < (int)state->featureAELossHistory.size() ? state->featureAELossHistory[i] : 0.0f,
+            i < (int)state->poseAELossHistory.size() ? state->poseAELossHistory[i] : 0.0f,
             i < (int)state->segmentAELossHistory.size() ? state->segmentAELossHistory[i] : 0.0f,
-            i < (int)state->predictorLossHistory.size() ? state->predictorLossHistory[i] : 0.0f,
+            i < (int)state->latentSegmentPredictorLossHistory.size() ? state->latentSegmentPredictorLossHistory[i] : 0.0f,
             i < (int)state->flowLossHistory.size() ? state->flowLossHistory[i] : 0.0f,
-            i < (int)state->e2eLossHistory.size() ? state->e2eLossHistory[i] : 0.0f);
+            i < (int)state->segmentE2eLossHistory.size() ? state->segmentE2eLossHistory[i] : 0.0f,
+            i < (int)state->fullFlowLossHistory.size() ? state->fullFlowLossHistory[i] : 0.0f,
+            i < (int)state->fridayFlowLossHistory.size() ? state->fridayFlowLossHistory[i] : 0.0f,
+            i < (int)state->singlePosePredictorLossHistory.size() ? state->singlePosePredictorLossHistory[i] : 0.0f,
+            i < (int)state->singlePoseE2eLossHistory.size() ? state->singlePoseE2eLossHistory[i] : 0.0f,
+            i < (int)state->uncondAdvanceLossHistory.size() ? state->uncondAdvanceLossHistory[i] : 0.0f,
+            i < (int)state->mondayLossHistory.size() ? state->mondayLossHistory[i] : 0.0f);
     }
 
     fclose(f);
@@ -736,27 +1473,49 @@ static inline void LossHistoryLoad(
 
     state->lossHistoryTime.clear();
     state->featureAELossHistory.clear();
+    state->poseAELossHistory.clear();
     state->segmentAELossHistory.clear();
-    state->predictorLossHistory.clear();
+    state->latentSegmentPredictorLossHistory.clear();
+    state->singlePosePredictorLossHistory.clear();
     state->flowLossHistory.clear();
-    state->e2eLossHistory.clear();
+    state->segmentE2eLossHistory.clear();
+    state->fullFlowLossHistory.clear();
+    state->fridayFlowLossHistory.clear();
+    state->singlePoseE2eLossHistory.clear();
+    state->uncondAdvanceLossHistory.clear();
+    state->mondayLossHistory.clear();
 
     // skip header
     char line[512];
     if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
 
-    // read rows — supports both old (5 col) and new (6 col) formats
+    // columns: time,featureAE,poseAE,segmentAE,predictor,flow,segmentE2e,fullFlow,fridayFlow,singlePose,singlePoseE2e,uncondAdvance,monday
     while (fgets(line, sizeof(line), f))
     {
-        float t = 0, fae = 0, sae = 0, pred = 0, flow = 0, e2e = 0;
-        const int cols = sscanf(line, "%f,%f,%f,%f,%f,%f", &t, &fae, &sae, &pred, &flow, &e2e);
+        float t = 0, fae = 0, pae = 0, sae = 0;
+        float pred = 0, flow = 0, segE2e = 0;
+        float ff = 0, friday = 0, singlePose = 0, singlePoseE2e = 0;
+        float uncondAdv = 0, monday = 0;
+        const int cols = sscanf(
+            line,
+            "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f",
+            &t, &fae, &pae, &sae,
+            &pred, &flow, &segE2e, &ff, &friday,
+            &singlePose, &singlePoseE2e, &uncondAdv, &monday);
         if (cols < 5) break;
         state->lossHistoryTime.push_back(t);
         state->featureAELossHistory.push_back(fae);
-        state->segmentAELossHistory.push_back(sae);
-        state->predictorLossHistory.push_back(pred);
-        state->flowLossHistory.push_back(flow);
-        state->e2eLossHistory.push_back(cols >= 6 ? e2e : 0.0f);
+        state->poseAELossHistory.push_back(cols >= 3 ? pae : 0.0f);
+        state->segmentAELossHistory.push_back(cols >= 4 ? sae : 0.0f);
+        state->latentSegmentPredictorLossHistory.push_back(cols >= 5 ? pred : 0.0f);
+        state->flowLossHistory.push_back(cols >= 6 ? flow : 0.0f);
+        state->segmentE2eLossHistory.push_back(cols >= 7 ? segE2e : 0.0f);
+        state->fullFlowLossHistory.push_back(cols >= 8 ? ff : 0.0f);
+        state->fridayFlowLossHistory.push_back(cols >= 9 ? friday : 0.0f);
+        state->singlePosePredictorLossHistory.push_back(cols >= 10 ? singlePose : 0.0f);
+        state->singlePoseE2eLossHistory.push_back(cols >= 11 ? singlePoseE2e : 0.0f);
+        state->uncondAdvanceLossHistory.push_back(cols >= 12 ? uncondAdv : 0.0f);
+        state->mondayLossHistory.push_back(cols >= 13 ? monday : 0.0f);
     }
 
     fclose(f);
@@ -776,27 +1535,46 @@ static inline void NetworkSaveAll(
     const std::string& folderPath)
 {
     NetworkSaveFeatureAE(state, folderPath);
+    NetworkSavePoseAE(state, folderPath);
     NetworkSaveSegmentAE(state, folderPath);
-    NetworkSavePredictor(state, folderPath);
+    NetworkSaveLatentSegmentPredictor(state, folderPath);
+    NetworkSaveSinglePosePredictor(state, folderPath);
     NetworkSaveFlow(state, folderPath);
+    NetworkSaveFullFlow(state, folderPath);
+    NetworkSaveFridayFlow(state, folderPath);
+    NetworkSaveUncondAdvance(state, folderPath);
+    NetworkSaveMonday(state, folderPath);
     LossHistorySave(state, folderPath);
 }
 
 static inline void NetworkLoadAll(
     NetworkState* state,
-    int featureDim,
-    int segmentFlatDim,
+    const AnimDatabase* db,  
     const std::string& folderPath)
 {
+    const int featureDim = db->featureDim;
+    const int segmentFlatDim = db->poseGenSegmentFlatDim;
     NetworkLoadFeatureAE(state, featureDim, FEATURE_AE_LATENT_DIM, folderPath);
+    NetworkLoadPoseAE(state, db->poseGenFeaturesComputeDim, POSE_AE_LATENT_DIM, folderPath); 
     if (segmentFlatDim > 0)
     {
         NetworkLoadSegmentAE(state, segmentFlatDim, SEGMENT_AE_LATENT_DIM, folderPath);
     }
-    NetworkLoadPredictor(state, FEATURE_AE_LATENT_DIM, SEGMENT_AE_LATENT_DIM, folderPath);
+    NetworkLoadLatentSegmentPredictor(state, FEATURE_AE_LATENT_DIM, SEGMENT_AE_LATENT_DIM, folderPath);
+    NetworkLoadSinglePosePredictor(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM, folderPath);
     NetworkLoadFlow(state, FEATURE_AE_LATENT_DIM, SEGMENT_AE_LATENT_DIM, folderPath);
+    if (segmentFlatDim > 0)
+    {
+        NetworkLoadFullFlow(state, featureDim, segmentFlatDim, folderPath);
+    }
+    NetworkLoadFridayFlow(
+        state, folderPath, FEATURE_AE_LATENT_DIM,
+        POSE_AE_LATENT_DIM, db);
+    NetworkLoadUncondAdvance(state, POSE_AE_LATENT_DIM, folderPath);
+    NetworkLoadMonday(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM, folderPath);
     LossHistoryLoad(state, folderPath);
 }
+
 
 //---------------------------------------------------------
 // time-budgeted training functions
@@ -868,14 +1646,96 @@ static inline void NetworkTrainFeatureAEForTime(
             "Feature AE Training Error: %s", e.what());
         state->isTraining = false;
     }
+}
 
-    if (state->featureAEIterations % 300 == 0
-        && state->featureAEIterations > 0)
+static inline void NetworkTrainPoseAEForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->poseAutoEncoder) return;
+    if (!state->poseAEOptimizer) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+    if (db->poseGenFeaturesComputeDim <= 0) return;
+
+    const int batchSize = 64;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const Clock::time_point start = Clock::now();
+
+    state->poseAutoEncoder->train();
+
+    try
     {
-        TraceLog(LOG_INFO,
-            "Feature AE Loss (iter %d): %.6f",
-            state->featureAEIterations,
-            state->featureAELoss);
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            // sample triplets of consecutive frames (prev, curr, next) from same clip
+            // so we can encourage straight latent trajectories
+            torch::Tensor prevHost = torch::empty({batchSize, poseDim});
+            torch::Tensor currHost = torch::empty({batchSize, poseDim});
+            torch::Tensor nextHost = torch::empty({batchSize, poseDim});
+            float* prevPtr = prevHost.data_ptr<float>();
+            float* currPtr = currHost.data_ptr<float>();
+            float* nextPtr = nextHost.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                // legal frames have enough buffer from clip boundaries
+                // that frame-1 and frame+1 are always in the same clip
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> rowPrev =
+                    db->normalizedPoseGenFeatures.row_view(frame - 1);
+                std::span<const float> rowCurr =
+                    db->normalizedPoseGenFeatures.row_view(frame);
+                std::span<const float> rowNext =
+                    db->normalizedPoseGenFeatures.row_view(frame + 1);
+                std::copy(rowPrev.begin(), rowPrev.end(), prevPtr + b * poseDim);
+                std::copy(rowCurr.begin(), rowCurr.end(), currPtr + b * poseDim);
+                std::copy(rowNext.begin(), rowNext.end(), nextPtr + b * poseDim);
+            }
+
+            torch::Tensor prev = prevHost.to(state->device);
+            torch::Tensor curr = currHost.to(state->device);
+            torch::Tensor next = nextHost.to(state->device);
+
+            // reconstruction loss on curr (with denoising noise, same as before)
+            torch::Tensor noise = torch::randn({batchSize, poseDim})
+                .to(state->device) * 0.05f;
+            torch::Tensor output = state->poseAutoEncoder->forward(curr + noise);
+            torch::Tensor reconLoss = torch::mse_loss(output, curr);
+
+            // straightness loss: penalize latent second derivative
+            // z_curr should be the midpoint of z_prev and z_next
+            torch::Tensor zPrev = PoseAEEncode(state->poseAutoEncoder, prev);
+            torch::Tensor zCurr = PoseAEEncode(state->poseAutoEncoder, curr);
+            torch::Tensor zNext = PoseAEEncode(state->poseAutoEncoder, next);
+            torch::Tensor straightLoss = torch::mean(
+                torch::square(zPrev - 2.0f * zCurr + zNext));
+
+            // tightness loss: penalize distances between consecutive latent codes
+            // encourages the encoder to place consecutive frames close together
+            torch::Tensor tightLoss = torch::mean(torch::square(zCurr - zPrev))
+                + torch::mean(torch::square(zNext - zCurr));
+
+            torch::Tensor loss = reconLoss
+                + POSE_AE_STRAIGHT_WEIGHT * straightLoss
+                + POSE_AE_TIGHT_WEIGHT * tightLoss;
+
+            state->poseAEOptimizer->zero_grad();
+            loss.backward();
+            state->poseAEOptimizer->step();
+
+            state->poseAELoss = loss.item<float>();
+            state->poseAELossSmoothed = state->poseAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                + state->poseAELoss * LOSS_SMOOTHING_FACTOR;
+            state->poseAEIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR,
+            "Pose AE Training Error: %s", e.what());
+        state->isTraining = false;
     }
 }
 
@@ -956,13 +1816,13 @@ static inline void NetworkTrainSegmentAEForTime(
 
 // train predictor for up to budgetSeconds
 // both AEs are frozen (eval + NoGrad)
-static inline void NetworkTrainPredictorForTime(
+static inline void NetworkTrainLatentSegmentPredictorForTime(
     NetworkState* state,
     const AnimDatabase* db,
     double budgetSeconds)
 {
     if (!state->segmentLatentAveragePredictor) return;
-    if (!state->predictorOptimizer) return;
+    if (!state->latentSegmentPredictorOptimizer) return;
     if (!state->featuresAutoEncoder) return;
     if (!state->segmentAutoEncoder) return;
     if (db->normalizedFeatures.empty()) return;
@@ -1031,7 +1891,7 @@ static inline void NetworkTrainPredictorForTime(
             }
 
             // predict and optimize
-            state->predictorOptimizer->zero_grad();
+            state->latentSegmentPredictorOptimizer->zero_grad();
             torch::Tensor predicted =
                 state->segmentLatentAveragePredictor
                     ->forward(featureLatent);
@@ -1039,12 +1899,12 @@ static inline void NetworkTrainPredictorForTime(
                 torch::mse_loss(predicted, segmentLatent);
 
             loss.backward();
-            state->predictorOptimizer->step();
+            state->latentSegmentPredictorOptimizer->step();
 
-            state->predictorLoss = loss.item<float>();
-            state->predictorLossSmoothed = state->predictorLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->predictorLoss * LOSS_SMOOTHING_FACTOR;
-            state->predictorIterations++;
+            state->latentSegmentPredictorLoss = loss.item<float>();
+            state->latentSegmentPredictorLossSmoothed = state->latentSegmentPredictorLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                + state->latentSegmentPredictorLoss * LOSS_SMOOTHING_FACTOR;
+            state->latentSegmentPredictorIterations++;
         }
     }
     catch (const std::exception& e)
@@ -1053,14 +1913,86 @@ static inline void NetworkTrainPredictorForTime(
             "Predictor Training Error: %s", e.what());
         state->isTraining = false;
     }
+}
 
-    if (state->predictorIterations % 300 == 0
-        && state->predictorIterations > 0)
+//---------------------------------------------------------
+// single pose predictor training
+// featureAE and poseAE are frozen
+//---------------------------------------------------------
+
+static inline void NetworkTrainSinglePosePredictorForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->singlePosePredictor) return;
+    if (!state->singlePosePredictorOptimizer) return;
+    if (!state->featuresAutoEncoder) return;
+    if (!state->poseAutoEncoder) return;
+    if (db->normalizedFeatures.empty()) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int featureDim = db->featureDim;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const Clock::time_point start = Clock::now();
+
+    state->featuresAutoEncoder->eval();
+    state->poseAutoEncoder->eval();
+    state->singlePosePredictor->train();
+
+    try
     {
-        TraceLog(LOG_INFO,
-            "Predictor Loss (iter %d): %.6f",
-            state->predictorIterations,
-            state->predictorLoss);
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            torch::Tensor featureBatch = torch::empty({batchSize, featureDim});
+            torch::Tensor poseBatch = torch::empty({batchSize, poseDim});
+            float* fPtr = featureBatch.data_ptr<float>();
+            float* pPtr = poseBatch.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> fRow = db->normalizedFeatures.row_view(frame);
+                std::copy(fRow.begin(), fRow.end(), fPtr + b * featureDim);
+
+                std::span<const float> pRow = db->normalizedPoseGenFeatures.row_view(frame);
+                std::copy(pRow.begin(), pRow.end(), pPtr + b * poseDim);
+            }
+
+            featureBatch = featureBatch.to(state->device);
+            poseBatch = poseBatch.to(state->device);
+
+            // encode through frozen AEs
+            torch::Tensor featureLatent, poseLatent;
+            {
+                torch::NoGradGuard noGrad;
+                featureLatent = EncodeWithAE(state->featuresAutoEncoder, featureBatch);
+                poseLatent = PoseAEEncode(state->poseAutoEncoder, poseBatch);
+            }
+
+            // predict and optimize
+            state->singlePosePredictorOptimizer->zero_grad();
+            torch::Tensor predicted = state->singlePosePredictor->forward(featureLatent);
+            torch::Tensor loss = torch::mse_loss(predicted, poseLatent);
+
+            loss.backward();
+            torch::nn::utils::clip_grad_norm_(state->singlePosePredictor->parameters(), 1.0);
+            state->singlePosePredictorOptimizer->step();
+
+            state->singlePosePredictorLoss = loss.item<float>();
+            state->singlePosePredictorLossSmoothed = state->singlePosePredictorIterations == 0
+                ? state->singlePosePredictorLoss
+                : state->singlePosePredictorLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->singlePosePredictorLoss * LOSS_SMOOTHING_FACTOR;
+            state->singlePosePredictorIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "SinglePosePredictor Training Error: %s", e.what());
+        state->isTraining = false;
     }
 }
 
@@ -1213,11 +2145,575 @@ static inline void NetworkTrainFlowForTime(
 }
 
 //---------------------------------------------------------
-// end-to-end training: features → encode → predict → decode → segment
+// full-space flow matching training (no AEs, direct segment space)
+//---------------------------------------------------------
+
+static inline void NetworkTrainFullFlowForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->fullFlowModel) return;
+    if (budgetSeconds <= 0.0) return;
+    if (db->normalizedFeatures.empty()) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int featureDim = db->featureDim;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int segFrames = db->poseGenSegmentFrameCount;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const Clock::time_point start = Clock::now();
+
+    state->fullFlowModel->train();
+
+    try
+    {
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            // build condition and segment batches on CPU
+            torch::Tensor condBatch = torch::empty({batchSize, featureDim});
+            torch::Tensor x1Batch = torch::empty({batchSize, flatDim});
+            float* cPtr = condBatch.data_ptr<float>();
+            float* sPtr = x1Batch.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> fRow = db->normalizedFeatures.row_view(frame);
+                std::copy(fRow.begin(), fRow.end(), cPtr + b * featureDim);
+
+                const float* src = db->normalizedPoseGenFeatures.data() + frame * pgDim;
+                memcpy(sPtr + b * flatDim, src, (size_t)segFrames * pgDim * sizeof(float));
+            }
+
+            condBatch = condBatch.to(state->device);
+            x1Batch = x1Batch.to(state->device);
+
+            // sample time and noise
+            torch::Tensor t = torch::rand(
+                {batchSize, 1},
+                torch::TensorOptions().device(state->device));
+            torch::Tensor x0 = torch::randn(
+                {batchSize, flatDim},
+                torch::TensorOptions().device(state->device));
+
+            // interpolate: xt = (1-t)*x0 + t*x1
+            torch::Tensor xt = (1.0f - t) * x0 + t * x1Batch;
+
+            // target velocity: x1 - x0 (constant along OT path)
+            torch::Tensor target = x1Batch - x0;
+
+            // condition + time concatenated for re-injection
+            torch::Tensor condTime = torch::cat({condBatch, t}, 1);
+
+            // forward and optimize
+            state->fullFlowOptimizer->zero_grad();
+            torch::Tensor predicted = state->fullFlowModel->forward(xt, condTime);
+            torch::Tensor loss = torch::mse_loss(predicted, target);
+
+            loss.backward();
+            state->fullFlowOptimizer->step();
+
+            state->fullFlowLoss = loss.item<float>();
+            state->fullFlowLossSmoothed = state->fullFlowIterations == 0
+                ? state->fullFlowLoss
+                : state->fullFlowLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                  + state->fullFlowLoss * LOSS_SMOOTHING_FACTOR;
+            state->fullFlowIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "FullFlow Training Error: %s", e.what());
+        state->isTraining = false;
+    }
+}
+
+//---------------------------------------------------------
+// friday flow training: flow matching predicting actual next latent
+// (ControlOperators-style: x1 = z1, Zdist-scaled noise, noisy z0 conditioning)
+//---------------------------------------------------------
+
+static inline void NetworkTrainFridayFlowForTime(NetworkState* state, const AnimDatabase* db, double budgetSeconds)
+{
+    if (!state->fridayFlowModel) return;
+    if (!state->poseAutoEncoder) return;
+    if (!state->featuresAutoEncoder) return;
+    if (budgetSeconds <= 0.0) return;
+    if (db->normalizedFeatures.empty()) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+    if (state->poseLatentStd.empty()) return;
+
+    const int batchSize = 64;
+    const int featureDim = db->featureDim;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+    const Clock::time_point start = Clock::now();
+
+    state->fridayFlowModel->train();
+    state->poseAutoEncoder->eval();
+    state->featuresAutoEncoder->eval();
+
+    // build Zdist tensor from stored per-dim std (kept on device for the loop)
+    torch::Tensor Zdist = torch::from_blob(
+        state->poseLatentStd.data(), {1, latentDim}, torch::kFloat32)
+        .clone().to(state->device);
+
+    try
+    {
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            torch::Tensor condBatch = torch::empty({batchSize, featureDim});
+            torch::Tensor poseBatch0 = torch::empty({batchSize, poseDim});
+            torch::Tensor poseBatch1 = torch::empty({batchSize, poseDim});
+            float* cPtr = condBatch.data_ptr<float>();
+            float* p0Ptr = poseBatch0.data_ptr<float>();
+            float* p1Ptr = poseBatch1.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                // legal frames have enough buffer from clip boundaries
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> fRow = db->normalizedFeatures.row_view(frame);
+                std::copy(fRow.begin(), fRow.end(), cPtr + b * featureDim);
+
+                std::span<const float> pRow0 = db->normalizedPoseGenFeatures.row_view(frame);
+                std::copy(pRow0.begin(), pRow0.end(), p0Ptr + b * poseDim);
+
+                std::span<const float> pRow1 = db->normalizedPoseGenFeatures.row_view(frame + 1);
+                std::copy(pRow1.begin(), pRow1.end(), p1Ptr + b * poseDim);
+            }
+
+            condBatch = condBatch.to(state->device);
+            poseBatch0 = poseBatch0.to(state->device);
+            poseBatch1 = poseBatch1.to(state->device);
+
+            // encode everything through frozen AEs:
+            // features -> feature latent (compact conditioning)
+            // poses -> pose latent (what the flow predicts)
+            torch::Tensor featureLatent, zPrev, zNext;
+            {
+                torch::NoGradGuard noGrad;
+                featureLatent = EncodeWithAE(state->featuresAutoEncoder, condBatch);
+                zPrev = PoseAEEncode(state->poseAutoEncoder, poseBatch0);
+                zNext = PoseAEEncode(state->poseAutoEncoder, poseBatch1);
+            }
+
+            // flow matching noise: random starting point of the flow path,
+            // scaled by per-dim data distribution so noise is closer to the actual
+            // latent distribution (less transport distance for the flow to learn)
+            torch::Tensor flowNoise = Zdist * torch::randn(
+                {batchSize, latentDim}, torch::TensorOptions().device(state->device));
+
+            // noisy conditioning: add noise to zPrev so the network learns to handle
+            // imperfect input at runtime (where zPrev is a previous prediction, not a
+            // clean AE encoding). Each sample gets a random noise level 0..POSE_NOISE.
+            torch::Tensor zPrevNoisy = zPrev + Zdist * FRIDAY_FLOW_POSE_NOISE
+                * torch::rand({batchSize, 1}, torch::TensorOptions().device(state->device))
+                * torch::randn_like(zPrev);
+
+            // flow matching: sample t
+            torch::Tensor t = torch::rand(
+                {batchSize, 1}, torch::TensorOptions().device(state->device));
+
+            // interpolate along flow path: from noise toward the target next latent
+            torch::Tensor zt = (1.0f - t) * flowNoise + t * zNext;
+
+            // target: constant velocity along OT path (zNext - flowNoise)
+            torch::Tensor target = zNext - flowNoise;
+
+            // condition = cat(featureLatent, zPrevNoisy, t)
+            torch::Tensor condTime = torch::cat({featureLatent, zPrevNoisy, t}, 1);
+
+            // forward: network output scaled by Zdist (denormalization of velocity)
+            state->fridayFlowOptimizer->zero_grad();
+            torch::Tensor predicted = Zdist * state->fridayFlowModel->forward(zt, condTime);
+            torch::Tensor loss = torch::mse_loss(predicted, target);
+
+            loss.backward();
+            torch::nn::utils::clip_grad_norm_(state->fridayFlowModel->parameters(), 1.0);
+            state->fridayFlowOptimizer->step();
+
+            state->fridayFlowLoss = loss.item<float>();
+            state->fridayFlowLossSmoothed = state->fridayFlowIterations == 0
+                ? state->fridayFlowLoss
+                : state->fridayFlowLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR) + state->fridayFlowLoss * LOSS_SMOOTHING_FACTOR;
+            state->fridayFlowIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "FridayFlow Training Error: %s", e.what());
+        state->isTraining = false;
+    }
+}
+
+//---------------------------------------------------------
+// friday flow inference: predict the actual next latent
+//---------------------------------------------------------
+
+static inline bool NetworkPredictFridayFlow(
+    NetworkState* state,
+    const AnimDatabase* db,
+    const std::vector<float>& rawQuery,
+    const std::vector<float>& currentLatent,
+    /*out*/ std::vector<float>& predictedNextLatent)
+{
+    if (!state->fridayFlowModel) return false;
+    if (!state->poseAutoEncoder) return false;
+    if (!state->featuresAutoEncoder) return false;
+    if (state->poseLatentStd.empty()) return false;
+
+    const int featureDim = db->featureDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->fridayFlowModel->eval();
+    state->featuresAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // Zdist for scaling noise and network output
+    torch::Tensor Zdist = torch::from_blob(
+        state->poseLatentStd.data(), {1, latentDim}, torch::kFloat32)
+        .clone().to(state->device);
+
+    // normalize the raw MM query, then encode through feature AE
+    torch::Tensor normQuery = torch::empty({1, featureDim});
+    NormalizeFeatureQuery(db, rawQuery.data(), normQuery.data_ptr<float>());
+    normQuery = normQuery.to(state->device);
+    torch::Tensor featureLatent = EncodeWithAE(state->featuresAutoEncoder, normQuery);
+
+    // current latent as tensor (this is zPrev — the conditioning)
+    torch::Tensor zPrev = torch::from_blob(
+        (void*)currentLatent.data(), {1, latentDim}, torch::kFloat32)
+        .clone().to(state->device);
+
+    // start from distribution-matched noise
+    const int steps = FLOW_INFERENCE_STEPS;
+    //torch::Tensor x = Zdist * torch::randn(
+    //    { 1, latentDim }, torch::TensorOptions().device(state->device));
+    // start from zero: deterministic at runtime
+    torch::Tensor x = Zdist * torch::zeros(
+        { 1, latentDim }, torch::TensorOptions().device(state->device));
+
+    // Euler integration: flow from noise toward the predicted next latent
+    for (int s = 0; s < steps; ++s)
+    {
+        const float tVal = (float)s / (float)steps;
+        torch::Tensor t = torch::full(
+            {1, 1}, tVal, torch::TensorOptions().device(state->device));
+        torch::Tensor condTime = torch::cat({featureLatent, zPrev, t}, 1);
+        torch::Tensor v = Zdist * state->fridayFlowModel->forward(x, condTime);
+        x = x + v * (1.0f / steps);
+    }
+
+    // bail if the ODE produced NaN/Inf (untrained or unstable network)
+    if (!x.isfinite().all().item<bool>())
+    {
+        return false;
+    }
+
+    // x is now the predicted next latent (not a delta)
+    predictedNextLatent.resize(latentDim);
+    torch::Tensor xCpu = x.to(torch::kCPU);
+    const float* xPtr = xCpu.data_ptr<float>();
+    for (int d = 0; d < latentDim; ++d)
+    {
+        predictedNextLatent[d] = xPtr[d];
+    }
+    return true;
+}
+
+//---------------------------------------------------------
+// friday flow: decode latent to raw poseGenFeatures
+//---------------------------------------------------------
+
+static inline bool NetworkDecodeFridayFlowLatent(
+    NetworkState* state, const AnimDatabase* db, const std::vector<float>& latent, /*out*/ std::vector<float>& rawPose)
+{
+    if (!state->poseAutoEncoder) return false;
+
+    const int latentDim = POSE_AE_LATENT_DIM;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+
+    state->poseAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    torch::Tensor z = torch::from_blob((void*)latent.data(), {1, latentDim}, torch::kFloat32).clone().to(state->device);
+
+    torch::Tensor decoded = PoseAEDecode(state->poseAutoEncoder, z);
+    decoded = decoded.to(torch::kCPU);
+    const float* dPtr = decoded.data_ptr<float>();
+
+    // denormalize: raw = (val / weight) * std + mean, then clamp to mocap bounds
+    rawPose.resize(poseDim);
+    for (int d = 0; d < poseDim; ++d)
+    {
+        const float w = db->poseGenFeaturesWeight[d];
+        if (w > 1e-10f)
+        {
+            rawPose[d] = (dPtr[d] / w) * db->poseGenFeaturesStd[d] + db->poseGenFeaturesMean[d];
+        }
+        else
+        {
+            rawPose[d] = db->poseGenFeaturesMean[d];
+        }
+        rawPose[d] = std::clamp(rawPose[d], db->poseGenFeaturesMin[d], db->poseGenFeaturesMax[d]);
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
+// friday flow: encode raw poseGenFeatures to latent
+//---------------------------------------------------------
+
+static inline bool NetworkEncodePoseToLatent(
+    NetworkState* state, const AnimDatabase* db, const std::vector<float>& rawPose, /*out*/ std::vector<float>& latent)
+{
+    if (!state->poseAutoEncoder) return false;
+
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->poseAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // normalize
+    torch::Tensor input = torch::empty({1, poseDim});
+    float* iPtr = input.data_ptr<float>();
+    for (int d = 0; d < poseDim; ++d)
+    {
+        const float std = db->poseGenFeaturesStd[d];
+        const float w = db->poseGenFeaturesWeight[d];
+        if (std > 1e-10f)
+        {
+            iPtr[d] = (rawPose[d] - db->poseGenFeaturesMean[d]) / std * w;
+        }
+        else
+        {
+            iPtr[d] = 0.0f;
+        }
+    }
+    input = input.to(state->device);
+
+    torch::Tensor z = PoseAEEncode(state->poseAutoEncoder, input);
+    z = z.to(torch::kCPU);
+    const float* zPtr = z.data_ptr<float>();
+
+    latent.resize(latentDim);
+    for (int d = 0; d < latentDim; ++d) latent[d] = zPtr[d];
+
+    return true;
+}
+
+//---------------------------------------------------------
+// single pose predictor inference:
+// features -> featureAE -> predict pose latent -> poseAE decode -> raw pose
+//---------------------------------------------------------
+
+static inline bool NetworkPredictSinglePose(
+    NetworkState* state,
+    const AnimDatabase* db,
+    const std::vector<float>& rawQuery,
+    /*out*/ std::vector<float>& rawPose)
+{
+    if (!state->singlePosePredictor) return false;
+    if (!state->featuresAutoEncoder) return false;
+    if (!state->poseAutoEncoder) return false;
+
+    const int featureDim = db->featureDim;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+
+    state->singlePosePredictor->eval();
+    state->featuresAutoEncoder->eval();
+    state->poseAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // normalize and encode features
+    torch::Tensor normQuery = torch::empty({1, featureDim});
+    NormalizeFeatureQuery(db, rawQuery.data(), normQuery.data_ptr<float>());
+    normQuery = normQuery.to(state->device);
+    torch::Tensor featureLatent = EncodeWithAE(state->featuresAutoEncoder, normQuery);
+
+    // predict pose latent
+    torch::Tensor poseLatent = state->singlePosePredictor->forward(featureLatent);
+
+    // decode through PoseAE
+    torch::Tensor decoded = PoseAEDecode(state->poseAutoEncoder, poseLatent);
+    decoded = decoded.to(torch::kCPU);
+    const float* dPtr = decoded.data_ptr<float>();
+
+    // denormalize and clamp
+    rawPose.resize(poseDim);
+    for (int d = 0; d < poseDim; ++d)
+    {
+        const float w = db->poseGenFeaturesWeight[d];
+        if (w > 1e-10f)
+        {
+            rawPose[d] = (dPtr[d] / w) * db->poseGenFeaturesStd[d] + db->poseGenFeaturesMean[d];
+        }
+        else
+        {
+            rawPose[d] = db->poseGenFeaturesMean[d];
+        }
+        rawPose[d] = std::clamp(rawPose[d], db->poseGenFeaturesMin[d], db->poseGenFeaturesMax[d]);
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
+// single pose predictor: features → pose latent (no decode)
+// used by UnconditionedAdvance mode to get conditioned latent on search frames
+//---------------------------------------------------------
+
+static inline bool NetworkPredictSinglePoseLatent(
+    NetworkState* state,
+    const AnimDatabase* db,
+    const std::vector<float>& rawQuery,
+    /*out*/ std::vector<float>& poseLatentOut)
+{
+    if (!state->singlePosePredictor) return false;
+    if (!state->featuresAutoEncoder) return false;
+
+    const int featureDim = db->featureDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->singlePosePredictor->eval();
+    state->featuresAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // normalize and encode features
+    torch::Tensor normQuery = torch::empty({1, featureDim});
+    NormalizeFeatureQuery(db, rawQuery.data(), normQuery.data_ptr<float>());
+    normQuery = normQuery.to(state->device);
+    torch::Tensor featureLatent = EncodeWithAE(state->featuresAutoEncoder, normQuery);
+
+    // predict pose latent (stop here, no PoseAE decode)
+    torch::Tensor poseLatent = state->singlePosePredictor->forward(featureLatent);
+    poseLatent = poseLatent.to(torch::kCPU);
+    const float* zPtr = poseLatent.data_ptr<float>();
+
+    poseLatentOut.resize(latentDim);
+    for (int d = 0; d < latentDim; ++d)
+    {
+        poseLatentOut[d] = zPtr[d];
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
+// unconditioned advance inference: pose latent → next pose latent
+//---------------------------------------------------------
+
+static inline bool NetworkPredictUncondAdvance(
+    NetworkState* state,
+    const std::vector<float>& currentLatent,
+    /*out*/ std::vector<float>& predictedNextLatent)
+{
+    if (!state->uncondAdvancePredictor) return false;
+
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->uncondAdvancePredictor->eval();
+    torch::NoGradGuard noGrad;
+
+    torch::Tensor z = torch::from_blob(
+        (void*)currentLatent.data(), {1, latentDim}, torch::kFloat32)
+        .clone().to(state->device);
+
+    torch::Tensor predicted = state->uncondAdvancePredictor->forward(z);
+
+    if (!predicted.isfinite().all().item<bool>())
+    {
+        return false;
+    }
+
+    predicted = predicted.to(torch::kCPU);
+    const float* pPtr = predicted.data_ptr<float>();
+    predictedNextLatent.resize(latentDim);
+    for (int d = 0; d < latentDim; ++d)
+    {
+        predictedNextLatent[d] = pPtr[d];
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
+// monday predictor inference: (features, pose latent) → delta
+//---------------------------------------------------------
+
+static inline bool NetworkPredictMonday(
+    NetworkState* state,
+    const AnimDatabase* db,
+    const std::vector<float>& rawQuery,
+    const std::vector<float>& currentLatent,
+    /*out*/ std::vector<float>& deltaOut)
+{
+    if (!state->mondayPredictor) return false;
+    if (!state->featuresAutoEncoder) return false;
+
+    const int featureDim = db->featureDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+
+    state->mondayPredictor->eval();
+    state->featuresAutoEncoder->eval();
+    torch::NoGradGuard noGrad;
+
+    // normalize and encode features
+    torch::Tensor normQuery = torch::empty({1, featureDim});
+    NormalizeFeatureQuery(db, rawQuery.data(), normQuery.data_ptr<float>());
+    normQuery = normQuery.to(state->device);
+    torch::Tensor featureLatent = EncodeWithAE(state->featuresAutoEncoder, normQuery);
+
+    // current pose latent
+    torch::Tensor zCurrent = torch::from_blob(
+        (void*)currentLatent.data(), {1, latentDim}, torch::kFloat32)
+        .clone().to(state->device);
+
+    // predict delta (network outputs in normalized space)
+    torch::Tensor input = torch::cat({featureLatent, zCurrent}, 1);
+    torch::Tensor delta = state->mondayPredictor->forward(input);
+
+    // denormalize back to latent space scale
+    if (!state->mondayDeltaMean.empty())
+    {
+        torch::Tensor deltaMean = torch::from_blob(
+            (void*)state->mondayDeltaMean.data(), {1, latentDim}, torch::kFloat32)
+            .clone().to(state->device);
+        torch::Tensor deltaStd = torch::from_blob(
+            (void*)state->mondayDeltaStd.data(), {1, latentDim}, torch::kFloat32)
+            .clone().to(state->device);
+        delta = delta * deltaStd + deltaMean;
+    }
+
+    if (!delta.isfinite().all().item<bool>())
+    {
+        return false;
+    }
+
+    delta = delta.to(torch::kCPU);
+    const float* dPtr = delta.data_ptr<float>();
+    deltaOut.resize(latentDim);
+    for (int d = 0; d < latentDim; ++d)
+    {
+        deltaOut[d] = dPtr[d];
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
+// segment end-to-end training: features → encode → predict → decode → segment
 // gradients flow through all 3 networks simultaneously
 //---------------------------------------------------------
 
-static inline void NetworkTrainEndToEndForTime(
+static inline void NetworkTrainSegmentEndToEndForTime(
     NetworkState* state,
     const AnimDatabase* db,
     double budgetSeconds)
@@ -1227,7 +2723,7 @@ static inline void NetworkTrainEndToEndForTime(
     if (!state->segmentLatentAveragePredictor) return;
     if (!state->featureAEOptimizer) return;
     if (!state->segmentOptimizer) return;
-    if (!state->predictorOptimizer) return;
+    if (!state->latentSegmentPredictorOptimizer) return;
     if (db->normalizedFeatures.empty()) return;
     if (db->normalizedPoseGenFeatures.empty()) return;
 
@@ -1276,26 +2772,312 @@ static inline void NetworkTrainEndToEndForTime(
             // this is in normalized bone-weighted space, so important joints matter more
             state->featureAEOptimizer->zero_grad();
             state->segmentOptimizer->zero_grad();
-            state->predictorOptimizer->zero_grad();
+            state->latentSegmentPredictorOptimizer->zero_grad();
 
             torch::Tensor loss = torch::mse_loss(reconstructed, segmentBatch);
             loss.backward();
 
             state->featureAEOptimizer->step();
             state->segmentOptimizer->step();
-            state->predictorOptimizer->step();
+            state->latentSegmentPredictorOptimizer->step();
 
             const float lossVal = loss.item<float>();
-            state->e2eLoss = lossVal;
-            state->e2eLossSmoothed = state->e2eIterations == 0
+            state->segmentE2eLoss = lossVal;
+            state->segmentE2eLossSmoothed = state->segmentE2eIterations == 0
                 ? lossVal
-                : state->e2eLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR) + lossVal * LOSS_SMOOTHING_FACTOR;
-            state->e2eIterations++;
+                : state->segmentE2eLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR) + lossVal * LOSS_SMOOTHING_FACTOR;
+            state->segmentE2eIterations++;
         }
     }
     catch (const std::exception& e)
     {
-        TraceLog(LOG_ERROR, "E2E Training Error: %s", e.what());
+        TraceLog(LOG_ERROR, "Segment E2E Training Error: %s", e.what());
+        state->isTraining = false;
+    }
+}
+
+//---------------------------------------------------------
+// single pose end-to-end training: features → featureAE encode → predict → poseAE decode → pose
+// gradients flow through all 3 networks simultaneously
+//---------------------------------------------------------
+
+static inline void NetworkTrainSinglePoseEndToEndForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->featuresAutoEncoder) return;
+    if (!state->poseAutoEncoder) return;
+    if (!state->singlePosePredictor) return;
+    if (!state->featureAEOptimizer) return;
+    if (!state->poseAEOptimizer) return;
+    if (!state->singlePosePredictorOptimizer) return;
+    if (db->normalizedFeatures.empty()) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int featureDim = db->featureDim;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const Clock::time_point start = Clock::now();
+
+    // everything trains together — no frozen networks here
+    state->featuresAutoEncoder->train();
+    state->poseAutoEncoder->train();
+    state->singlePosePredictor->train();
+
+    try
+    {
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            torch::Tensor featureBatch = torch::empty({ batchSize, featureDim });
+            torch::Tensor poseBatch = torch::empty({ batchSize, poseDim });
+            float* fPtr = featureBatch.data_ptr<float>();
+            float* pPtr = poseBatch.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> fRow = db->normalizedFeatures.row_view(frame);
+                std::copy(fRow.begin(), fRow.end(), fPtr + b * featureDim);
+
+                std::span<const float> pRow = db->normalizedPoseGenFeatures.row_view(frame);
+                std::copy(pRow.begin(), pRow.end(), pPtr + b * poseDim);
+            }
+
+            featureBatch = featureBatch.to(state->device);
+            poseBatch = poseBatch.to(state->device);
+
+            // full chain: encode features, predict pose latent, decode to pose
+            torch::Tensor featureLatent = EncodeWithAE(state->featuresAutoEncoder, featureBatch);
+            torch::Tensor predictedPoseLatent = state->singlePosePredictor->forward(featureLatent);
+            torch::Tensor reconstructed = PoseAEDecode(state->poseAutoEncoder, predictedPoseLatent);
+
+            // loss in output space: the network chain must reconstruct the true pose
+            state->featureAEOptimizer->zero_grad();
+            state->poseAEOptimizer->zero_grad();
+            state->singlePosePredictorOptimizer->zero_grad();
+
+            torch::Tensor loss = torch::mse_loss(reconstructed, poseBatch);
+            loss.backward();
+
+            state->featureAEOptimizer->step();
+            state->poseAEOptimizer->step();
+            state->singlePosePredictorOptimizer->step();
+
+            const float lossVal = loss.item<float>();
+            state->singlePoseE2eLoss = lossVal;
+            state->singlePoseE2eLossSmoothed = state->singlePoseE2eIterations == 0
+                ? lossVal
+                : state->singlePoseE2eLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + lossVal * LOSS_SMOOTHING_FACTOR;
+            state->singlePoseE2eIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "SinglePose E2E Training Error: %s", e.what());
+        state->isTraining = false;
+    }
+}
+
+//---------------------------------------------------------
+// unconditioned pose advance training: pose latent → next pose latent
+// PoseAE is frozen, only the advance predictor trains
+//---------------------------------------------------------
+
+static inline void NetworkTrainUncondAdvanceForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->uncondAdvancePredictor) return;
+    if (!state->uncondAdvanceOptimizer) return;
+    if (!state->poseAutoEncoder) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const Clock::time_point start = Clock::now();
+
+    state->poseAutoEncoder->eval();
+    state->uncondAdvancePredictor->train();
+
+    try
+    {
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            torch::Tensor poseBatch0 = torch::empty({batchSize, poseDim});
+            torch::Tensor poseBatch1 = torch::empty({batchSize, poseDim});
+            float* p0Ptr = poseBatch0.data_ptr<float>();
+            float* p1Ptr = poseBatch1.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> pRow0 = db->normalizedPoseGenFeatures.row_view(frame);
+                std::copy(pRow0.begin(), pRow0.end(), p0Ptr + b * poseDim);
+
+                std::span<const float> pRow1 = db->normalizedPoseGenFeatures.row_view(frame + 1);
+                std::copy(pRow1.begin(), pRow1.end(), p1Ptr + b * poseDim);
+            }
+
+            poseBatch0 = poseBatch0.to(state->device);
+            poseBatch1 = poseBatch1.to(state->device);
+
+            // encode through frozen PoseAE
+            torch::Tensor zCurrent, zNext;
+            {
+                torch::NoGradGuard noGrad;
+                zCurrent = PoseAEEncode(state->poseAutoEncoder, poseBatch0);
+                zNext = PoseAEEncode(state->poseAutoEncoder, poseBatch1);
+            }
+
+            // add noise to input for robustness (at runtime the input is a previous prediction,
+            // not a clean AE encoding, so the network needs to handle imperfect inputs)
+            torch::Tensor noise = torch::randn_like(zCurrent) * 0.1f;
+            torch::Tensor zCurrentNoisy = zCurrent + noise;
+
+            // predict and optimize
+            state->uncondAdvanceOptimizer->zero_grad();
+            torch::Tensor predicted = state->uncondAdvancePredictor->forward(zCurrentNoisy);
+            torch::Tensor loss = torch::mse_loss(predicted, zNext);
+
+            loss.backward();
+            torch::nn::utils::clip_grad_norm_(state->uncondAdvancePredictor->parameters(), 1.0);
+            state->uncondAdvanceOptimizer->step();
+
+            state->uncondAdvanceLoss = loss.item<float>();
+            state->uncondAdvanceLossSmoothed = state->uncondAdvanceIterations == 0
+                ? state->uncondAdvanceLoss
+                : state->uncondAdvanceLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->uncondAdvanceLoss * LOSS_SMOOTHING_FACTOR;
+            state->uncondAdvanceIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "UncondAdvance Training Error: %s", e.what());
+        state->isTraining = false;
+    }
+}
+
+//---------------------------------------------------------
+// monday predictor training: (features, pose latent) → pose latent delta
+// both AEs frozen, only mondayPredictor trains
+//---------------------------------------------------------
+
+static inline void NetworkTrainMondayForTime(
+    NetworkState* state,
+    const AnimDatabase* db,
+    double budgetSeconds)
+{
+    if (!state->mondayPredictor) return;
+    if (!state->mondayOptimizer) return;
+    if (!state->featuresAutoEncoder) return;
+    if (!state->poseAutoEncoder) return;
+    if (db->normalizedFeatures.empty()) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int batchSize = 64;
+    const int featureDim = db->featureDim;
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    const int latentDim = POSE_AE_LATENT_DIM;
+    const Clock::time_point start = Clock::now();
+
+    // build normalization tensors if stats are available
+    const bool hasStats = !state->mondayDeltaMean.empty();
+    torch::Tensor deltaMean;
+    torch::Tensor deltaStd;
+    if (hasStats)
+    {
+        deltaMean = torch::from_blob(
+            (void*)state->mondayDeltaMean.data(), {1, latentDim}, torch::kFloat32)
+            .clone().to(state->device);
+        deltaStd = torch::from_blob(
+            (void*)state->mondayDeltaStd.data(), {1, latentDim}, torch::kFloat32)
+            .clone().to(state->device);
+    }
+
+    state->featuresAutoEncoder->eval();
+    state->poseAutoEncoder->eval();
+    state->mondayPredictor->train();
+
+    try
+    {
+        while (ElapsedSeconds(start) < budgetSeconds)
+        {
+            torch::Tensor featureBatch = torch::empty({batchSize, featureDim});
+            torch::Tensor poseBatch0 = torch::empty({batchSize, poseDim});
+            torch::Tensor poseBatch1 = torch::empty({batchSize, poseDim});
+            float* fPtr = featureBatch.data_ptr<float>();
+            float* p0Ptr = poseBatch0.data_ptr<float>();
+            float* p1Ptr = poseBatch1.data_ptr<float>();
+
+            for (int b = 0; b < batchSize; ++b)
+            {
+                const int frame = SampleLegalFrame(db);
+
+                std::span<const float> fRow = db->normalizedFeatures.row_view(frame);
+                std::copy(fRow.begin(), fRow.end(), fPtr + b * featureDim);
+
+                std::span<const float> pRow0 = db->normalizedPoseGenFeatures.row_view(frame);
+                std::copy(pRow0.begin(), pRow0.end(), p0Ptr + b * poseDim);
+
+                std::span<const float> pRow1 = db->normalizedPoseGenFeatures.row_view(frame + 1);
+                std::copy(pRow1.begin(), pRow1.end(), p1Ptr + b * poseDim);
+            }
+
+            featureBatch = featureBatch.to(state->device);
+            poseBatch0 = poseBatch0.to(state->device);
+            poseBatch1 = poseBatch1.to(state->device);
+
+            // encode through frozen AEs
+            torch::Tensor featureLatent, zCurrent, zNext;
+            {
+                torch::NoGradGuard noGrad;
+                featureLatent = EncodeWithAE(state->featuresAutoEncoder, featureBatch);
+                zCurrent = PoseAEEncode(state->poseAutoEncoder, poseBatch0);
+                zNext = PoseAEEncode(state->poseAutoEncoder, poseBatch1);
+            }
+
+            // add noise to input pose latent for robustness.
+            // the target delta adjusts accordingly: targetDelta = zNext - zCurrentNoisy
+            // which equals (cleanDelta - noise), teaching the network to correct back
+            // towards the trajectory when given drifted input at runtime
+            torch::Tensor noise = torch::randn_like(zCurrent) * 0.1f;
+            torch::Tensor zCurrentNoisy = zCurrent + noise;
+            torch::Tensor targetDelta = zNext - zCurrentNoisy;
+
+            // normalize target so the network outputs something close to gaussian
+            if (hasStats)
+            {
+                targetDelta = (targetDelta - deltaMean) / deltaStd;
+            }
+
+            // predict delta from (featureLatent, noisyPoseLatent)
+            torch::Tensor input = torch::cat({featureLatent, zCurrentNoisy}, 1);
+
+            state->mondayOptimizer->zero_grad();
+            torch::Tensor predictedDelta = state->mondayPredictor->forward(input);
+            torch::Tensor loss = torch::mse_loss(predictedDelta, targetDelta);
+
+            loss.backward();
+            torch::nn::utils::clip_grad_norm_(state->mondayPredictor->parameters(), 1.0);
+            state->mondayOptimizer->step();
+
+            state->mondayLoss = loss.item<float>();
+            state->mondayLossSmoothed = state->mondayIterations == 0
+                ? state->mondayLoss
+                : state->mondayLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->mondayLoss * LOSS_SMOOTHING_FACTOR;
+            state->mondayIterations++;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        TraceLog(LOG_ERROR, "Monday Training Error: %s", e.what());
         state->isTraining = false;
     }
 }
@@ -1318,35 +3100,73 @@ static inline double NetworkTrainAll(
     const Clock::time_point wallStart = Clock::now();
 
     const double elapsed = state->trainingElapsedSeconds;
-    const bool hasPredictor =
-        static_cast<bool>(
-            state->segmentLatentAveragePredictor);
+    const bool hasLatentSegmentPredictor =
+        static_cast<bool>(state->segmentLatentAveragePredictor);
     const bool hasFlow =
         static_cast<bool>(state->latentFlowModel);
+    const bool hasFridayFlow =
+        static_cast<bool>(state->fridayFlowModel);
+    const bool hasSinglePosePredictor =
+        static_cast<bool>(state->singlePosePredictor);
+    const bool hasUncondAdvance =
+        static_cast<bool>(state->uncondAdvancePredictor);
+    const bool hasMonday =
+        static_cast<bool>(state->mondayPredictor);
 
-    // 2-phase training schedule using relative weights:
-    // phase 1 (0-5s):  AEs only (headstart)
-    // phase 2 (5s+):   everything
+    // auto-init fullFlow immediately (no headstart needed, doesn't use AEs)
+    if (!state->fullFlowModel &&
+        db->featureDim > 0 && db->poseGenSegmentFlatDim > 0)
+    {
+        NetworkInitFullFlow(state, db->featureDim, db->poseGenSegmentFlatDim);
+    }
+
+    const bool hasFullFlow =
+        static_cast<bool>(state->latentFlowModel);
+
+
+    // split otherBudget among existing networks using relative weights
+    // phase 1 (0-5s): AEs only. phase 2 (5s+): everything
     const float wFeature = BUDGET_WEIGHT_FEATURE_AE;
+    const float wPose = BUDGET_WEIGHT_POSE_AE;
     const float wSegment = BUDGET_WEIGHT_SEGMENT_AE;
-    const float wPredictor = hasPredictor ? BUDGET_WEIGHT_PREDICTOR : 0.0f;
-    const float wE2e = hasPredictor ? BUDGET_WEIGHT_E2E : 0.0f;
-    const float wFlow = hasFlow ? BUDGET_WEIGHT_FLOW : 0.0f;
-    const float totalWeight = wFeature + wSegment + wPredictor + wE2e + wFlow;
+    const float wPredictor = hasLatentSegmentPredictor ? BUDGET_WEIGHT_LATENT_SEGMENT_PREDICTOR : 0.0f;
+    const float wSegmentE2e = hasLatentSegmentPredictor ? BUDGET_WEIGHT_SEGMENT_E2E : 0.0f;
+    const float wFlow = hasFlow ? BUDGET_WEIGHT_SEGMENT_FLOW : 0.0f;
+    const float wFullFlow = hasFlow ? BUDGET_WEIGHT_FULL_FLOW : 0.0f;
+    const float wFridayFlow = hasFridayFlow ? BUDGET_WEIGHT_FRIDAY_FLOW : 0.0f;
+    const float wSinglePose = hasSinglePosePredictor ? BUDGET_WEIGHT_SINGLE_POSE_PREDICTOR : 0.0f;
+    const float wSinglePoseE2e = hasSinglePosePredictor ? BUDGET_WEIGHT_POSE_E2E : 0.0f;
+    const float wUncondAdvance = hasUncondAdvance ? BUDGET_WEIGHT_UNCOND_ADVANCE : 0.0f;
+    const float wMonday = hasMonday ? BUDGET_WEIGHT_MONDAY : 0.0f;
+    const float totalWeight = wFeature + wPose + wSegment + wPredictor + wSegmentE2e
+        + wFlow + wFullFlow + wFridayFlow + wSinglePose + wSinglePoseE2e
+        + wUncondAdvance + wMonday;
 
     const double featureBudget = totalBudgetSeconds * wFeature / totalWeight;
+    const double poseBudget = totalBudgetSeconds * wPose / totalWeight;
     const double segmentBudget = totalBudgetSeconds * wSegment / totalWeight;
     const double predictorBudget = totalBudgetSeconds * wPredictor / totalWeight;
-    const double e2eBudget = totalBudgetSeconds * wE2e / totalWeight;
+    const double segmentE2eBudget = totalBudgetSeconds * wSegmentE2e / totalWeight;
     const double flowBudget = totalBudgetSeconds * wFlow / totalWeight;
+    const double fullFlowBudget = totalBudgetSeconds * wFullFlow / totalWeight;
+    const double fridayFlowBudget = totalBudgetSeconds * wFridayFlow / totalWeight;
+    const double singlePoseBudget = totalBudgetSeconds * wSinglePose / totalWeight;
+    const double singlePoseE2eBudget = totalBudgetSeconds * wSinglePoseE2e / totalWeight;
+    const double uncondAdvanceBudget = totalBudgetSeconds * wUncondAdvance / totalWeight;
+    const double mondayBudget = totalBudgetSeconds * wMonday / totalWeight;
+
+    // train fullFlow first (gets the most budget)
+    if (hasFullFlow)
+        NetworkTrainFullFlowForTime(state, db, fullFlowBudget);
 
     NetworkTrainFeatureAEForTime(state, db, featureBudget);
+    NetworkTrainPoseAEForTime(state, db, poseBudget);
     NetworkTrainSegmentAEForTime(state, db, segmentBudget);
 
-    // auto-init predictor and flow after AE headstart
+    // auto-init predictor and latent flow after AE headstart
     if (!state->segmentLatentAveragePredictor && elapsed >= HEADSTART_SECONDS)
     {
-        NetworkInitPredictor(state, FEATURE_AE_LATENT_DIM, SEGMENT_AE_LATENT_DIM);
+        NetworkInitLatentSegmentPredictor(state, FEATURE_AE_LATENT_DIM, SEGMENT_AE_LATENT_DIM);
         TraceLog(LOG_INFO, "AE headstart done, predictor initialized.");
     }
 
@@ -1357,31 +3177,115 @@ static inline double NetworkTrainAll(
     }
 
     if (state->segmentLatentAveragePredictor && predictorBudget > 0.0)
-        NetworkTrainPredictorForTime(state, db, predictorBudget);
+        NetworkTrainLatentSegmentPredictorForTime(state, db, predictorBudget);
 
-    if (state->segmentLatentAveragePredictor && e2eBudget > 0.0)
-        NetworkTrainEndToEndForTime(state, db, e2eBudget);
+    if (state->segmentLatentAveragePredictor && segmentE2eBudget > 0.0)
+        NetworkTrainSegmentEndToEndForTime(state, db, segmentE2eBudget);
 
     if (state->latentFlowModel && flowBudget > 0.0)
         NetworkTrainFlowForTime(state, db, flowBudget);
+
+    // auto-init fridayFlow after PoseAE headstart
+    // needs both PoseAE and FeatureAE since we condition on feature latents
+    if (!state->fridayFlowModel
+        && elapsed >= FRIDAY_FLOW_HEADSTART
+        && state->poseAutoEncoder
+        && state->featuresAutoEncoder
+        && db->featureDim > 0)
+    {
+        NetworkInitFridayFlow(
+            state, FEATURE_AE_LATENT_DIM,
+            POSE_AE_LATENT_DIM);
+        ComputePoseLatentStats(state, db);
+        TraceLog(LOG_INFO,
+            "PoseAE headstart done, "
+            "FridayFlow initialized.");
+    }
+
+    // auto-init singlePosePredictor after headstart (same timing as FridayFlow)
+    if (!state->singlePosePredictor
+        && elapsed >= FRIDAY_FLOW_HEADSTART
+        && state->poseAutoEncoder
+        && state->featuresAutoEncoder)
+    {
+        NetworkInitSinglePosePredictor(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM);
+    }
+
+    // auto-init uncondAdvance after headstart (needs PoseAE)
+    if (!state->uncondAdvancePredictor
+        && elapsed >= FRIDAY_FLOW_HEADSTART
+        && state->poseAutoEncoder)
+    {
+        NetworkInitUncondAdvance(state, POSE_AE_LATENT_DIM);
+    }
+
+    // auto-init monday after headstart (needs both AEs)
+    if (!state->mondayPredictor
+        && elapsed >= FRIDAY_FLOW_HEADSTART
+        && state->poseAutoEncoder
+        && state->featuresAutoEncoder)
+    {
+        NetworkInitMonday(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM);
+        ComputeMondayDeltaStats(state, db);
+    }
+
+    // train fridayFlow (50% of total budget when active)
+    if (state->fridayFlowModel)
+    {
+        NetworkTrainFridayFlowForTime(
+            state, db, fridayFlowBudget);
+    }
+
+    if (state->singlePosePredictor && singlePoseBudget > 0.0)
+    {
+        NetworkTrainSinglePosePredictorForTime(state, db, singlePoseBudget);
+    }
+
+    if (state->singlePosePredictor && singlePoseE2eBudget > 0.0)
+        NetworkTrainSinglePoseEndToEndForTime(state, db, singlePoseE2eBudget);
+
+    if (state->uncondAdvancePredictor && uncondAdvanceBudget > 0.0)
+        NetworkTrainUncondAdvanceForTime(state, db, uncondAdvanceBudget);
+
+    if (state->mondayPredictor && mondayBudget > 0.0)
+    {
+        NetworkTrainMondayForTime(state, db, mondayBudget);
+    }
+
+    // periodically recompute monday delta stats (PoseAE latent space drifts as it trains)
+    if (state->mondayPredictor && state->poseAutoEncoder)
+    {
+        state->mondayDeltaStatsTimer += totalBudgetSeconds;
+        if (state->mondayDeltaStatsTimer >= MONDAY_DELTA_STATS_INTERVAL)
+        {
+            state->mondayDeltaStatsTimer = 0.0;
+            ComputeMondayDeltaStats(state, db);
+        }
+    }
 
     const double wallElapsed = ElapsedSeconds(wallStart);
     state->trainingElapsedSeconds += wallElapsed;
     state->timeSinceLastAutoSave += wallElapsed;
     state->timeSinceLastLossLog += wallElapsed;
 
-    // log all losses at a fixed time interval so curves are directly comparable
-    // use exponentially smoothed losses, record 0.0 for networks with < 100 iterations
     if (state->timeSinceLastLossLog >= LOSS_LOG_INTERVAL_SECONDS)
     {
         state->timeSinceLastLossLog = 0.0;
         state->lossHistoryTime.push_back((float)state->trainingElapsedSeconds);
         state->featureAELossHistory.push_back(state->featureAEIterations >= 100 ? state->featureAELossSmoothed : 0.0f);
+        state->poseAELossHistory.push_back(state->poseAEIterations >= 100 ? state->poseAELossSmoothed : 0.0f);
         state->segmentAELossHistory.push_back(state->segmentAEIterations >= 100 ? state->segmentAELossSmoothed : 0.0f);
-        state->predictorLossHistory.push_back(state->predictorIterations >= 100 ? state->predictorLossSmoothed : 0.0f);
+        state->latentSegmentPredictorLossHistory.push_back(state->latentSegmentPredictorIterations >= 100 ? state->latentSegmentPredictorLossSmoothed : 0.0f);
         state->flowLossHistory.push_back(state->flowIterations >= 100 ? state->flowLossSmoothed : 0.0f);
-        state->e2eLossHistory.push_back(state->e2eIterations >= 100 ? state->e2eLossSmoothed : 0.0f);
-    }    return wallElapsed;
+        state->segmentE2eLossHistory.push_back(state->segmentE2eIterations >= 100 ? state->segmentE2eLossSmoothed : 0.0f);
+        state->fullFlowLossHistory.push_back(state->fullFlowIterations >= 100 ? state->fullFlowLossSmoothed : 0.0f);
+        state->fridayFlowLossHistory.push_back(state->fridayFlowIterations >= 100 ? state->fridayFlowLossSmoothed : 0.0f);
+        state->singlePosePredictorLossHistory.push_back(state->singlePosePredictorIterations >= 100 ? state->singlePosePredictorLossSmoothed : 0.0f);
+        state->singlePoseE2eLossHistory.push_back(state->singlePoseE2eIterations >= 100 ? state->singlePoseE2eLossSmoothed : 0.0f);
+        state->uncondAdvanceLossHistory.push_back(state->uncondAdvanceIterations >= 100 ? state->uncondAdvanceLossSmoothed : 0.0f);
+        state->mondayLossHistory.push_back(state->mondayIterations >= 100 ? state->mondayLossSmoothed : 0.0f);
+    }
+    return wallElapsed;
 }
 
 //---------------------------------------------------------
@@ -1400,6 +3304,8 @@ static inline void NetworkInitAllForTraining(
 
     NetworkInitFeatureAE(
         state, db->featureDim, FEATURE_AE_LATENT_DIM);
+    NetworkInitPoseAE(
+        state, db->poseGenFeaturesComputeDim, POSE_AE_LATENT_DIM);
 
     if (db->poseGenSegmentFlatDim > 0)
     {
@@ -1432,31 +3338,80 @@ static inline void NetworkResetAll(NetworkState* state)
     state->featureAELoss = 0.0f;
     state->featureAEIterations = 0;
 
+    state->poseAutoEncoder = nullptr;
+    state->poseAEOptimizer = nullptr;
+    state->poseAELoss = 0.0f;
+    state->poseAEIterations = 0;
+    
     state->segmentAutoEncoder = nullptr;
     state->segmentOptimizer = nullptr;
     state->segmentAELoss = 0.0f;
     state->segmentAEIterations = 0;
 
     state->segmentLatentAveragePredictor = nullptr;
-    state->predictorOptimizer = nullptr;
-    state->predictorLoss = 0.0f;
-    state->predictorIterations = 0;
+    state->latentSegmentPredictorOptimizer = nullptr;
+    state->latentSegmentPredictorLoss = 0.0f;
+    state->latentSegmentPredictorIterations = 0;
+
+    state->singlePosePredictor = nullptr;
+    state->singlePosePredictorOptimizer = nullptr;
+    state->singlePosePredictorLoss = 0.0f;
+    state->singlePosePredictorIterations = 0;
 
     state->latentFlowModel = nullptr;
     state->flowOptimizer = nullptr;
     state->flowLoss = 0.0f;
     state->flowIterations = 0;
 
-    state->e2eLoss = 0.0f;
-    state->e2eLossSmoothed = 0.0f;
-    state->e2eIterations = 0;
+    state->fullFlowModel = nullptr;
+    state->fullFlowOptimizer = nullptr;
+    state->fullFlowLoss = 0.0f;
+    state->fullFlowLossSmoothed = 0.0f;
+    state->fullFlowIterations = 0;
+
+    state->fridayFlowModel = nullptr;
+    state->fridayFlowOptimizer = nullptr;
+    state->fridayFlowLoss = 0.0f;
+    state->fridayFlowLossSmoothed = 0.0f;
+    state->fridayFlowIterations = 0;
+    state->poseLatentStd.clear();
+
+    state->segmentE2eLoss = 0.0f;
+    state->segmentE2eLossSmoothed = 0.0f;
+    state->segmentE2eIterations = 0;
+
+    state->singlePoseE2eLoss = 0.0f;
+    state->singlePoseE2eLossSmoothed = 0.0f;
+    state->singlePoseE2eIterations = 0;
+
+    state->uncondAdvancePredictor = nullptr;
+    state->uncondAdvanceOptimizer = nullptr;
+    state->uncondAdvanceLoss = 0.0f;
+    state->uncondAdvanceLossSmoothed = 0.0f;
+    state->uncondAdvanceIterations = 0;
+
+    state->mondayPredictor = nullptr;
+    state->mondayOptimizer = nullptr;
+    state->mondayLoss = 0.0f;
+    state->mondayLossSmoothed = 0.0f;
+    state->mondayIterations = 0;
+    state->mondayDeltaMean.clear();
+    state->mondayDeltaStd.clear();
+    state->mondayDeltaStatsTimer = 0.0;
 
     state->lossHistoryTime.clear();
     state->featureAELossHistory.clear();
+    state->poseAELossHistory.clear();
     state->segmentAELossHistory.clear();
-    state->predictorLossHistory.clear();
+    state->latentSegmentPredictorLossHistory.clear();
+    state->singlePosePredictorLossHistory.clear();
     state->flowLossHistory.clear();
-    state->e2eLossHistory.clear();
+    state->segmentE2eLossHistory.clear();
+    state->fullFlowLossHistory.clear();
+    state->fridayFlowLossHistory.clear();
+    state->singlePoseE2eLossHistory.clear();
+    state->uncondAdvanceLossHistory.clear();
+    state->mondayLossHistory.clear();
     state->timeSinceLastLossLog = 0.0;
 
     state->trainingElapsedSeconds = 0.0;
@@ -1489,21 +3444,9 @@ static inline bool NetworkPredictSegment(
 
     segment.resize(segFrames, pgDim);
 
-    // normalize query (same way as MotionMatchingSearch)
-    torch::Tensor queryTensor =
-        torch::empty({ 1, featureDim });
-    float* qPtr = queryTensor.data_ptr<float>();
-    for (int d = 0; d < featureDim; ++d)
-    {
-        const FeatureType ft = db->featureTypes[d];
-        const int ti = static_cast<int>(ft);
-        const float norm =
-            (rawQuery[d] - db->featuresMean[d])
-            / db->featureTypesStd[ti];
-        const float w =
-            db->featuresConfig.featureTypeWeights[ti];
-        qPtr[d] = norm * w;
-    }
+    // normalize query
+    torch::Tensor queryTensor = torch::empty({ 1, featureDim });
+    NormalizeFeatureQuery(db, rawQuery.data(), queryTensor.data_ptr<float>());
 
     state->featuresAutoEncoder->eval();
     state->segmentLatentAveragePredictor->eval();
@@ -1578,17 +3521,9 @@ static inline bool NetworkPredictSegmentFlow(
 
     segment.resize(segFrames, pgDim);
 
-    // normalize the raw motion matching query the same way we do for search and training
+    // normalize the raw motion matching query
     torch::Tensor queryTensor = torch::empty({ 1, featureDim });
-    float* qPtr = queryTensor.data_ptr<float>();
-    for (int d = 0; d < featureDim; ++d)
-    {
-        const FeatureType ft = db->featureTypes[d];
-        const int ti = static_cast<int>(ft);
-        const float norm = (rawQuery[d] - db->featuresMean[d]) / db->featureTypesStd[ti];
-        const float w = db->featuresConfig.featureTypeWeights[ti];
-        qPtr[d] = norm * w;
-    }
+    NormalizeFeatureQuery(db, rawQuery.data(), queryTensor.data_ptr<float>());
 
     // everything is inference-only, no gradients needed
     state->featuresAutoEncoder->eval();
@@ -1698,6 +3633,85 @@ static inline bool NetworkPredictSegmentFlow(
 }
 
 //---------------------------------------------------------
+// full-space flow predict (no AEs, direct segment space)
+//---------------------------------------------------------
+
+static inline bool NetworkPredictFullFlow(
+    NetworkState* state,
+    const AnimDatabase* db,
+    const std::vector<float>& rawQuery,
+    Array2D<float>& /*out*/ segment)
+{
+    if (!state->fullFlowModel) return false;
+    if ((int)rawQuery.size() != db->featureDim) return false;
+
+    const int featureDim = db->featureDim;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int segFrames = db->poseGenSegmentFrameCount;
+    const int flatDim = db->poseGenSegmentFlatDim;
+
+    segment.resize(segFrames, pgDim);
+
+    // normalize the raw query
+    torch::Tensor condTensor = torch::empty({1, featureDim});
+    NormalizeFeatureQuery(db, rawQuery.data(), condTensor.data_ptr<float>());
+
+    state->fullFlowModel->eval();
+    condTensor = condTensor.to(state->device);
+
+    torch::Tensor result;
+    {
+        torch::NoGradGuard noGrad;
+
+        // start from noise
+        //torch::Tensor x = torch::randn(
+        //    {1, flatDim},
+        //    torch::TensorOptions().device(state->device));
+        // mode seek from zero: the mode is better than random noise - crisp, hopefully
+        torch::Tensor x = torch::zeros(
+            { 1, flatDim }, torch::TensorOptions().device(state->device));
+
+        // Euler integration: 8 steps
+        constexpr int steps = FLOW_INFERENCE_STEPS;
+        constexpr float dt = 1.0f / steps;
+
+        for (int step = 0; step < steps; ++step)
+        {
+            const float t = (float)step / steps;
+            torch::Tensor tTensor = torch::full(
+                {1, 1}, t,
+                torch::TensorOptions().device(state->device));
+            torch::Tensor condTime = torch::cat(
+                {condTensor, tTensor}, 1);
+            torch::Tensor v = state->fullFlowModel->forward(
+                x, condTime);
+            x = x + v * dt;
+        }
+
+        result = x.to(torch::kCPU);
+    }
+
+    // denormalize to get real-world pose values
+    const float* fPtr = result.data_ptr<float>();
+    for (int f = 0; f < segFrames; ++f)
+    {
+        std::span<float> dst = segment.row_view(f);
+        for (int d = 0; d < pgDim; ++d)
+        {
+            const float w = db->poseGenFeaturesWeight[d];
+            const float denorm = (w > 1e-10f)
+                ? (fPtr[f * pgDim + d] / w
+                    * db->poseGenFeaturesStd[d]
+                    + db->poseGenFeaturesMean[d])
+                : db->poseGenFeaturesMean[d];
+            dst[d] = denorm;
+        }
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------
 // segment AE apply (for visual evaluation)
 //---------------------------------------------------------
 
@@ -1759,5 +3773,49 @@ static inline void NetworkApplySegmentAE(
                 : db->poseGenFeaturesMean[d];
             dst[d] = denorm;
         }
+    }
+}
+
+
+// Pass a single pose through the pose autoencoder
+// in-place (normalize -> encode -> decode -> denormalize).
+// Used to visually evaluate reconstruction quality.
+static inline void NetworkApplyPoseAE(
+    NetworkState* networkState,
+    const AnimDatabase* db,
+    std::span<float> pose)
+{
+    if (!networkState->poseAutoEncoder) return;
+
+    const int poseDim = db->poseGenFeaturesComputeDim;
+    if ((int)pose.size() != poseDim) return;
+
+    // normalize: (raw - mean) / std * weight
+    torch::Tensor normalized = torch::empty({ 1, poseDim });
+    float* nPtr = normalized.data_ptr<float>();
+    for (int d = 0; d < poseDim; ++d)
+    {
+        nPtr[d] = (pose[d] - db->poseGenFeaturesMean[d])
+            / db->poseGenFeaturesStd[d]
+            * db->poseGenFeaturesWeight[d];
+    }
+
+    // forward pass (eval mode)
+    normalized = normalized.to(networkState->device);
+    networkState->poseAutoEncoder->eval();
+    torch::Tensor reconstructed =
+        networkState->poseAutoEncoder->forward(normalized);
+    reconstructed = reconstructed.to(torch::kCPU);
+
+    // denormalize: raw = output / weight * std + mean
+    const float* rPtr = reconstructed.data_ptr<float>();
+    for (int d = 0; d < poseDim; ++d)
+    {
+        const float w = db->poseGenFeaturesWeight[d];
+        const float denorm = (w > 1e-10f)
+            ? (rPtr[d] / w * db->poseGenFeaturesStd[d]
+                + db->poseGenFeaturesMean[d])
+            : db->poseGenFeaturesMean[d];
+        pose[d] = denorm;
     }
 }

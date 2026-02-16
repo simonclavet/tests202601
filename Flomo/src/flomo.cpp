@@ -348,8 +348,7 @@ static inline void OnCharactersLoaded(
         {
             NetworkLoadAll(
                 &networkState,
-                animDatabase.featureDim,
-                animDatabase.poseGenSegmentFlatDim,
+                &animDatabase,
                 folderPath);
         }
     }
@@ -757,6 +756,14 @@ static inline bool LoadConfigFromFolder(
 }
 
 
+struct ConversionResult
+{
+    char filename[256];
+    char outputPath[512];
+    bool success;
+    char errorMsg[256];
+};
+
 // Main application state - passed to update/render functions
 struct ApplicationState {
     int argc;
@@ -796,6 +803,7 @@ struct ApplicationState {
     Shader genoBasicShader;
     bool genoModelLoaded;
     vector<BVHGenoMapping> genoMappings;
+    BVHGenoMapping ccGenoMapping = {};
 
     // Debug timescale system
     // numpad-: halve debugTimescale
@@ -815,6 +823,10 @@ struct ApplicationState {
     int savedConfigsSelectedIndex = -1;
     std::vector<std::string> savedConfigFolders;
     bool savedConfigsNeedRefresh = true;
+
+    // FBX converter UI
+    bool converterWindowOpen = false;
+    std::vector<ConversionResult> conversionResults;
 };
 
 
@@ -1549,6 +1561,36 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             ImGui::EndCombo();
         }
 
+        ImGui::Text("Aim Direction Mode:");
+        ImGui::SameLine(180);
+        if (ImGui::BeginCombo("##aimDirMode",
+            AimDirectionModeName(
+                config->mmConfigEditor
+                    .aimDirectionMode)))
+        {
+            for (int i = 0;
+                i < static_cast<int>(
+                    AimDirectionMode::COUNT); ++i)
+            {
+                const AimDirectionMode mode =
+                    static_cast<AimDirectionMode>(i);
+                const bool isSelected =
+                    (config->mmConfigEditor
+                        .aimDirectionMode == mode);
+                if (ImGui::Selectable(
+                    AimDirectionModeName(mode),
+                    isSelected))
+                {
+                    config->mmConfigEditor
+                        .aimDirectionMode = mode;
+                    configChanged = true;
+                }
+                if (isSelected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
         if (configChanged)
         {
             // Mark for rebuild (don't rebuild on every keypress)
@@ -1580,13 +1622,25 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
     AppConfig* config = &app->config;
     if (!cc->active) return;
 
-    const bool hasPredictor = static_cast<bool>(app->networkState.segmentLatentAveragePredictor);
+    const bool hasLatentSegmentPredictor = static_cast<bool>(app->networkState.segmentLatentAveragePredictor);
     const bool hasFlow = static_cast<bool>(app->networkState.latentFlowModel);
+    const bool hasFullFlow = static_cast<bool>(app->networkState.fullFlowModel);
+    const bool hasSinglePosePredictor = static_cast<bool>(app->networkState.singlePosePredictor);
+    const bool hasUncondAdvance = static_cast<bool>(app->networkState.uncondAdvancePredictor);
+    const bool hasMonday = static_cast<bool>(app->networkState.mondayPredictor);
 
     // if current mode needs networks and there are none, fall back to motion matching
-    if (config->animationMode == AnimationMode::AverageLatentPredictor && !hasPredictor)
+    if (config->animationMode == AnimationMode::AverageLatentPredictor && !hasLatentSegmentPredictor)
         config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::FlowSampled && !hasFlow)
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::FullFlowSampled && !hasFullFlow)
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::MondayPredictor && !hasMonday)
         config->animationMode = AnimationMode::MotionMatching;
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
@@ -1600,9 +1654,15 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
             for (int i = 0; i < static_cast<int>(AnimationMode::COUNT); ++i)
             {
                 const AnimationMode mode = static_cast<AnimationMode>(i);
-                if (mode == AnimationMode::AverageLatentPredictor && !hasPredictor)
+                if (mode == AnimationMode::AverageLatentPredictor && !hasLatentSegmentPredictor)
                     continue;
                 if (mode == AnimationMode::FlowSampled && !hasFlow)
+                    continue;
+                if (mode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
+                    continue;
+                if (mode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
+                    continue;
+                if (mode == AnimationMode::MondayPredictor && !hasMonday)
                     continue;
                 const bool isSelected = (currentMode == i);
                 if (ImGui::Selectable(AnimationModeName(mode), isSelected))
@@ -1823,16 +1883,17 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
         // checkboxes (independent of training)
         if (app->networkState.featuresAutoEncoder)
         {
-            ImGui::Checkbox(
-                "Use Denoiser",
-                &app->config.useMMFeatureDenoiser);
+            ImGui::Checkbox("Use Denoiser", &app->config.useMMFeatureDenoiser);
         }
         if (app->networkState.segmentAutoEncoder)
         {
-            ImGui::Checkbox(
-                "Test Segment AE",
-                &app->config.testSegmentAutoEncoder);
+            ImGui::Checkbox("Test Segment AE", &app->config.testSegmentAutoEncoder);
         }
+        if (app->networkState.poseAutoEncoder)
+        {
+            ImGui::Checkbox("Test Pose AE", &app->config.testPoseAutoEncoder);
+        }
+
 
         if (training || hasAEs)
         {
@@ -1873,30 +1934,59 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
             const NetworkState& ns = app->networkState;
             const ImVec2 plotSize(0, 50);
 
-            ImGui::Text("Feature AE  Loss: %.6f  Iter: %d", ns.featureAELoss, ns.featureAEIterations);
+            // log-scale loss plot helper:
+            // converts raw loss to log10, applies
+            // skip slider, and plots
+            static float lossPlotSkipPct = 0.0f;
+            auto plotLossLog = [&](
+                const char* label,
+                const std::vector<float>& history)
+            {
+                const int total = (int)history.size();
+                const int skip =
+                    (int)(lossPlotSkipPct * 0.01f
+                        * total);
+                const int count = total - skip;
+                if (count <= 0) return;
+                const float* data = history.data() + skip;
+                ImGui::PlotLines(label,
+                    data, count,
+                    0, nullptr,
+                    FLT_MAX, FLT_MAX, plotSize);
+            };
+
+            ImGui::SliderFloat("Skip##lossPlot",
+                &lossPlotSkipPct, 0.0f, 99.0f,
+                "%.0f%%");
+
+            ImGui::Text("Feature AE  Loss: %.6f  Iter: %d", ns.featureAELossSmoothed, ns.featureAEIterations);
             if (!ns.featureAELossHistory.empty())
             {
-                ImGui::PlotLines("##featureAE",
-                    ns.featureAELossHistory.data(), (int)ns.featureAELossHistory.size(),
-                    0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                plotLossLog("##featureAE",
+                    ns.featureAELossHistory);
             }
 
-            ImGui::Text("Segment AE  Loss: %.6f  Iter: %d", ns.segmentAELoss, ns.segmentAEIterations);
+            ImGui::Text("Pose AE  Loss: %.6f  Iter: %d", ns.poseAELossSmoothed, ns.poseAEIterations);
+            if (!ns.poseAELossHistory.empty())
+            {
+                plotLossLog("##poseAE",
+                    ns.poseAELossHistory);
+            }
+
+            ImGui::Text("Segment AE  Loss: %.6f  Iter: %d", ns.segmentAELossSmoothed, ns.segmentAEIterations);
             if (!ns.segmentAELossHistory.empty())
             {
-                ImGui::PlotLines("##segmentAE",
-                    ns.segmentAELossHistory.data(), (int)ns.segmentAELossHistory.size(),
-                    0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                plotLossLog("##segmentAE",
+                    ns.segmentAELossHistory);
             }
 
             if (ns.segmentLatentAveragePredictor)
             {
-                ImGui::Text("Predictor   Loss: %.6f  Iter: %d", ns.predictorLoss, ns.predictorIterations);
-                if (!ns.predictorLossHistory.empty())
+                ImGui::Text("Seg Pred    Loss: %.6f  Iter: %d", ns.latentSegmentPredictorLossSmoothed, ns.latentSegmentPredictorIterations);
+                if (!ns.latentSegmentPredictorLossHistory.empty())
                 {
-                    ImGui::PlotLines("##predictor",
-                        ns.predictorLossHistory.data(), (int)ns.predictorLossHistory.size(),
-                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                    plotLossLog("##segPredictor",
+                        ns.latentSegmentPredictorLossHistory);
                 }
             }
             else if (training)
@@ -1906,12 +1996,11 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
 
             if (ns.latentFlowModel)
             {
-                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d", ns.flowLoss, ns.flowIterations);
+                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d", ns.flowLossSmoothed, ns.flowIterations);
                 if (!ns.flowLossHistory.empty())
                 {
-                    ImGui::PlotLines("##flow",
-                        ns.flowLossHistory.data(), (int)ns.flowLossHistory.size(),
-                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                    plotLossLog("##flow",
+                        ns.flowLossHistory);
                 }
             }
             else if (training)
@@ -1919,16 +2008,161 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
                 ImGui::TextDisabled("Flow: waiting for AE warmup");
             }
 
-            if (ns.e2eIterations > 0)
+            if (ns.segmentE2eIterations > 0)
             {
-                ImGui::Text("End-to-End  Loss: %.6f  Iter: %d", ns.e2eLoss, ns.e2eIterations);
-                if (!ns.e2eLossHistory.empty())
+                ImGui::Text("Segment E2E  Loss: %.6f  Iter: %d", ns.segmentE2eLossSmoothed, ns.segmentE2eIterations);
+                if (!ns.segmentE2eLossHistory.empty())
                 {
-                    ImGui::PlotLines("##e2e",
-                        ns.e2eLossHistory.data(), (int)ns.e2eLossHistory.size(),
-                        0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                    plotLossLog("##segmentE2e",
+                        ns.segmentE2eLossHistory);
                 }
             }
+
+            if (ns.fullFlowModel)
+            {
+                ImGui::Text(
+                    "FullFlow    Loss: %.6f  Iter: %d",
+                    ns.fullFlowLossSmoothed,
+                    ns.fullFlowIterations);
+                if (!ns.fullFlowLossHistory.empty())
+                {
+                    plotLossLog("##fullFlow",
+                        ns.fullFlowLossHistory);
+                }
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("FullFlow: waiting for init");
+            }
+
+            if (ns.fridayFlowModel)
+            {
+                ImGui::Text("FridayFlow  Loss: %.6f  Iter: %d",
+                    ns.fridayFlowLossSmoothed, ns.fridayFlowIterations);
+                if (!ns.fridayFlowLossHistory.empty())
+                    plotLossLog("##fridayFlow", ns.fridayFlowLossHistory);
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("FridayFlow: waiting for init (%.0fs headstart)",
+                    FRIDAY_FLOW_HEADSTART);
+            }
+
+            if (ns.singlePosePredictor)
+            {
+                ImGui::Text("SinglePose  Loss: %.6f  Iter: %d",
+                    ns.singlePosePredictorLossSmoothed, ns.singlePosePredictorIterations);
+                if (!ns.singlePosePredictorLossHistory.empty())
+                {
+                    plotLossLog("##singlePose", ns.singlePosePredictorLossHistory);
+                }
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("SinglePose: waiting for init");
+            }
+
+            if (ns.singlePoseE2eIterations > 0)
+            {
+                ImGui::Text("SinglePose E2E  Loss: %.6f  Iter: %d",
+                    ns.singlePoseE2eLossSmoothed, ns.singlePoseE2eIterations);
+                if (!ns.singlePoseE2eLossHistory.empty())
+                    plotLossLog("##singlePoseE2e", ns.singlePoseE2eLossHistory);
+            }
+
+            if (ns.uncondAdvancePredictor)
+            {
+                ImGui::Text("UncondAdvance  Loss: %.6f  Iter: %d",
+                    ns.uncondAdvanceLossSmoothed, ns.uncondAdvanceIterations);
+                if (!ns.uncondAdvanceLossHistory.empty())
+                {
+                    plotLossLog("##uncondAdvance", ns.uncondAdvanceLossHistory);
+                }
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("UncondAdvance: waiting for init");
+            }
+
+            if (ns.mondayPredictor)
+            {
+                ImGui::Text("Monday  Loss: %.6f  Iter: %d",
+                    ns.mondayLossSmoothed, ns.mondayIterations);
+                if (!ns.mondayLossHistory.empty())
+                {
+                    plotLossLog("##monday", ns.mondayLossHistory);
+                }
+            }
+            else if (training)
+            {
+                ImGui::TextDisabled("Monday: waiting for init");
+            }
+        }
+    }
+    ImGui::End();
+}
+
+static inline void ImGuiUtilities(ApplicationState* app)
+{
+    ImGui::SetNextWindowPos(
+        ImVec2(1100, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(
+        ImVec2(200, 60), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Utilities"))
+    {
+        if (ImGui::Button("Open Converter"))
+            app->converterWindowOpen = true;
+    }
+    ImGui::End();
+}
+
+static inline void ImGuiConverter(ApplicationState* app)
+{
+    if (!app->converterWindowOpen) return;
+
+    ImGui::SetNextWindowPos(
+        ImVec2(400, 200), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(
+        ImVec2(500, 300), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("FBX to BVH Converter",
+        &app->converterWindowOpen))
+    {
+        ImGui::TextWrapped(
+            "Drop .fbx files anywhere to convert"
+            " them to BVH.");
+        ImGui::Separator();
+
+        if (!app->conversionResults.empty())
+        {
+            if (ImGui::Button("Clear"))
+                app->conversionResults.clear();
+
+            ImGui::BeginChild("##results",
+                ImVec2(0, 0), true);
+            for (int i = 0;
+                i < (int)app->conversionResults.size();
+                i++)
+            {
+                const ConversionResult& r =
+                    app->conversionResults[i];
+                if (r.success)
+                {
+                    ImGui::TextColored(
+                        ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
+                        "[OK] %s", r.filename);
+                    ImGui::TextDisabled(
+                        "  -> %s", r.outputPath);
+                }
+                else
+                {
+                    ImGui::TextColored(
+                        ImVec4(0.9f, 0.2f, 0.2f, 1.0f),
+                        "[FAIL] %s", r.filename);
+                    ImGui::TextDisabled(
+                        "  %s", r.errorMsg);
+                }
+            }
+            ImGui::EndChild();
         }
     }
     ImGui::End();
@@ -1961,9 +2195,49 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         for (int i = 0; i < droppedFiles.count; i++)
         {
-            if (CharacterDataLoadFromFile(&app->characterData, droppedFiles.paths[i], app->errMsg, 512))
+            const char* path = droppedFiles.paths[i];
+
+            // when converter is open, route fbx files
+            // to conversion instead of loading them
+            if (app->converterWindowOpen
+                && IsFileExtension(path, ".fbx"))
             {
-                app->characterData.active = app->characterData.count - 1;
+                ConversionResult result = {};
+                snprintf(result.filename,
+                    sizeof(result.filename), "%s",
+                    GetFileName(path));
+                snprintf(result.outputPath,
+                    sizeof(result.outputPath),
+                    "%s.bvh", path);
+
+                BVHData bvh;
+                BVHDataInit(&bvh);
+                if (!FBXDataLoad(&bvh, path,
+                    result.errorMsg,
+                    sizeof(result.errorMsg)))
+                {
+                    result.success = false;
+                }
+                else if (!BVHDataSave(&bvh,
+                    result.outputPath,
+                    result.errorMsg,
+                    sizeof(result.errorMsg)))
+                {
+                    result.success = false;
+                }
+                else
+                {
+                    result.success = true;
+                }
+                BVHDataFree(&bvh);
+                app->conversionResults.push_back(result);
+            }
+            else if (CharacterDataLoadFromFile(
+                &app->characterData, path,
+                app->errMsg, 512))
+            {
+                app->characterData.active =
+                    app->characterData.count - 1;
             }
         }
 
@@ -2007,6 +2281,10 @@ static void ApplicationUpdate(void* voidApplicationState)
             //ControlledCharacterFree(&app->controlledCharacter);
             app->controlledCharacter.active = false;
         }
+
+        // Reset geno mappings
+        app->genoMappings.clear();
+        app->ccGenoMapping = {};
 
         // Reset scrubber
         ScrubberSettingsInit(&app->scrubberSettings, app->argc, app->argv);
@@ -2447,6 +2725,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Add controlled character's capsules
+    // (kept even in geno mode for AO/shadows on the ground)
     if (app->controlledCharacter.active)
     {
         CapsuleDataAppendFromTransformData(
@@ -2762,7 +3041,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->genoMappings.push_back(mapping);
         }
 
-        // Draw all characters
+        // Draw all sequence characters
         for (int c = 0; c < app->characterData.count; c++)
         {
             // Update Geno animation from current BVH pose
@@ -2778,6 +3057,32 @@ static void ApplicationUpdate(void* voidApplicationState)
             // Draw the Geno model with character's color
             const Color charColor = app->characterData.colors[c];
             DrawModel(app->genoModel, Vector3Zero(), 1.0f, charColor);
+        }
+
+        // Draw controlled character with geno mesh
+        const ControlledCharacter& cc =
+            app->controlledCharacter;
+        if (cc.active && cc.skeleton)
+        {
+            if (!app->ccGenoMapping.valid)
+            {
+                app->ccGenoMapping =
+                    CreateBVHGenoMapping(
+                        cc.skeleton, &app->genoModel);
+            }
+
+            UpdateGenoAnimationFromBVH(
+                &app->genoAnimation,
+                &cc.xformData,
+                &app->ccGenoMapping,
+                1.0f);
+
+            UpdateModelAnimationBones(
+                app->genoModel,
+                app->genoAnimation, 0);
+
+            DrawModel(app->genoModel,
+                Vector3Zero(), 1.0f, cc.color);
         }
     }
 
@@ -3525,6 +3830,9 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         ImGuiNeuralNetworks(app);
 
+        ImGuiUtilities(app);
+        ImGuiConverter(app);
+
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
     }
@@ -3569,7 +3877,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                     ImGui::Text("%s ToeVel:  % .3f % .3f % .3f (spd %.3f)", s, v.x, v.y, v.z, Vector3Length2D(v));
                 }
                 const Vector3& diff = cc.toeBlendedPosDiffRootSpace;
-                ImGui::Text("ToeDiff XZ:  % .3f % .3f", diff.x, diff.z);
+                ImGui::Text("ToePosDiff XZ:  % .3f % .3f", diff.x, diff.z);
                 ImGui::Text("ToeSpeedDiff: % .3f", cc.blendedToeSpeedDiff);
                 for (int side : sides)
                 {
@@ -3636,7 +3944,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                                 ImGui::Text("%s ToeVel:  % .3f % .3f % .3f (spd %.3f)",
                                     s, v.x, v.y, v.z, Vector3Length2D(v));
                             }
-                            ImGui::Text("ToeDiff XZ:  % .3f % .3f",
+                            ImGui::Text("ToePosDiff XZ:  % .3f % .3f",
                                 pf.toePosDiffRootSpace.x, pf.toePosDiffRootSpace.z);
                             ImGui::Text("ToeSpeedDiff: % .3f", pf.toeSpeedDiff);
                         }

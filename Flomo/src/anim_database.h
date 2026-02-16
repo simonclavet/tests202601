@@ -25,6 +25,20 @@ static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
     return -1;
 }
 
+// normalize a raw MM feature query: clamp to data bounds, then (raw - mean) / typeStd * typeWeight
+// writes featureDim floats into dest
+static inline void NormalizeFeatureQuery(
+    const AnimDatabase* db, const float* raw, float* dest)
+{
+    for (int d = 0; d < db->featureDim; ++d)
+    {
+        const float clamped = std::clamp(raw[d], db->featuresMin[d], db->featuresMax[d]);
+        const int ti = static_cast<int>(db->featureTypes[d]);
+        const float norm = (clamped - db->featuresMean[d]) / db->featureTypesStd[ti];
+        dest[d] = norm * db->featuresConfig.featureTypeWeights[ti];
+    }
+}
+
 constexpr int KMEANS_CLUSTER_COUNT = 500;
 constexpr double KMEANS_TIME_BUDGET_SECONDS = 10.0;
 
@@ -1135,7 +1149,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     db->featureDim = 0;
     if (cfg.IsFeatureEnabled(FeatureType::ToePos)) db->featureDim += 4;
     if (cfg.IsFeatureEnabled(FeatureType::ToeVel)) db->featureDim += 4;
-    if (cfg.IsFeatureEnabled(FeatureType::ToeDiff)) db->featureDim += 2;
+    if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed)) db->featureDim += (int)cfg.futureTrajPointTimes.size();
@@ -1277,17 +1291,17 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // DIFFERENCE: toeDifference = Left - Right (in magic horizontal frame) => (dx, dz)
-        if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
+        if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff))
         {
             featRow[currentFeature++] = localLeftPos.x - localRightPos.x;
             featRow[currentFeature++] = localLeftPos.z - localRightPos.z;
 
             if (isFirstFrame)
             {
-                db->featureNames.push_back(string("ToeDiffX"));
-                db->featureNames.push_back(string("ToeDiffZ"));
-                db->featureTypes.push_back(FeatureType::ToeDiff);
-                db->featureTypes.push_back(FeatureType::ToeDiff);
+                db->featureNames.push_back(string("ToePosDiffX"));
+                db->featureNames.push_back(string("ToePosDiffZ"));
+                db->featureTypes.push_back(FeatureType::ToePosDiff);
+                db->featureTypes.push_back(FeatureType::ToePosDiff);
             }
         }
 
@@ -1444,7 +1458,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             }
         }
 
-        // AIM DIRECTION: head→rightHand direction at future trajectory times, relative to current magic yaw
+        // AIM DIRECTION: direction at future trajectory times, relative to current magic yaw
+        // mode controls what direction is extracted from the animation
         if (cfg.IsFeatureEnabled(FeatureType::AimDirection))
         {
             const float frameTime = db->animFrameTime[clipIdx];
@@ -1455,32 +1470,67 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
                 const int futureFrame = f + futureFrameOffset;
 
-                Vector3 aimDirLocal = { 0.0f, 0.0f, 1.0f };  // default: forward
+                Vector3 aimDirLocal = { 0.0f, 0.0f, 1.0f };
 
-                // Check if future frame is within the same clip
                 if (futureFrame >= clipStart && futureFrame < clipEnd)
                 {
-                    span<const Vector3> futurePosRow = db->jointPositionsAnimSpace.row_view(futureFrame);
+                    Vector3 aimDirWorld = { 0.0f, 0.0f, 1.0f };
 
-                    // Compute head→rightHand direction at future frame
-                    const Vector3 futureHeadPos = futurePosRow[db->headIndex];
-                    const Vector3 futureHandPos = futurePosRow[db->handIndices[SIDE_RIGHT]];
-                    Vector3 aimDirWorld = Vector3Subtract(futureHandPos, futureHeadPos);
-                    aimDirWorld.y = 0.0f;  // project to XZ plane
+                    switch (cfg.aimDirectionMode)
+                    {
+                    case AimDirectionMode::HeadToRightHand:
+                    {
+                        span<const Vector3> futurePosRow =
+                            db->jointPositionsAnimSpace
+                                .row_view(futureFrame);
+                        const Vector3 headPos =
+                            futurePosRow[db->headIndex];
+                        const Vector3 handPos =
+                            futurePosRow[
+                                db->handIndices[SIDE_RIGHT]];
+                        aimDirWorld = Vector3Subtract(
+                            handPos, headPos);
+                        break;
+                    }
+                    case AimDirectionMode::HeadDirection:
+                    {
+                        span<const Rot6d> futureRotRow =
+                            db->jointRotationsAnimSpace
+                                .row_view(futureFrame);
+                        aimDirWorld = Vector3RotateByRot6d(
+                            Vector3{ 0.0f, 0.0f, 1.0f },
+                            futureRotRow[db->headIndex]);
+                        break;
+                    }
+                    case AimDirectionMode::HipsDirection:
+                    {
+                        span<const Rot6d> futureRotRow =
+                            db->jointRotationsAnimSpace
+                                .row_view(futureFrame);
+                        aimDirWorld = Vector3RotateByRot6d(
+                            Vector3{ 0.0f, 0.0f, 1.0f },
+                            futureRotRow[db->hipJointIndex]);
+                        break;
+                    }
+                    default: break;
+                    }
 
-                    // Normalize to unit length
-                    const float aimLen = Vector3Length(aimDirWorld);
+                    // project to XZ plane and normalize
+                    aimDirWorld.y = 0.0f;
+                    const float aimLen =
+                        Vector3Length(aimDirWorld);
                     if (aimLen > 1e-6f)
                     {
-                        aimDirWorld = Vector3Scale(aimDirWorld, 1.0f / aimLen);
+                        aimDirWorld = Vector3Scale(
+                            aimDirWorld, 1.0f / aimLen);
                     }
                     else
                     {
                         aimDirWorld = { 0.0f, 0.0f, 1.0f };
                     }
 
-                    // Transform to current frame's magic space (relative to current magic yaw)
-                    aimDirLocal = Vector3RotateByRot6d(aimDirWorld, invMagicYawRot);
+                    aimDirLocal = Vector3RotateByRot6d(
+                        aimDirWorld, invMagicYawRot);
                 }
 
                 featRow[currentFeature++] = aimDirLocal.x;
@@ -1490,12 +1540,18 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
                 {
                     char nameBufX[64];
                     char nameBufZ[64];
-                    snprintf(nameBufX, sizeof(nameBufX), "AimDirX_%.2fs", futureTime);
-                    snprintf(nameBufZ, sizeof(nameBufZ), "AimDirZ_%.2fs", futureTime);
-                    db->featureNames.push_back(string(nameBufX));
-                    db->featureNames.push_back(string(nameBufZ));
-                    db->featureTypes.push_back(FeatureType::AimDirection);
-                    db->featureTypes.push_back(FeatureType::AimDirection);
+                    snprintf(nameBufX, sizeof(nameBufX),
+                        "AimDirX_%.2fs", futureTime);
+                    snprintf(nameBufZ, sizeof(nameBufZ),
+                        "AimDirZ_%.2fs", futureTime);
+                    db->featureNames.push_back(
+                        string(nameBufX));
+                    db->featureNames.push_back(
+                        string(nameBufZ));
+                    db->featureTypes.push_back(
+                        FeatureType::AimDirection);
+                    db->featureTypes.push_back(
+                        FeatureType::AimDirection);
                 }
             }
         }
@@ -1637,18 +1693,27 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
 
 
-    // Allocate mean vector (per-dimension)
+    // Allocate mean/min/max vectors (per-dimension)
     db->featuresMean.resize(db->featureDim, 0.0f);
+    db->featuresMin.resize(db->featureDim, FLT_MAX);
+    db->featuresMax.resize(db->featureDim, -FLT_MAX);
 
-    // Compute mean for each feature dimension
+    // Compute mean, min, max for each feature dimension
     for (int d = 0; d < db->featureDim; ++d)
     {
         double sum = 0.0;
+        float dMin = FLT_MAX;
+        float dMax = -FLT_MAX;
         for (int f = 0; f < db->motionFrameCount; ++f)
         {
-            sum += db->features.at(f, d);
+            const float v = db->features.at(f, d);
+            sum += v;
+            if (v < dMin) dMin = v;
+            if (v > dMax) dMax = v;
         }
         db->featuresMean[d] = (float)(sum / db->motionFrameCount);
+        db->featuresMin[d] = dMin;
+        db->featuresMax[d] = dMax;
     }
 
     // Compute standard deviation per feature TYPE (shared across all dimensions of the same type)
@@ -1756,7 +1821,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         }
 
         // Copy current toe velocities (not lookahead)
-        // Sample at midpoint for better accuracy
         span<const Vector3> jointVelRootSpaceRow = db->jointVelocitiesRootSpace.row_view(f);
         for (int side : sides)
         {
@@ -1765,10 +1829,24 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             tempPose.toeVelocitiesRootSpace[side] = jointVelRootSpaceRow[toeIdx];
         }
 
+        // next-frame toe velocities (for MM query: what the feet are about to do)
+        const int nextF = (f + 1 < db->motionFrameCount) ? f + 1 : f;
+        span<const Vector3> nextJointVelRow = db->jointVelocitiesRootSpace.row_view(nextF);
+        for (int side : sides)
+        {
+            const int toeIdx = db->toeIndices[side];
+            tempPose.nextToeVelocitiesRootSpace[side] = nextJointVelRow[toeIdx];
+        }
+
         // current-frame 2D toe position difference (crisp, directly from world positions)
         const Vector3 leftToe = db->toePositionsRootSpace[SIDE_LEFT][f];
         const Vector3 rightToe = db->toePositionsRootSpace[SIDE_RIGHT][f];
         tempPose.toePosDiffRootSpace = { leftToe.x - rightToe.x, 0.0f, leftToe.z - rightToe.z };
+
+        // next-frame toe pos diff (for MM query: what the feet are about to do)
+        const Vector3 nextLeftToe = db->toePositionsRootSpace[SIDE_LEFT][nextF];
+        const Vector3 nextRightToe = db->toePositionsRootSpace[SIDE_RIGHT][nextF];
+        tempPose.nextToePosDiffRootSpace = { nextLeftToe.x - nextRightToe.x, 0.0f, nextLeftToe.z - nextRightToe.z };
 
         // toe speed difference magnitude (always positive — can't regress to zero)
         const float leftSpeedXZ = Vector3Length2D(jointVelRootSpaceRow[db->toeIndices[SIDE_LEFT]]);
@@ -1789,16 +1867,25 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         const int N = db->motionFrameCount;
         const int jc = db->jointCount;
 
-        // per-dim mean
+        // per-dim mean, min, max
         db->poseGenFeaturesMean.resize(pgDim, 0.0f);
+        db->poseGenFeaturesMin.resize(pgDim, FLT_MAX);
+        db->poseGenFeaturesMax.resize(pgDim, -FLT_MAX);
         for (int d = 0; d < pgDim; ++d)
         {
             float sum = 0.0f;
+            float dMin = FLT_MAX;
+            float dMax = -FLT_MAX;
             for (int f = 0; f < N; ++f)
             {
-                sum += db->poseGenFeatures.at(f, d);
+                const float v = db->poseGenFeatures.at(f, d);
+                sum += v;
+                if (v < dMin) { dMin = v; }
+                if (v > dMax) { dMax = v; }
             }
             db->poseGenFeaturesMean[d] = sum / N;
+            db->poseGenFeaturesMin[d] = dMin;
+            db->poseGenFeaturesMax[d] = dMax;
         }
 
         // per-dim std
@@ -1830,7 +1917,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {"LeftHand",0.00211f},
             {"RightUpLeg",0.05690f},{"RightLeg",0.02044f},{"RightFoot",0.00306f},
             {"RightToeBase",0.00080f},{"RightToeBaseEnd",0.00063f},
-            {"LeftUpLeg",0.05668f},{"LeftLeg",0.02034f},{"LeftFoot",0.00289f},
+            {"LeftUpLeg",0.15668f},{"LeftLeg",0.04034f},{"LeftFoot",0.00289f},
+            //{"LeftUpLeg",0.05668f},{"LeftLeg",0.02034f},{"LeftFoot",0.00289f},
             {"LeftToeBase",0.00078f},{"LeftToeBaseEnd",0.00063f},
         };
         constexpr float defaultBoneWeight = 0.01f;
@@ -1858,8 +1946,10 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             weightPose.lookaheadToePositionsRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
             weightPose.toeVelocitiesRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
+            weightPose.nextToeVelocitiesRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
         }
         weightPose.toePosDiffRootSpace = { nonRotWeight, 0.0f, nonRotWeight };
+        weightPose.nextToePosDiffRootSpace = { nonRotWeight, 0.0f, nonRotWeight };
         weightPose.toeSpeedDiff = nonRotWeight;
 
         db->poseGenFeaturesWeight.resize(pgDim);

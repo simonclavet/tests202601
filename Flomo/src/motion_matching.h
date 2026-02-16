@@ -64,16 +64,20 @@ static inline void ComputeFutureVelocities(
 // Extract motion features from current character state
 // This produces a feature vector in the same format as AnimDatabase features
 // Used by motion matching to build query vector from runtime character state
+// poseAlpha: how far into the next database frame we are (dt / dbFrameTime, clamped to [0,1]).
+// 1.0 = full database frame step (use "next" values as-is), 0.5 = half step (lerp halfway).
+// This matters for ToeVel, ToePosDiff, HeadToSlowestToe which use next-frame quantities.
 static void ComputeMotionFeatures(
     const AnimDatabase* db,
     const ControlledCharacter* cc,
-    std::vector<float>& outFeatures)
+    std::vector<float>& outFeatures,
+    bool updateFutureFeatures,
+    float poseAlpha)
 {
     if (db == nullptr || !db->valid) return;
     if (cc == nullptr) return;
 
     const TransformData* xform = &cc->xformBeforeIK;
-    const Vector3* toeVelocity = cc->toeBlendedVelocityWorld;
     const PlayerControlInput* input = &cc->playerInput;
 
     const MotionMatchingFeaturesConfig& cfg = db->featuresConfig;
@@ -114,9 +118,16 @@ static void ComputeMotionFeatures(
     const Vector3 magicToRight = Vector3Subtract(rightToePos, magicPos);
     const Vector3 localRightPos = Vector3RotateByQuaternion(magicToRight, invMagicWorldRot);
 
-    // Compute toe velocities in magic-local frame
-    Vector3 localLeftVel = Vector3RotateByQuaternion(toeVelocity[SIDE_LEFT], invMagicWorldRot);
-    Vector3 localRightVel = Vector3RotateByQuaternion(toeVelocity[SIDE_RIGHT], invMagicWorldRot);
+    // Compute toe velocities in magic-local frame, lerped between current and next
+    // based on poseAlpha to handle runtime framerate != database framerate
+    const Vector3 leftVelWorld = Vector3Lerp(
+        cc->toeBlendedVelocityWorld[SIDE_LEFT],
+        cc->nextToeBlendedVelocityWorld[SIDE_LEFT], poseAlpha);
+    const Vector3 rightVelWorld = Vector3Lerp(
+        cc->toeBlendedVelocityWorld[SIDE_RIGHT],
+        cc->nextToeBlendedVelocityWorld[SIDE_RIGHT], poseAlpha);
+    const Vector3 localLeftVel = Vector3RotateByQuaternion(leftVelWorld, invMagicWorldRot);
+    const Vector3 localRightVel = Vector3RotateByQuaternion(rightVelWorld, invMagicWorldRot);
 
     // Fill the feature vector in the same order as database features
     int fi = 0;
@@ -139,62 +150,100 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = localRightVel.z;
     }
 
-    // ToeDiff: (left - right) from blended segment data (crisp, not from FK chain)
-    if (cfg.IsFeatureEnabled(FeatureType::ToeDiff))
+    // ToePosDiff: (left - right) toe pos diff, lerped between current and next frame
+    if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff))
     {
-        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.x;
-        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.z;
+        const Vector3 posDiff = Vector3Lerp(
+            cc->toeBlendedPosDiffRootSpace,
+            cc->nextToeBlendedPosDiffRootSpace, poseAlpha);
+        outFeatures[fi++] = posDiff.x;
+        outFeatures[fi++] = posDiff.z;
     }
 
 
     // Compute future velocities for velocity-based features (FutureVel, FutureSpeed, FutureVelClamped, FutureAccelClamped)
-    const Vector3 currentVelWorld = cc->virtualControlSmoothedVelocity;
-    const Vector3 desiredVelWorld = input->desiredVelocity;
+    // Only computed when updateFutureFeatures is true; otherwise old values in outFeatures persist
+    Vector3 currentVelWorld = Vector3Zero();
+    Vector3 desiredVelWorld = Vector3Zero();
     const float maxAcceleration = 4.0f;
-
     std::vector<Vector3> futureVelocities;
-    ComputeFutureVelocities(currentVelWorld, desiredVelWorld, maxAcceleration, cfg.futureTrajPointTimes, futureVelocities);
+
+    if (updateFutureFeatures)
+    {
+        currentVelWorld = cc->virtualControlSmoothedVelocity;
+        desiredVelWorld = input->desiredVelocity;
+        ComputeFutureVelocities(
+            currentVelWorld, desiredVelWorld, maxAcceleration,
+            cfg.futureTrajPointTimes, futureVelocities);
+    }
 
     // FutureVel: predicted velocity at future sample times (XZ components in magic space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
     {
-        for (int p = 0; p < (int)futureVelocities.size(); ++p)
+        const int count = 2 * (int)cfg.futureTrajPointTimes.size();
+        if (updateFutureFeatures)
         {
-            // Transform to magic space for feature output
-            const Vector3 futureVelMagicSpace = Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
-            outFeatures[fi++] = futureVelMagicSpace.x;
-            outFeatures[fi++] = futureVelMagicSpace.z;
+            for (int p = 0; p < (int)futureVelocities.size(); ++p)
+            {
+                // Transform to magic space for feature output
+                const Vector3 futureVelMagicSpace =
+                    Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
+                outFeatures[fi++] = futureVelMagicSpace.x;
+                outFeatures[fi++] = futureVelMagicSpace.z;
+            }
+        }
+        else
+        {
+            fi += count;
         }
     }
 
     // FutureVelClamped: predicted velocity clamped to max magnitude (XZ in magic space)
     if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped))
     {
-        constexpr float MaxFutureVelClampedMag = 1.0f;
-
-        for (int p = 0; p < (int)futureVelocities.size(); ++p)
+        const int count = 2 * (int)cfg.futureTrajPointTimes.size();
+        if (updateFutureFeatures)
         {
-            const Vector3 futureVelMagicSpace = Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
+            constexpr float MaxFutureVelClampedMag = 1.0f;
 
-            // Clamp to max magnitude
-            Vector3 clampedVel = futureVelMagicSpace;
-            const float mag = Vector3Length(futureVelMagicSpace);
-            if (mag > MaxFutureVelClampedMag)
+            for (int p = 0; p < (int)futureVelocities.size(); ++p)
             {
-                clampedVel = Vector3Scale(futureVelMagicSpace, MaxFutureVelClampedMag / mag);
-            }
+                const Vector3 futureVelMagicSpace =
+                    Vector3RotateByQuaternion(futureVelocities[p], invMagicWorldRot);
 
-            outFeatures[fi++] = clampedVel.x;
-            outFeatures[fi++] = clampedVel.z;
+                // Clamp to max magnitude
+                Vector3 clampedVel = futureVelMagicSpace;
+                const float mag = Vector3Length(futureVelMagicSpace);
+                if (mag > MaxFutureVelClampedMag)
+                {
+                    clampedVel = Vector3Scale(
+                        futureVelMagicSpace, MaxFutureVelClampedMag / mag);
+                }
+
+                outFeatures[fi++] = clampedVel.x;
+                outFeatures[fi++] = clampedVel.z;
+            }
+        }
+        else
+        {
+            fi += count;
         }
     }
 
     // FutureSpeed: predicted scalar speed at future sample times
     if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
     {
-        for (int p = 0; p < (int)futureVelocities.size(); ++p)
+        const int count = 1 * (int)cfg.futureTrajPointTimes.size();
+        if (updateFutureFeatures)
         {
-            outFeatures[fi++] = Vector3Length(futureVelocities[p]);
+            for (int p = 0; p < (int)futureVelocities.size(); ++p)
+            {
+                outFeatures[fi++] = Vector3Length(futureVelocities[p]);
+            }
+        }
+        else
+        {
+            fi += count;
         }
     }
 
@@ -250,17 +299,26 @@ static void ComputeMotionFeatures(
     // Same desired aim is used for all time points (user confirmed)
     if (cfg.IsFeatureEnabled(FeatureType::AimDirection))
     {
-        // Get desired aim from player input (world space, already unit length)
-        const Vector3 desiredAimWorld = input->desiredAimDirection;
-
-        // Transform to magic-local frame
-        const Vector3 desiredAimLocal = Vector3RotateByQuaternion(desiredAimWorld, invMagicWorldRot);
-
-        // Store the same aim direction for each trajectory time point
-        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        const int count = 2 * (int)cfg.futureTrajPointTimes.size();
+        if (updateFutureFeatures)
         {
-            outFeatures[fi++] = desiredAimLocal.x;
-            outFeatures[fi++] = desiredAimLocal.z;
+            // Get desired aim from player input (world space, already unit length)
+            const Vector3 desiredAimWorld = input->desiredAimDirection;
+
+            // Transform to magic-local frame
+            const Vector3 desiredAimLocal =
+                Vector3RotateByQuaternion(desiredAimWorld, invMagicWorldRot);
+
+            // Store the same aim direction for each trajectory time point
+            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+            {
+                outFeatures[fi++] = desiredAimLocal.x;
+                outFeatures[fi++] = desiredAimLocal.z;
+            }
+        }
+        else
+        {
+            fi += count;
         }
     }
 
@@ -278,9 +336,9 @@ static void ComputeMotionFeatures(
         const Vector3 magicToHead = Vector3Subtract(headPos, magicPos);
         const Vector3 localHeadPos = Vector3RotateByQuaternion(magicToHead, invMagicWorldRot);
 
-        // Get toe speeds (using provided toeVelocity which is in world space)
-        const float leftSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
-        const float rightSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
+        // Get toe speeds from lerped velocity (same lerp as ToeVel feature)
+        const float leftSpeed = Vector3Length(leftVelWorld);
+        const float rightSpeed = Vector3Length(rightVelWorld);
 
         float wLeft, wRight;
         float totalSpeed = leftSpeed + rightSpeed;
@@ -331,50 +389,64 @@ static void ComputeMotionFeatures(
     // Same remapping as database: mag < 1 → 0, [1,3] → [0,3], > 3 → 3
     if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped))
     {
-        constexpr float accelDeadZone = 1.0f;
-        constexpr float accelMaxMag = 3.0f;
-        constexpr float accelRemapScale = accelMaxMag / (accelMaxMag - accelDeadZone);
-
-        // Compute the constant control acceleration
-        const Vector3 velDelta = Vector3Subtract(desiredVelWorld, currentVelWorld);
-        const float velDeltaMag = Vector3Length(velDelta);
-
-        Vector3 controlAccelWorld = Vector3Zero();
-        if (velDeltaMag > 1e-6f)
+        const int count = 2 * (int)cfg.futureTrajPointTimes.size();
+        if (updateFutureFeatures)
         {
-            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
-            controlAccelWorld = Vector3Scale(velDeltaDir, maxAcceleration);
+            constexpr float accelDeadZone = 1.0f;
+            constexpr float accelMaxMag = 3.0f;
+            constexpr float accelRemapScale =
+                accelMaxMag / (accelMaxMag - accelDeadZone);
+
+            // Compute the constant control acceleration
+            const Vector3 velDelta =
+                Vector3Subtract(desiredVelWorld, currentVelWorld);
+            const float velDeltaMag = Vector3Length(velDelta);
+
+            Vector3 controlAccelWorld = Vector3Zero();
+            if (velDeltaMag > 1e-6f)
+            {
+                const Vector3 velDeltaDir =
+                    Vector3Scale(velDelta, 1.0f / velDeltaMag);
+                controlAccelWorld =
+                    Vector3Scale(velDeltaDir, maxAcceleration);
+            }
+
+            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+            {
+                const float futureTime = cfg.futureTrajPointTimes[p];
+                Vector3 futureAccelWorld = controlAccelWorld;
+
+                const float maxDeltaVelMag = maxAcceleration * futureTime;
+                if (velDeltaMag <= maxDeltaVelMag)
+                {
+                    futureAccelWorld = Vector3Zero();
+                }
+
+                // Transform to magic space
+                Vector3 accelMagic =
+                    Vector3RotateByQuaternion(futureAccelWorld, invMagicWorldRot);
+
+                // Apply dead zone + remap + clamp
+                const float mag = Vector3Length(accelMagic);
+                if (mag > accelDeadZone)
+                {
+                    float remappedMag =
+                        (mag - accelDeadZone) * accelRemapScale;
+                    if (remappedMag > accelMaxMag) remappedMag = accelMaxMag;
+                    accelMagic = Vector3Scale(accelMagic, remappedMag / mag);
+                }
+                else
+                {
+                    accelMagic = Vector3Zero();
+                }
+
+                outFeatures[fi++] = accelMagic.x;
+                outFeatures[fi++] = accelMagic.z;
+            }
         }
-
-        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        else
         {
-            const float futureTime = cfg.futureTrajPointTimes[p];
-            Vector3 futureAccelWorld = controlAccelWorld;
-
-            const float maxDeltaVelMag = maxAcceleration * futureTime;
-            if (velDeltaMag <= maxDeltaVelMag)
-            {
-                futureAccelWorld = Vector3Zero();
-            }
-
-            // Transform to magic space
-            Vector3 accelMagic = Vector3RotateByQuaternion(futureAccelWorld, invMagicWorldRot);
-
-            // Apply dead zone + remap + clamp
-            const float mag = Vector3Length(accelMagic);
-            if (mag > accelDeadZone)
-            {
-                float remappedMag = (mag - accelDeadZone) * accelRemapScale;
-                if (remappedMag > accelMaxMag) remappedMag = accelMaxMag;
-                accelMagic = Vector3Scale(accelMagic, remappedMag / mag);
-            }
-            else
-            {
-                accelMagic = Vector3Zero();
-            }
-
-            outFeatures[fi++] = accelMagic.x;
-            outFeatures[fi++] = accelMagic.z;
+            fi += count;
         }
     }
 
