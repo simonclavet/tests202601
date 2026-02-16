@@ -10,7 +10,7 @@ extern "C" void cuda_init_context();
 
 constexpr int FEATURE_AE_LATENT_DIM = 16;
 constexpr int SEGMENT_AE_LATENT_DIM = 128;
-constexpr int POSE_AE_LATENT_DIM = 16;
+constexpr int POSE_AE_LATENT_DIM = 32;
 constexpr double HEADSTART_SECONDS = 5.0;
 constexpr double FRIDAY_FLOW_HEADSTART = 20.0;
 constexpr double AUTOSAVE_INTERVAL_SECONDS = 300.0;
@@ -723,7 +723,9 @@ static inline void NetworkInitMonday(
         NN_ACTIVATION(),
         torch::nn::Linear(128, 256),
         NN_ACTIVATION(),
-        torch::nn::Linear(256, 256),
+        torch::nn::Linear(256, 512),
+        NN_ACTIVATION(),
+        torch::nn::Linear(512, 256),
         NN_ACTIVATION(),
         torch::nn::Linear(256, poseLatentDim)
     );
@@ -733,7 +735,7 @@ static inline void NetworkInitMonday(
     state->mondayOptimizer =
         std::make_shared<torch::optim::Adam>(
             state->mondayPredictor->parameters(),
-            torch::optim::AdamOptions(1e-3));
+            torch::optim::AdamOptions(1e-4));
 
     state->mondayLoss = 0.0f;
     state->mondayIterations = 0;
@@ -3045,8 +3047,12 @@ static inline void NetworkTrainMondayForTime(
             // add noise to input pose latent for robustness.
             // the target delta adjusts accordingly: targetDelta = zNext - zCurrentNoisy
             // which equals (cleanDelta - noise), teaching the network to correct back
-            // towards the trajectory when given drifted input at runtime
-            torch::Tensor noise = torch::randn_like(zCurrent) * 0.1f;
+            // towards the trajectory when given drifted input at runtime.
+            // noise is scaled per-dim by deltaStd so it stays commensurate with the
+            // actual delta signal — fixed noise (0.1) would dwarf the tiny deltas
+            torch::Tensor noise = hasStats
+                ? torch::randn_like(zCurrent) * deltaStd * 0.1f
+                : torch::randn_like(zCurrent) * 0.001f;
             torch::Tensor zCurrentNoisy = zCurrent + noise;
             torch::Tensor targetDelta = zNext - zCurrentNoisy;
 

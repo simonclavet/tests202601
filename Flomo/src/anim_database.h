@@ -1915,14 +1915,16 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {"RightHand",0.00213f},
             {"LeftShoulder",0.02739f},{"LeftArm",0.02113f},{"LeftForeArm",0.00850f},
             {"LeftHand",0.00211f},
-            {"RightUpLeg",0.05690f},{"RightLeg",0.02044f},{"RightFoot",0.00306f},
-            {"RightToeBase",0.00080f},{"RightToeBaseEnd",0.00063f},
-            {"LeftUpLeg",0.15668f},{"LeftLeg",0.04034f},{"LeftFoot",0.00289f},
+            {"RightUpLeg",0.15690f},{"RightLeg",0.04044f},{"RightFoot",0.02f},
+            //{"RightUpLeg",0.05690f},{"RightLeg",0.02044f},{"RightFoot",0.02f},
+            {"RightToeBase",0.005f},{"RightToeBaseEnd",0.00063f},
+            {"LeftUpLeg",0.15668f},{"LeftLeg",0.04034f},{"LeftFoot",0.02f},
             //{"LeftUpLeg",0.05668f},{"LeftLeg",0.02034f},{"LeftFoot",0.00289f},
-            {"LeftToeBase",0.00078f},{"LeftToeBaseEnd",0.00063f},
+            {"LeftToeBase",0.005f},{"LeftToeBaseEnd",0.00063f},
         };
         constexpr float defaultBoneWeight = 0.01f;
-        constexpr float nonRotWeight = 1.0f;
+        constexpr float nonRotWeight = 0.4f;
+        constexpr float footPosVelWeight = 1.0f;
 
         const BVHData* skeleton = &characterData->bvhData[0];
 
@@ -1944,13 +1946,13 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         weightPose.rootYawRate = nonRotWeight;
         for (int side : sides)
         {
-            weightPose.lookaheadToePositionsRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
-            weightPose.toeVelocitiesRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
-            weightPose.nextToeVelocitiesRootSpace[side] = { nonRotWeight, nonRotWeight, nonRotWeight };
+            weightPose.lookaheadToePositionsRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
+            weightPose.toeVelocitiesRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
+            weightPose.nextToeVelocitiesRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
         }
-        weightPose.toePosDiffRootSpace = { nonRotWeight, 0.0f, nonRotWeight };
-        weightPose.nextToePosDiffRootSpace = { nonRotWeight, 0.0f, nonRotWeight };
-        weightPose.toeSpeedDiff = nonRotWeight;
+        weightPose.toePosDiffRootSpace = { footPosVelWeight, 0.0f, footPosVelWeight };
+        weightPose.nextToePosDiffRootSpace = { footPosVelWeight, 0.0f, footPosVelWeight };
+        weightPose.toeSpeedDiff = footPosVelWeight;
 
         db->poseGenFeaturesWeight.resize(pgDim);
         weightPose.SerializeTo(db->poseGenFeaturesWeight);
