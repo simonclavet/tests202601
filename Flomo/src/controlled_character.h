@@ -66,6 +66,11 @@ static void ControlledCharacterInit(
     TransformDataInit(&cc->xformLookahead);
     TransformDataResize(&cc->xformLookahead, skeleton);
 
+    // Initialize glimpse pose debug transform buffer
+    TransformDataInit(&cc->xformGlimpsePose);
+    TransformDataResize(&cc->xformGlimpsePose, skeleton);
+    cc->glimpsePoseValid = false;
+
     // Ensure blend cursors have storage sized to joint count
     for (int i = 0; i < ControlledCharacter::MAX_BLEND_CURSORS; ++i) {
 
@@ -76,7 +81,7 @@ static void ControlledCharacterInit(
         cc->cursors[i].globalPositions.resize(cc->xformData.jointCount);
         cc->cursors[i].globalRotations.resize(cc->xformData.jointCount);
         cc->cursors[i].prevLocalRootPos = cc->xformData.localPositions[0];
-        Rot6dFromQuaternion(cc->xformData.localRotations[0], cc->cursors[i].prevLocalRootRot6d);
+        cc->cursors[i].prevLocalRootRot6d = QuaternionToRot6d(cc->xformData.localRotations[0]);
 
         cc->cursors[i].active = false;
         cc->cursors[i].weightSpring = {};  // zero all spring state
@@ -215,6 +220,48 @@ static void SpawnBlendCursor(
     if (config->testSegmentAutoEncoder)
     {
         NetworkApplySegmentAE(networkState, db, &cursor->segment);
+    }
+
+    // optionally pass through PCA encode/decode to test reconstruction quality
+    if (config->testPcaReconstruction && db->pcaSegmentK > 0)
+    {
+        const int segFrames = cursor->segment.rows();
+        const int pgDim = cursor->segment.cols();
+        const int flatDim = segFrames * pgDim;
+
+        // normalize
+        std::vector<float> normalized(flatDim);
+        for (int f = 0; f < segFrames; ++f)
+        {
+            std::span<const float> row = cursor->segment.row_view(f);
+            for (int d = 0; d < pgDim; ++d)
+            {
+                normalized[f * pgDim + d] =
+                    (row[d] - db->poseGenFeaturesMean[d])
+                    / db->poseGenFeaturesStd[d]
+                    * db->poseGenFeaturesWeight[d];
+            }
+        }
+
+        // PCA project then reconstruct
+        std::vector<float> coeffs(db->pcaSegmentK);
+        PcaProjectSegment(db, normalized.data(), coeffs.data());
+        PcaReconstructSegment(db, coeffs.data(), normalized.data());
+
+        // denormalize back to raw
+        for (int f = 0; f < segFrames; ++f)
+        {
+            std::span<float> dst = cursor->segment.row_view(f);
+            for (int d = 0; d < pgDim; ++d)
+            {
+                const float w = db->poseGenFeaturesWeight[d];
+                dst[d] = (w > 1e-10f)
+                    ? (normalized[f * pgDim + d] / w
+                        * db->poseGenFeaturesStd[d]
+                        + db->poseGenFeaturesMean[d])
+                    : db->poseGenFeaturesMean[d];
+            }
+        }
     }
 
     if (config->testPoseAutoEncoder)
@@ -382,6 +429,89 @@ static void SpawnBlendCursorFromFullFlow(
     cursor->segmentAnimTime = 0.0f;
 }
 
+static void SpawnBlendCursorFromGlimpse(
+    ControlledCharacter* cc,
+    const AnimDatabase* db,
+    NetworkState* networkState,
+    const std::vector<float>& query,
+    float blendTime,
+    bool immediate)
+{
+    for (int i = 0;
+        i < ControlledCharacter::MAX_BLEND_CURSORS;
+        ++i)
+    {
+        if (cc->cursors[i].active)
+            cc->cursors[i].targetWeight = 0.0f;
+    }
+
+    BlendCursor* cursor = FindAvailableCursor(cc);
+    assert(cursor != nullptr);
+    if (!cursor) return;
+
+    cursor->active = true;
+    cursor->animIndex = -1;
+    cursor->weightSpring = {};
+    cursor->fastWeightSpring = {};
+
+    if (immediate)
+    {
+        cursor->weightSpring.x = 1.0f;
+        cursor->weightSpring.xi = 1.0f;
+        cursor->fastWeightSpring.x = 1.0f;
+        cursor->fastWeightSpring.xi = 1.0f;
+    }
+
+    cursor->targetWeight = 1.0f;
+    cursor->blendTime = blendTime;
+    cursor->segmentFrameTime = db->animFrameTime[0];
+
+    std::vector<float> futurePoseRaw;
+    if (!NetworkPredictGlimpse(
+        networkState, db, query, cursor->segment, &futurePoseRaw))
+    {
+        cursor->active = false;
+        cc->glimpsePoseValid = false;
+        return;
+    }
+
+    // build xformGlimpsePose from the future pose for debug visualization
+    if (!futurePoseRaw.empty())
+    {
+        const int jc = cc->xformData.jointCount;
+        PoseFeatures poseFeat;
+        poseFeat.DeserializeFrom(std::span<const float>(futurePoseRaw), jc);
+
+        for (int j = 0; j < jc; ++j)
+        {
+            if (j == 0)
+            {
+                cc->xformGlimpsePose.localPositions[j] = poseFeat.rootLocalPosition;
+            }
+            else
+            {
+                cc->xformGlimpsePose.localPositions[j] =
+                    Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
+            }
+            Rot6d rot = poseFeat.lookaheadLocalRotations[j];
+            Rot6dNormalize(rot);
+            cc->xformGlimpsePose.localRotations[j] = Rot6dToQuaternion(rot);
+        }
+        TransformDataForwardKinematics(&cc->xformGlimpsePose);
+        for (int j = 0; j < jc; ++j)
+        {
+            cc->xformGlimpsePose.globalPositions[j] = Vector3Add(
+                Vector3RotateByQuaternion(cc->xformGlimpsePose.globalPositions[j], cc->worldRotation),
+                cc->worldPosition);
+            cc->xformGlimpsePose.globalRotations[j] = QuaternionMultiply(
+                cc->worldRotation, cc->xformGlimpsePose.globalRotations[j]);
+        }
+        cc->glimpsePoseValid = true;
+    }
+
+    cursor->segmentAnimTime = 0.0f;
+}
+
 // - requires db != nullptr && db->valid and db->jointCount == cc->xformData.jointCount
 // - uses db->localJointPositions / localJointRotations6d for sampling (no per-frame global->local conversion)
 // - blends per-cursor root deltas in world-space (XZ + yaw) and applies to cc->world*
@@ -428,6 +558,37 @@ static void ControlledCharacterUpdate(
         }
     }
 
+    // --- Update motion matching feature velocity (independent from actual velocity) ---
+    // This velocity is used for FutureVel features and updated using maxAcceleration
+    {
+        if (!cc->virtualControlSmoothedVelocityInitialized)
+        {
+            cc->virtualControlSmoothedVelocity = Vector3Zero();
+            cc->virtualControlSmoothedVelocityInitialized = true;
+        }
+
+        // Update feature velocity towards desired velocity using maximum acceleration
+        const Vector3 desiredVel = cc->playerInput.desiredVelocity;
+        const float maxAccel = config.virtualControlMaxAcceleration;
+        const float maxDeltaVelMag = maxAccel * dt;
+
+        const Vector3 velDelta = Vector3Subtract(cc->playerInput.desiredVelocity, cc->virtualControlSmoothedVelocity);
+        const float velDeltaMag = Vector3Length(velDelta);
+
+        if (velDeltaMag <= maxDeltaVelMag)
+        {
+            // Can reach desired velocity within this timestep
+            cc->virtualControlSmoothedVelocity = cc->playerInput.desiredVelocity;
+        }
+        else if (velDeltaMag > 1e-6f)
+        {
+            // Clamp to max achievable change
+            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
+            cc->virtualControlSmoothedVelocity =
+                Vector3Add(cc->virtualControlSmoothedVelocity, Vector3Scale(velDeltaDir, maxDeltaVelMag));
+        }
+    }
+
     // --- Animation mode logic ---
 
     // input decided search: detect sudden input changes
@@ -439,7 +600,8 @@ static void ControlledCharacterUpdate(
         || cc->animMode == AnimationMode::FridayFlow
         || cc->animMode == AnimationMode::SinglePosePredictor
         || cc->animMode == AnimationMode::UnconditionedAdvance
-        || cc->animMode == AnimationMode::MondayPredictor)
+        || cc->animMode == AnimationMode::MondayPredictor
+        || cc->animMode == AnimationMode::GlimpseMode)
     {
         cc->inputDecidedSearchCooldown -= dt;
         const Vector3 velDiff = Vector3Subtract(
@@ -616,6 +778,19 @@ static void ControlledCharacterUpdate(
             cc->mmSearchTimer = config.mmSearchPeriod;
 
             SpawnBlendCursorFromFullFlow(
+                cc, db, networkState, cc->mmQuery,
+                config.defaultBlendTime, false);
+        }
+    }
+    else if (cc->animMode == AnimationMode::GlimpseMode)
+    {
+        cc->mmSearchTimer -= dt;
+        if (cc->mmSearchTimer <= 0.0f)
+        {
+            ComputeMotionFeatures(db, cc, cc->mmQuery, true, 1.0f);
+            cc->mmSearchTimer = config.mmSearchPeriod;
+
+            SpawnBlendCursorFromGlimpse(
                 cc, db, networkState, cc->mmQuery,
                 config.defaultBlendTime, false);
         }
@@ -901,36 +1076,6 @@ static void ControlledCharacterUpdate(
         }
     }
 
-    // --- Update motion matching feature velocity (independent from actual velocity) ---
-    // This velocity is used for FutureVel features and updated using maxAcceleration
-    {
-        if (!cc->virtualControlSmoothedVelocityInitialized)
-        {
-            cc->virtualControlSmoothedVelocity = Vector3Zero();
-            cc->virtualControlSmoothedVelocityInitialized = true;
-        }
-
-        // Update feature velocity towards desired velocity using maximum acceleration
-        const Vector3 desiredVel = cc->playerInput.desiredVelocity;
-        const float maxAccel = config.virtualControlMaxAcceleration;
-        const float maxDeltaVelMag = maxAccel * dt;
-
-        const Vector3 velDelta = Vector3Subtract(cc->playerInput.desiredVelocity, cc->virtualControlSmoothedVelocity);
-        const float velDeltaMag = Vector3Length(velDelta);
-
-        if (velDeltaMag <= maxDeltaVelMag)
-        {
-            // Can reach desired velocity within this timestep
-            cc->virtualControlSmoothedVelocity = cc->playerInput.desiredVelocity;
-        }
-        else if (velDeltaMag > 1e-6f)
-        {
-            // Clamp to max achievable change
-            const Vector3 velDeltaDir = Vector3Scale(velDelta, 1.0f / velDeltaMag);
-            cc->virtualControlSmoothedVelocity =
-                Vector3Add(cc->virtualControlSmoothedVelocity, Vector3Scale(velDeltaDir, maxDeltaVelMag));
-        }
-    }
 
     // advance cursor times, update weights, compute total weight and normalize weights
     {
@@ -1211,7 +1356,7 @@ static void ControlledCharacterUpdate(
         // Convert blendedRot6d to quaternions
         for (int j = 0; j < jc; ++j)
         {
-            Rot6dToQuaternion(blendedLocalRotations[j], cc->xformBasicBlend.localRotations[j]);
+            cc->xformBasicBlend.localRotations[j] = Rot6dToQuaternion(blendedLocalRotations[j]);
         }
         // NOTE: No longer zeroing root XZ - hip position is relative to Magic anchor
         // FK
@@ -1242,7 +1387,7 @@ static void ControlledCharacterUpdate(
             }
             Rot6d lookaheadRot = blendedLookaheadLocalRotations[j];
             Rot6dNormalize(lookaheadRot);
-            Rot6dToQuaternion(lookaheadRot, cc->xformLookahead.localRotations[j]);
+            cc->xformLookahead.localRotations[j] = Rot6dToQuaternion(lookaheadRot);
         }
         // FK
         TransformDataForwardKinematics(&cc->xformLookahead);
@@ -1316,7 +1461,7 @@ static void ControlledCharacterUpdate(
         // Apply dragged rotations (convert from Rot6d to quaternions)
         for (int j = 0; j < jc; ++j)
         {
-            Rot6dToQuaternion(cc->lookaheadDragLocalRotations6d[j], cc->xformData.localRotations[j]);
+            cc->xformData.localRotations[j] = Rot6dToQuaternion(cc->lookaheadDragLocalRotations6d[j]);
         }
 
         // Apply dragged positions
@@ -1358,7 +1503,7 @@ static void ControlledCharacterUpdate(
         // standard blending: directly use blended rotations and positions
         for (int j = 0; j < jc; ++j)
         {
-            Rot6dToQuaternion(blendedLocalRotations[j], cc->xformData.localRotations[j]);
+            cc->xformData.localRotations[j] = Rot6dToQuaternion(blendedLocalRotations[j]);
             if (j == 0)
             {
                 cc->xformData.localPositions[j] = blendedLocalPositions[0];
@@ -1415,7 +1560,7 @@ static void ControlledCharacterUpdate(
                 cur.globalPositions[j] = cur.rootLocalPosition;
             else
                 cur.globalPositions[j] = Vector3Scale(cc->skeleton->joints[j].offset, cc->scale);
-            Rot6dToQuaternion(cur.localRotations6d[j], cur.globalRotations[j]);
+            cur.globalRotations[j] = Rot6dToQuaternion(cur.localRotations6d[j]);
         }
 
         // Forward kinematics
@@ -1467,10 +1612,10 @@ static void ControlledCharacterUpdate(
     const float toeAlpha = dt / lookaheadTime;
     assert(toeAlpha <= 1.0f);
 
-    // determine which foot should be faster from blended velocities
-    const float leftBlendedSpeed = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
-    const float rightBlendedSpeed = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
-    const int fastSide = (leftBlendedSpeed >= rightBlendedSpeed) ? SIDE_LEFT : SIDE_RIGHT;
+    const Vector3 preLoopVirtualToePos[SIDES_COUNT] = {
+        cc->virtualToePos[SIDE_LEFT],
+        cc->virtualToePos[SIDE_RIGHT]
+    };
 
     for (int side : sides)
     {
@@ -1519,8 +1664,8 @@ static void ControlledCharacterUpdate(
                     const float lowSpeed = 0.5f;
                     const float highSpeed = 2.0f;
                     const float howFast = ClampedInvLerp(lowSpeed, highSpeed, blendedSpeedXZ);
-                    const float lowMult = 1.2f;
-                    const float highMult = 1.4f;
+                    const float lowMult = 1.1f;
+                    const float highMult = 1.3f;
                     const float speedMultiplier = SmoothLerp(lowMult, highMult, howFast);
                     const float maxSpeed = blendedSpeedXZ * speedMultiplier;
                     const float maxDistXZ = maxSpeed * dt;
@@ -1533,27 +1678,99 @@ static void ControlledCharacterUpdate(
                         // Y is NOT clamped - height should track target directly
                     }
 
-                    // speed floor: fast foot must move at least toeSpeedDiff faster than slow foot
-                    // since slow foot is typically near-stationary, floor ≈ toeSpeedDiff
-                    constexpr bool doFastFootVelFloor = false;
-                    if (doFastFootVelFloor && side == fastSide && cc->blendedToeSpeedDiff > 0.1f)
-                    {
-                        const Vector3 postClampDisp = Vector3Subtract(newVirtualToePos, prevVirtualToePos);
-                        const float postClampDistXZ = Vector3Length2D(postClampDisp);
-                        const float minDistXZ = cc->blendedToeSpeedDiff * dt;
-                        if (postClampDistXZ < minDistXZ)
-                        {
-                            // scale in original target direction to enforce minimum speed
-                            const float scale = minDistXZ / distXZ;
-                            newVirtualToePos.x = prevVirtualToePos.x + displacement.x * scale;
-                            newVirtualToePos.z = prevVirtualToePos.z + displacement.z * scale;
-                        }
-                    }
                 }
             }
 
             cc->virtualToePos[side] = newVirtualToePos;
+        }
+    }
 
+    // enforce animation speed difference between feet (before timed unlocking)
+    // we compare the actual speed difference to what the animation data says it should be,
+    // then speed up or slow down each foot proportionally to close the gap.
+    // speeding up: nudge toward the far lookahead target (stable, no overshoot).
+    // slowing down: scale back the displacement from previous position.
+    {
+        Vector3 frameDisp[SIDES_COUNT];
+        float frameSpeed[SIDES_COUNT];
+        for (int side : sides)
+        {
+            frameDisp[side] = Vector3Subtract(cc->virtualToePos[side], preLoopVirtualToePos[side]);
+            frameSpeed[side] = Vector3Length2D(frameDisp[side]) / dt;
+        }
+        const float totalSpeed = frameSpeed[SIDE_LEFT] + frameSpeed[SIDE_RIGHT];
+
+        if (totalSpeed > 1e-4f)
+        {
+            // which foot should be faster? use anim velocities (stable, not affected by our corrections)
+            const float animSpeedL = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
+            const float animSpeedR = Vector3Length2D(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
+            const float targetDiff = cc->blendedToeSpeedDiff;
+            const float signedTarget = (animSpeedL >= animSpeedR) ? targetDiff : -targetDiff;
+
+            const float actualDiff = frameSpeed[SIDE_LEFT] - frameSpeed[SIDE_RIGHT];
+            const float error = signedTarget - actualDiff;
+
+            // soft dead zone: ramp correction from 0 to full as error grows
+            const float absError = fabsf(error);
+            const float deadZone = 0.2f;
+            const float strength = SmoothStep(
+                Clamp(absError / Max(deadZone, targetDiff * 0.5f), 0.0f, 1.0f));
+            const float correction = error * strength;
+
+            // distribute using animation speed weights (stable, unlike frame speeds which
+            // depend on distance-to-target and fluctuate frame to frame)
+            const float totalAnimSpeed = animSpeedL + animSpeedR;
+            const float weight[SIDES_COUNT] = {
+                (totalAnimSpeed > 1e-4f) ? animSpeedL / totalAnimSpeed : 0.5f,
+                (totalAnimSpeed > 1e-4f) ? animSpeedR / totalAnimSpeed : 0.5f
+            };
+            // positive speedAdj = speed up, negative = slow down
+            // correction > 0 means "left should be faster" so left gets +, right gets -
+            const float speedAdj[SIDES_COUNT] = {
+                 correction * weight[SIDE_LEFT],
+                -correction * weight[SIDE_RIGHT]
+            };
+
+            for (int side : sides)
+            {
+                if (speedAdj[side] > 1e-6f)
+                {
+                    // speed up: move toward the far lookahead target (not the drag target,
+                    // which is close and would cause overshoot oscillation)
+                    const Vector3 lookaheadWorld = Vector3Add(
+                        Vector3RotateByQuaternion(
+                            toeBlendedLookaheadPositionRootSpace[side], cc->worldRotation),
+                        cc->worldPosition);
+                    const Vector3 toTarget = Vector3Subtract(lookaheadWorld, cc->virtualToePos[side]);
+                    const float distToTarget = Vector3Length2D(toTarget);
+                    const float extraDist = speedAdj[side] * dt;
+
+                    if (distToTarget > 1e-6f)
+                    {
+                        const float moveDist = Min(extraDist, distToTarget);
+                        const float s = moveDist / distToTarget;
+                        cc->virtualToePos[side].x += toTarget.x * s;
+                        cc->virtualToePos[side].z += toTarget.z * s;
+                    }
+                }
+                else if (speedAdj[side] < -1e-6f && frameSpeed[side] > 1e-6f)
+                {
+                    // slow down: pull back toward previous position
+                    const float newSpeed = Max(0.0f, frameSpeed[side] + speedAdj[side]);
+                    const float s = newSpeed / frameSpeed[side];
+                    cc->virtualToePos[side].x = preLoopVirtualToePos[side].x + frameDisp[side].x * s;
+                    cc->virtualToePos[side].z = preLoopVirtualToePos[side].z + frameDisp[side].z * s;
+                }
+            }
+        }
+    }
+
+    // timed unlocking (second pass, per-foot)
+    for (int side : sides)
+    {
+        if (cc->lookaheadDragToePosInitialized)
+        {
             // Check unlock condition: distance between lookaheadDrag (unconstrained) and virtual (constrained)
             const Vector3 unlockDelta = Vector3Subtract(cc->lookaheadDragToePosWorld[side], cc->virtualToePos[side]);
             const float distXZUnlock = Vector3Length2D(unlockDelta);
@@ -1585,7 +1802,7 @@ static void ControlledCharacterUpdate(
             if (config.enableTimedUnlocking && cc->virtualToeUnlockTimer[side] >= 0.0f)
             {
                 const float unlockProgress = cc->virtualToeUnlockTimer[side] / config.unlockDuration;
-                const float smoothUnlockProgress = SmoothStep(unlockProgress);
+                const float smoothUnlockProgress = SmootherStep(unlockProgress);
                 const float maxClampDist = cc->virtualToeUnlockStartDistance[side] * smoothUnlockProgress;
 
                 cc->virtualToeUnlockClampRadius[side] = maxClampDist;

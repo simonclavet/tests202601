@@ -58,6 +58,51 @@ static inline void ComputeFutureVelocities(
     }
 }
 
+// max angular velocity for aim direction smoothing (180 degrees in 0.5 seconds)
+constexpr float MAX_AIM_ANGULAR_VELOCITY = 3.14159f / 0.5f;
+
+struct FutureAimPoint
+{
+    Vector3 direction;
+    float angularVelocity;  // rad/s around Y
+};
+
+// compute planned future aim directions, same idea as ComputeFutureVelocities but for angles.
+// the smoothed aim chases the desired aim at a capped angular velocity.
+// for each future time point we compute where the aim will be and how fast it's turning.
+static inline void ComputeFutureAimDirections(
+    const Vector3& currentAimDir,
+    const Vector3& desiredAimDir,
+    float maxAngularVelocity,
+    const std::vector<float>& futureTimes,
+    std::vector<FutureAimPoint>& outPoints)
+{
+    outPoints.resize(futureTimes.size());
+
+    const float angleDiff = SignedAngleY(currentAimDir, desiredAimDir);
+    const float sign = (angleDiff >= 0.0f) ? 1.0f : -1.0f;
+    const float absAngle = fabsf(angleDiff);
+
+    for (int p = 0; p < (int)futureTimes.size(); ++p)
+    {
+        const float t = futureTimes[p];
+        const float maxTurn = maxAngularVelocity * t;
+
+        if (absAngle <= maxTurn)
+        {
+            // we'll have reached the desired direction by this time
+            outPoints[p].direction = desiredAimDir;
+            outPoints[p].angularVelocity = 0.0f;
+        }
+        else
+        {
+            // still turning: rotate by maxTurn in the right direction
+            outPoints[p].direction = RotateXZByAngle(currentAimDir, sign * maxTurn);
+            outPoints[p].angularVelocity = sign * maxAngularVelocity;
+        }
+    }
+}
+
 //----------------------------------------------------------------------------------
 // Motion Matching - Feature Extraction and Search
 //----------------------------------------------------------------------------------
@@ -295,30 +340,94 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = pastPosLocal.z;
     }
 
-    // AimDirection: desired aim direction at future trajectory times (in magic-local frame)
-    // Same desired aim is used for all time points (user confirmed)
-    if (cfg.IsFeatureEnabled(FeatureType::AimDirection))
+    // FutureAimDirection + FutureAimVelocity: planned aim trajectory at future times
+    // the starting point is the actual current aim direction read from the live bones,
+    // not a smoothed state. unlike velocity (where we want the acceleration boost right away),
+    // for rotation we want to start from where the character actually is.
     {
-        const int count = 2 * (int)cfg.futureTrajPointTimes.size();
-        if (updateFutureFeatures)
+        const bool needDir = cfg.IsFeatureEnabled(FeatureType::FutureAimDirection);
+        const bool needVel = cfg.IsFeatureEnabled(FeatureType::FutureAimVelocity);
+        const int numPoints = (int)cfg.futureTrajPointTimes.size();
+
+        if ((needDir || needVel) && updateFutureFeatures)
         {
-            // Get desired aim from player input (world space, already unit length)
-            const Vector3 desiredAimWorld = input->desiredAimDirection;
-
-            // Transform to magic-local frame
-            const Vector3 desiredAimLocal =
-                Vector3RotateByQuaternion(desiredAimWorld, invMagicWorldRot);
-
-            // Store the same aim direction for each trajectory time point
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+            // compute current aim direction from the live bones
+            Vector3 currentAimWorld = { 0.0f, 0.0f, 1.0f };
+            switch (cfg.aimDirectionMode)
             {
-                outFeatures[fi++] = desiredAimLocal.x;
-                outFeatures[fi++] = desiredAimLocal.z;
+            case AimDirectionMode::HeadToRightHand:
+            {
+                if (db->headIndex >= 0 && db->handIndices[SIDE_RIGHT] >= 0)
+                {
+                    currentAimWorld = Vector3Subtract(
+                        xform->globalPositions[db->handIndices[SIDE_RIGHT]],
+                        xform->globalPositions[db->headIndex]);
+                }
+                break;
+            }
+            case AimDirectionMode::HeadDirection:
+            {
+                if (db->headIndex >= 0)
+                {
+                    currentAimWorld = Vector3RotateByQuaternion(
+                        Vector3{ 0.0f, 0.0f, 1.0f },
+                        xform->globalRotations[db->headIndex]);
+                }
+                break;
+            }
+            case AimDirectionMode::HipsDirection:
+            {
+                if (db->hipJointIndex >= 0)
+                {
+                    currentAimWorld = Vector3RotateByQuaternion(
+                        Vector3{ 0.0f, 0.0f, 1.0f },
+                        xform->globalRotations[db->hipJointIndex]);
+                }
+                break;
+            }
+            default: break;
+            }
+            currentAimWorld.y = 0.0f;
+            const float aimLen = Vector3Length(currentAimWorld);
+            if (aimLen > 1e-6f)
+            {
+                currentAimWorld = Vector3Scale(currentAimWorld, 1.0f / aimLen);
+            }
+            else
+            {
+                currentAimWorld = { 0.0f, 0.0f, 1.0f };
+            }
+
+            std::vector<FutureAimPoint> aimPoints;
+            ComputeFutureAimDirections(
+                currentAimWorld,
+                input->desiredAimDirection,
+                MAX_AIM_ANGULAR_VELOCITY,
+                cfg.futureTrajPointTimes,
+                aimPoints);
+
+            if (needDir)
+            {
+                for (int p = 0; p < numPoints; ++p)
+                {
+                    const Vector3 aimLocal =
+                        Vector3RotateByQuaternion(aimPoints[p].direction, invMagicWorldRot);
+                    outFeatures[fi++] = aimLocal.x;
+                    outFeatures[fi++] = aimLocal.z;
+                }
+            }
+            if (needVel)
+            {
+                for (int p = 0; p < numPoints; ++p)
+                {
+                    outFeatures[fi++] = aimPoints[p].angularVelocity;
+                }
             }
         }
         else
         {
-            fi += count;
+            if (needDir) { fi += numPoints * 2; }
+            if (needVel) { fi += numPoints; }
         }
     }
 

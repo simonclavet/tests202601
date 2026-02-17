@@ -439,6 +439,7 @@ static inline bool SaveConfigToFolder(
     const AppConfig& config,
     const CharacterData& characterData,
     const NetworkState& networkState,
+    const AnimDatabase& animDatabase,
     const std::string& folderPath)
 {
     // Copy current config file
@@ -467,7 +468,7 @@ static inline bool SaveConfigToFolder(
     }
 
     // Save networks if they exist
-    NetworkSaveAll(&networkState, folderPath);
+    NetworkSaveAll(&networkState, &animDatabase, folderPath);
 
     TraceLog(LOG_INFO, "Config saved to: %s",
         folderPath.c_str());
@@ -479,6 +480,7 @@ static inline bool SaveConfigToNewFolder(
     const AppConfig& config,
     const CharacterData& characterData,
     const NetworkState& networkState,
+    const AnimDatabase& animDatabase,
     std::string& /*out*/ savedFolderName)
 {
     const std::string baseDir = "saved";
@@ -525,7 +527,7 @@ static inline bool SaveConfigToNewFolder(
     }
 
     if (!SaveConfigToFolder(
-        config, characterData, networkState, folderPath))
+        config, characterData, networkState, animDatabase, folderPath))
     {
         return false;
     }
@@ -1628,6 +1630,9 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
     const bool hasSinglePosePredictor = static_cast<bool>(app->networkState.singlePosePredictor);
     const bool hasUncondAdvance = static_cast<bool>(app->networkState.uncondAdvancePredictor);
     const bool hasMonday = static_cast<bool>(app->networkState.mondayPredictor);
+    const bool hasFridayFlow = static_cast<bool>(app->networkState.fridayFlowModel);
+    const bool hasGlimpse = static_cast<bool>(app->networkState.glimpseFlow)
+        && static_cast<bool>(app->networkState.glimpseDecompressor);
 
     // if current mode needs networks and there are none, fall back to motion matching
     if (config->animationMode == AnimationMode::AverageLatentPredictor && !hasLatentSegmentPredictor)
@@ -1636,11 +1641,15 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
         config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::FullFlowSampled && !hasFullFlow)
         config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::FridayFlow && !hasFridayFlow)
+        config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
         config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
         config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::MondayPredictor && !hasMonday)
+        config->animationMode = AnimationMode::MotionMatching;
+    if (config->animationMode == AnimationMode::GlimpseMode && !hasGlimpse)
         config->animationMode = AnimationMode::MotionMatching;
 
     ImGui::SetNextWindowPos(ImVec2(250, 200), ImGuiCond_FirstUseEver);
@@ -1658,11 +1667,17 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
                     continue;
                 if (mode == AnimationMode::FlowSampled && !hasFlow)
                     continue;
+                if (mode == AnimationMode::FullFlowSampled && !hasFullFlow)
+                    continue;
+                if (mode == AnimationMode::FridayFlow && !hasFridayFlow)
+                    continue;
                 if (mode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
                     continue;
                 if (mode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
                     continue;
                 if (mode == AnimationMode::MondayPredictor && !hasMonday)
+                    continue;
+                if (mode == AnimationMode::GlimpseMode && !hasGlimpse)
                     continue;
                 const bool isSelected = (currentMode == i);
                 if (ImGui::Selectable(AnimationModeName(mode), isSelected))
@@ -1720,6 +1735,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                     app->config,
                     app->characterData,
                     app->networkState,
+                    app->animDatabase,
                     folderPath);
             }
             if (ImGui::IsItemHovered())
@@ -1740,6 +1756,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                 app->config,
                 app->characterData,
                 app->networkState,
+                app->animDatabase,
                 folderName))
             {
                 app->savedConfigsNeedRefresh = true;
@@ -1839,9 +1856,19 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
     {
         const bool training =
             app->networkState.isTraining;
-        const bool hasAEs =
+        const bool hasNetworks =
             app->networkState.featuresAutoEncoder
-            && app->networkState.segmentAutoEncoder;
+            || app->networkState.poseAutoEncoder
+            || app->networkState.segmentAutoEncoder
+            || app->networkState.segmentLatentAveragePredictor
+            || app->networkState.singlePosePredictor
+            || app->networkState.latentFlowModel
+            || app->networkState.fullFlowModel
+            || app->networkState.fridayFlowModel
+            || app->networkState.uncondAdvancePredictor
+            || app->networkState.mondayPredictor
+            || app->networkState.glimpseFlow
+            || app->networkState.glimpseDecompressor;
 
         if (!training)
         {
@@ -1863,7 +1890,7 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
                 }
             }
 
-            if (hasAEs)
+            if (hasNetworks)
             {
                 ImGui::SameLine();
                 if (ImGui::Button("Continue Training"))
@@ -1889,13 +1916,17 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
         {
             ImGui::Checkbox("Test Segment AE", &app->config.testSegmentAutoEncoder);
         }
+        if (app->animDatabase.pcaSegmentK > 0)
+        {
+            ImGui::Checkbox("Test PCA Reconstruction", &app->config.testPcaReconstruction);
+        }
         if (app->networkState.poseAutoEncoder)
         {
             ImGui::Checkbox("Test Pose AE", &app->config.testPoseAutoEncoder);
         }
 
 
-        if (training || hasAEs)
+        if (training || hasNetworks)
         {
             ImGui::Separator();
 
@@ -1959,107 +1990,78 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
                 &lossPlotSkipPct, 0.0f, 99.0f,
                 "%.0f%%");
 
-            ImGui::Text("Feature AE  Loss: %.6f  Iter: %d", ns.featureAELossSmoothed, ns.featureAEIterations);
-            if (!ns.featureAELossHistory.empty())
+            if (ns.featureAEIterations > 0)
             {
-                plotLossLog("##featureAE",
-                    ns.featureAELossHistory);
+                ImGui::Text("Feature AE  Loss: %.6f  Iter: %d",
+                    ns.featureAELossSmoothed, ns.featureAEIterations);
+                if (!ns.featureAELossHistory.empty())
+                    plotLossLog("##featureAE", ns.featureAELossHistory);
             }
 
-            ImGui::Text("Pose AE  Loss: %.6f  Iter: %d", ns.poseAELossSmoothed, ns.poseAEIterations);
-            if (!ns.poseAELossHistory.empty())
+            if (ns.poseAEIterations > 0)
             {
-                plotLossLog("##poseAE",
-                    ns.poseAELossHistory);
+                ImGui::Text("Pose AE  Loss: %.6f  Iter: %d",
+                    ns.poseAELossSmoothed, ns.poseAEIterations);
+                if (!ns.poseAELossHistory.empty())
+                    plotLossLog("##poseAE", ns.poseAELossHistory);
             }
 
-            ImGui::Text("Segment AE  Loss: %.6f  Iter: %d", ns.segmentAELossSmoothed, ns.segmentAEIterations);
-            if (!ns.segmentAELossHistory.empty())
+            if (ns.segmentAEIterations > 0)
             {
-                plotLossLog("##segmentAE",
-                    ns.segmentAELossHistory);
+                ImGui::Text("Segment AE  Loss: %.6f  Iter: %d",
+                    ns.segmentAELossSmoothed, ns.segmentAEIterations);
+                if (!ns.segmentAELossHistory.empty())
+                    plotLossLog("##segmentAE", ns.segmentAELossHistory);
             }
 
-            if (ns.segmentLatentAveragePredictor)
+            if (ns.latentSegmentPredictorIterations > 0)
             {
-                ImGui::Text("Seg Pred    Loss: %.6f  Iter: %d", ns.latentSegmentPredictorLossSmoothed, ns.latentSegmentPredictorIterations);
+                ImGui::Text("Seg Pred    Loss: %.6f  Iter: %d",
+                    ns.latentSegmentPredictorLossSmoothed,
+                    ns.latentSegmentPredictorIterations);
                 if (!ns.latentSegmentPredictorLossHistory.empty())
-                {
-                    plotLossLog("##segPredictor",
-                        ns.latentSegmentPredictorLossHistory);
-                }
-            }
-            else if (training)
-            {
-                ImGui::TextDisabled("Predictor: waiting for headstart");
+                    plotLossLog("##segPredictor", ns.latentSegmentPredictorLossHistory);
             }
 
-            if (ns.latentFlowModel)
+            if (ns.flowIterations > 0)
             {
-                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d", ns.flowLossSmoothed, ns.flowIterations);
+                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d",
+                    ns.flowLossSmoothed, ns.flowIterations);
                 if (!ns.flowLossHistory.empty())
-                {
-                    plotLossLog("##flow",
-                        ns.flowLossHistory);
-                }
-            }
-            else if (training)
-            {
-                ImGui::TextDisabled("Flow: waiting for AE warmup");
+                    plotLossLog("##flow", ns.flowLossHistory);
             }
 
             if (ns.segmentE2eIterations > 0)
             {
-                ImGui::Text("Segment E2E  Loss: %.6f  Iter: %d", ns.segmentE2eLossSmoothed, ns.segmentE2eIterations);
+                ImGui::Text("Segment E2E  Loss: %.6f  Iter: %d",
+                    ns.segmentE2eLossSmoothed, ns.segmentE2eIterations);
                 if (!ns.segmentE2eLossHistory.empty())
-                {
-                    plotLossLog("##segmentE2e",
-                        ns.segmentE2eLossHistory);
-                }
+                    plotLossLog("##segmentE2e", ns.segmentE2eLossHistory);
             }
 
-            if (ns.fullFlowModel)
+            if (ns.fullFlowIterations > 0)
             {
-                ImGui::Text(
-                    "FullFlow    Loss: %.6f  Iter: %d",
-                    ns.fullFlowLossSmoothed,
-                    ns.fullFlowIterations);
+                ImGui::Text("FullFlow    Loss: %.6f  Iter: %d",
+                    ns.fullFlowLossSmoothed, ns.fullFlowIterations);
                 if (!ns.fullFlowLossHistory.empty())
-                {
-                    plotLossLog("##fullFlow",
-                        ns.fullFlowLossHistory);
-                }
-            }
-            else if (training)
-            {
-                ImGui::TextDisabled("FullFlow: waiting for init");
+                    plotLossLog("##fullFlow", ns.fullFlowLossHistory);
             }
 
-            if (ns.fridayFlowModel)
+            if (ns.fridayFlowIterations > 0)
             {
                 ImGui::Text("FridayFlow  Loss: %.6f  Iter: %d",
                     ns.fridayFlowLossSmoothed, ns.fridayFlowIterations);
                 if (!ns.fridayFlowLossHistory.empty())
                     plotLossLog("##fridayFlow", ns.fridayFlowLossHistory);
             }
-            else if (training)
-            {
-                ImGui::TextDisabled("FridayFlow: waiting for init (%.0fs headstart)",
-                    FRIDAY_FLOW_HEADSTART);
-            }
 
-            if (ns.singlePosePredictor)
+            if (ns.singlePosePredictorIterations > 0)
             {
                 ImGui::Text("SinglePose  Loss: %.6f  Iter: %d",
-                    ns.singlePosePredictorLossSmoothed, ns.singlePosePredictorIterations);
+                    ns.singlePosePredictorLossSmoothed,
+                    ns.singlePosePredictorIterations);
                 if (!ns.singlePosePredictorLossHistory.empty())
-                {
                     plotLossLog("##singlePose", ns.singlePosePredictorLossHistory);
-                }
-            }
-            else if (training)
-            {
-                ImGui::TextDisabled("SinglePose: waiting for init");
             }
 
             if (ns.singlePoseE2eIterations > 0)
@@ -2070,32 +2072,37 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
                     plotLossLog("##singlePoseE2e", ns.singlePoseE2eLossHistory);
             }
 
-            if (ns.uncondAdvancePredictor)
+            if (ns.uncondAdvanceIterations > 0)
             {
                 ImGui::Text("UncondAdvance  Loss: %.6f  Iter: %d",
                     ns.uncondAdvanceLossSmoothed, ns.uncondAdvanceIterations);
                 if (!ns.uncondAdvanceLossHistory.empty())
-                {
                     plotLossLog("##uncondAdvance", ns.uncondAdvanceLossHistory);
-                }
-            }
-            else if (training)
-            {
-                ImGui::TextDisabled("UncondAdvance: waiting for init");
             }
 
-            if (ns.mondayPredictor)
+            if (ns.mondayIterations > 0)
             {
                 ImGui::Text("Monday  Loss: %.6f  Iter: %d",
                     ns.mondayLossSmoothed, ns.mondayIterations);
                 if (!ns.mondayLossHistory.empty())
-                {
                     plotLossLog("##monday", ns.mondayLossHistory);
-                }
             }
-            else if (training)
+
+            if (ns.glimpseFlowIterations > 0)
             {
-                ImGui::TextDisabled("Monday: waiting for init");
+                ImGui::Text("GlimpseFlow  Loss: %.6f  Iter: %d",
+                    ns.glimpseFlowLossSmoothed, ns.glimpseFlowIterations);
+                if (!ns.glimpseFlowLossHistory.empty())
+                    plotLossLog("##glimpseFlow", ns.glimpseFlowLossHistory);
+            }
+
+            if (ns.glimpseDecompressorIterations > 0)
+            {
+                ImGui::Text("GlimpseDecomp  Loss: %.6f  Iter: %d",
+                    ns.glimpseDecompressorLossSmoothed,
+                    ns.glimpseDecompressorIterations);
+                if (!ns.glimpseDecompressorLossHistory.empty())
+                    plotLossLog("##glimpseDecomp", ns.glimpseDecompressorLossHistory);
             }
         }
     }
@@ -2765,12 +2772,10 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Rendering
 
-    Frustum frustum;
-    FrustumFromCameraMatrices(
+    const Frustum frustum = FrustumFromCameraMatrices(
         //GetCameraProjectionMatrix(&app->camera.cam3d, (float)app->screenHeight / (float)app->screenWidth),
         GetCameraProjectionMatrix(&app->camera.cam3d, (float)app->screenWidth / (float)app->screenHeight),
-        GetCameraViewMatrix(&app->camera.cam3d),
-        frustum);
+        GetCameraViewMatrix(&app->camera.cam3d));
 
 
     PROFILE_BEGIN(Rendering);
@@ -3147,6 +3152,18 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->config.drawEndSites,
             ColorAlpha(MAGENTA, 0.5f),
             ColorAlpha(MAGENTA, 0.3f));
+    }
+
+    // Draw glimpse flow predicted future pose (semi-transparent cyan)
+    if (app->config.drawLookaheadPose && app->controlledCharacter.active
+        && app->controlledCharacter.glimpsePoseValid
+        && app->controlledCharacter.animMode == AnimationMode::GlimpseMode)
+    {
+        DrawSkeleton(
+            &app->controlledCharacter.xformGlimpsePose,
+            app->config.drawEndSites,
+            ColorAlpha(SKYBLUE, 0.5f),
+            ColorAlpha(SKYBLUE, 0.3f));
     }
 
     // Draw basic blend skeleton (semi-transparent green)
@@ -4110,6 +4127,7 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->config,
             app->characterData,
             app->networkState,
+            app->animDatabase,
             autoSavePath);
         app->savedConfigsNeedRefresh = true;
         TraceLog(LOG_INFO, "Auto-saved to: %s",

@@ -39,6 +39,12 @@ static inline float SmoothStep(float t)
     return t * t * (3.0f - 2.0f * t);
 }
 
+// smootherstep (Perlin): C2 continuous (zero 1st and 2nd derivatives at 0 and 1)
+static inline float SmootherStep(float t)
+{
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
 // Smooth lerp: interpolates from a to b using smoothstep for smoother transitions
 static inline float SmoothLerp(float a, float b, float t)
 {
@@ -81,7 +87,25 @@ static inline float Vector3LengthSqr2D(Vector3 v)
 static inline float Vector3Length2D(Vector3 v)
 {
     return sqrtf(v.x * v.x + v.z * v.z);
-}   
+}
+
+// signed angle from 'from' to 'to' around Y (XZ plane), in radians
+// positive = counterclockwise viewed from above
+static inline float SignedAngleY(Vector3 from, Vector3 to)
+{
+    const float cross = from.z * to.x - from.x * to.z;
+    const float dot = from.x * to.x + from.z * to.z;
+    return atan2f(cross, dot);
+}
+
+// rotate XZ direction by angle radians around Y (positive = CCW from above)
+// this is the Y-axis rotation matrix: new_x = x*cos + z*sin, new_z = -x*sin + z*cos
+static inline Vector3 RotateXZByAngle(Vector3 dir, float angle)
+{
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    return Vector3{ dir.x * c + dir.z * s, 0.0f, -dir.x * s + dir.z * c };
+}
 
 // Clamped inverse lerp: returns t in [0,1] such that Lerp(a, b, t) = value
 // Automatically clamps the result to [0,1] range
@@ -273,11 +297,11 @@ static inline Vector4 FrustumPlaneNormalize(Vector4 plane)
     return plane;
 }
 
-static inline void FrustumFromCameraMatrices(
+static inline Frustum FrustumFromCameraMatrices(
     const Matrix& projection,
-    const Matrix& modelview,
-    Frustum& resultFrustum)
+    const Matrix& modelview)
 {
+    Frustum resultFrustum;
     Matrix planes = { 0 };
     planes.m0 = modelview.m0 * projection.m0 + modelview.m1 * projection.m4 + modelview.m2 * projection.m8 + modelview.m3 * projection.m12;
     planes.m1 = modelview.m0 * projection.m1 + modelview.m1 * projection.m5 + modelview.m2 * projection.m9 + modelview.m3 * projection.m13;
@@ -302,6 +326,7 @@ static inline void FrustumFromCameraMatrices(
     resultFrustum.top = FrustumPlaneNormalize(Vector4{ planes.m3 - planes.m1, planes.m7 - planes.m5, planes.m11 - planes.m9, planes.m15 - planes.m13 });
     resultFrustum.left = FrustumPlaneNormalize(Vector4{ planes.m3 + planes.m0, planes.m7 + planes.m4, planes.m11 + planes.m8, planes.m15 + planes.m12 });
     resultFrustum.right = FrustumPlaneNormalize(Vector4{ planes.m3 - planes.m0, planes.m7 - planes.m4, planes.m11 - planes.m8, planes.m15 - planes.m12 });
+    return resultFrustum;
 }
 
 static inline float FrustumPlaneDistanceToPoint(Vector4 plane, Vector3 position)
@@ -490,12 +515,13 @@ void Rot6dRotate(Rot6d& rot, const Vector3& omega, float dt)
     rot.bz = rbz * invLenB;
 }
 
-void Rot6dMultiply(const Rot6d& lhs, const Rot6d& rhs, Rot6d& out)
+Rot6d Rot6dMultiply(const Rot6d& lhs, const Rot6d& rhs)
 {
     const float lcx = lhs.ay * lhs.bz - lhs.az * lhs.by;
     const float lcy = lhs.az * lhs.bx - lhs.ax * lhs.bz;
     const float lcz = lhs.ax * lhs.by - lhs.ay * lhs.bx;
 
+    Rot6d out;
     out.ax = lhs.ax * rhs.ax + lhs.bx * rhs.ay + lcx * rhs.az;
     out.ay = lhs.ay * rhs.ax + lhs.by * rhs.ay + lcy * rhs.az;
     out.az = lhs.az * rhs.ax + lhs.bz * rhs.ay + lcz * rhs.az;
@@ -503,27 +529,19 @@ void Rot6dMultiply(const Rot6d& lhs, const Rot6d& rhs, Rot6d& out)
     out.bx = lhs.ax * rhs.bx + lhs.bx * rhs.by + lcx * rhs.bz;
     out.by = lhs.ay * rhs.bx + lhs.by * rhs.by + lcy * rhs.bz;
     out.bz = lhs.az * rhs.bx + lhs.bz * rhs.by + lcz * rhs.bz;
+    return out;
 }
 
-void Rot6dInverse(const Rot6d& rot, Rot6d& out)
+Rot6d Rot6dInverse(const Rot6d& rot)
 {
     const float cx = rot.ay * rot.bz - rot.az * rot.by;
     const float cy = rot.az * rot.bx - rot.ax * rot.bz;
-    
+
+    Rot6d out;
     out.ax = rot.ax; out.ay = rot.bx; out.az = cx;
     out.bx = rot.ay; out.by = rot.by; out.bz = cy;
+    return out;
 }
-
-//void Rot6dTransformVector(const Rot6d& rot, const Vector3& v, Vector3& out)
-//{
-//    const float cx = rot.ay * rot.bz - rot.az * rot.by;
-//    const float cy = rot.az * rot.bx - rot.ax * rot.bz;
-//    const float cz = rot.ax * rot.by - rot.ay * rot.bx;
-//
-//    out.x = v.x * rot.ax + v.y * rot.bx + v.z * cx;
-//    out.y = v.x * rot.ay + v.y * rot.by + v.z * cy;
-//    out.z = v.x * rot.az + v.y * rot.bz + v.z * cz;
-//}
 
 static inline Vector3 Vector3RotateByRot6d(Vector3 v, const Rot6d& rot)
 {
@@ -539,91 +557,87 @@ static inline Vector3 Vector3RotateByRot6d(Vector3 v, const Rot6d& rot)
     return result;
 }
 
-void Rot6dToQuaternion(const Rot6d& rot, Quaternion& outQ)
+Quaternion Rot6dToQuaternion(const Rot6d& rot)
 {
     // third column via cross product: c = a × b
     const float cx = rot.ay * rot.bz - rot.az * rot.by;
     const float cy = rot.az * rot.bx - rot.ax * rot.bz;
     const float cz = rot.ax * rot.by - rot.ay * rot.bx;
 
-    // matrix layout:
-    // m00=rot.ax  m01=rot.bx  m02=cx
-    // m10=rot.ay  m11=rot.by  m12=cy
-    // m20=rot.az  m21=rot.bz  m22=cz
-    //
-    // standard matrix-to-quat formulas:
-    // x = (m21 - m12) / s = (rot.bz - cy) / s
-    // y = (m02 - m20) / s = (cx - rot.az) / s
-    // z = (m10 - m01) / s = (rot.ay - rot.bx) / s
-    // w = (varies by branch)
-
+    Quaternion q;
     const float tr = rot.ax + rot.by + cz;
     if (tr > 0.0f)
     {
         const float s = std::sqrt(tr + 1.0f) * 2.0f;
-        outQ.w = 0.25f * s;
-        outQ.x = (rot.bz - cy) / s;
-        outQ.y = (cx - rot.az) / s;
-        outQ.z = (rot.ay - rot.bx) / s;
+        q.w = 0.25f * s;
+        q.x = (rot.bz - cy) / s;
+        q.y = (cx - rot.az) / s;
+        q.z = (rot.ay - rot.bx) / s;
     }
     else if ((rot.ax > rot.by) && (rot.ax > cz))
     {
         const float s = std::sqrt(1.0f + rot.ax - rot.by - cz) * 2.0f;
-        outQ.w = (rot.bz - cy) / s;
-        outQ.x = 0.25f * s;
-        outQ.y = (rot.ay + rot.bx) / s;
-        outQ.z = (rot.az + cx) / s;
+        q.w = (rot.bz - cy) / s;
+        q.x = 0.25f * s;
+        q.y = (rot.ay + rot.bx) / s;
+        q.z = (rot.az + cx) / s;
     }
     else if (rot.by > cz)
     {
         const float s = std::sqrt(1.0f + rot.by - rot.ax - cz) * 2.0f;
-        outQ.w = (cx - rot.az) / s;
-        outQ.x = (rot.ay + rot.bx) / s;
-        outQ.y = 0.25f * s;
-        outQ.z = (rot.bz + cy) / s;
+        q.w = (cx - rot.az) / s;
+        q.x = (rot.ay + rot.bx) / s;
+        q.y = 0.25f * s;
+        q.z = (rot.bz + cy) / s;
     }
     else
     {
         const float s = std::sqrt(1.0f + cz - rot.ax - rot.by) * 2.0f;
-        outQ.w = (rot.ay - rot.bx) / s;
-        outQ.x = (rot.az + cx) / s;
-        outQ.y = (rot.bz + cy) / s;
-        outQ.z = 0.25f * s;
+        q.w = (rot.ay - rot.bx) / s;
+        q.x = (rot.az + cx) / s;
+        q.y = (rot.bz + cy) / s;
+        q.z = 0.25f * s;
     }
+    return q;
 }
 
-void Rot6dFromQuaternion(const Quaternion& q, Rot6d& outRot)
+Rot6d QuaternionToRot6d(const Quaternion& q)
 {
     const float x2 = q.x + q.x, y2 = q.y + q.y, z2 = q.z + q.z;
     const float xx = q.x * x2, xy = q.x * y2, xz = q.x * z2;
     const float yy = q.y * y2, yz = q.y * z2, zz = q.z * z2;
     const float wx = q.w * x2, wy = q.w * y2, wz = q.w * z2;
 
-    outRot.ax = 1.0f - (yy + zz);
-    outRot.ay = xy + wz;
-    outRot.az = xz - wy;
-
-    outRot.bx = xy - wz;
-    outRot.by = 1.0f - (xx + zz);
-    outRot.bz = yz + wx;
+    Rot6d r;
+    r.ax = 1.0f - (yy + zz);
+    r.ay = xy + wz;
+    r.az = xz - wy;
+    r.bx = xy - wz;
+    r.by = 1.0f - (xx + zz);
+    r.bz = yz + wx;
+    return r;
 }
 
-void Rot6dToMatrix(const Rot6d& rot, Matrix& outMat)
+Matrix Rot6dToMatrix(const Rot6d& rot)
 {
     const float cx = rot.ay * rot.bz - rot.az * rot.by;
     const float cy = rot.az * rot.bx - rot.ax * rot.bz;
     const float cz = rot.ax * rot.by - rot.ay * rot.bx;
 
-    outMat.m0 = rot.ax; outMat.m4 = rot.bx; outMat.m8 = cx;   outMat.m12 = 0.0f;
-    outMat.m1 = rot.ay; outMat.m5 = rot.by; outMat.m9 = cy;   outMat.m13 = 0.0f;
-    outMat.m2 = rot.az; outMat.m6 = rot.bz; outMat.m10 = cz;   outMat.m14 = 0.0f;
-    outMat.m3 = 0.0f;   outMat.m7 = 0.0f;   outMat.m11 = 0.0f; outMat.m15 = 1.0f;
+    Matrix m;
+    m.m0 = rot.ax; m.m4 = rot.bx; m.m8 = cx;   m.m12 = 0.0f;
+    m.m1 = rot.ay; m.m5 = rot.by; m.m9 = cy;   m.m13 = 0.0f;
+    m.m2 = rot.az; m.m6 = rot.bz; m.m10 = cz;   m.m14 = 0.0f;
+    m.m3 = 0.0f;   m.m7 = 0.0f;   m.m11 = 0.0f; m.m15 = 1.0f;
+    return m;
 }
 
-void Rot6dFromMatrix(const Matrix& mat, Rot6d& outRot)
+Rot6d MatrixToRot6d(const Matrix& mat)
 {
-    outRot.ax = mat.m0; outRot.ay = mat.m1; outRot.az = mat.m2;
-    outRot.bx = mat.m4; outRot.by = mat.m5; outRot.bz = mat.m6;
+    Rot6d r;
+    r.ax = mat.m0; r.ay = mat.m1; r.az = mat.m2;
+    r.bx = mat.m4; r.by = mat.m5; r.bz = mat.m6;
+    return r;
 }
 
 Rot6d Rot6dLerp(const Rot6d& start, const Rot6d& end, float t)
@@ -684,12 +698,11 @@ static inline void Rot6dScaledAdd(float a, const Rot6d& x, Rot6d& inout)
     inout.bz += a * x.bz;
 }
 
-void Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t, Rot6d& out)
+Rot6d Rot6dSlerp(const Rot6d& start, const Rot6d& end, float t)
 {
-    Quaternion qStart, qEnd;
-    Rot6dToQuaternion(start, qStart);
-    Rot6dToQuaternion(end, qEnd);
-    Rot6dFromQuaternion(QuaternionSlerp(qStart, qEnd, t), out);
+    const Quaternion qStart = Rot6dToQuaternion(start);
+    const Quaternion qEnd = Rot6dToQuaternion(end);
+    return QuaternionToRot6d(QuaternionSlerp(qStart, qEnd, t));
 }
 
 // orthonormalize a Rot6d (useful after weighted accumulation)
@@ -750,21 +763,19 @@ static inline Rot6d Rot6dFromYaw(float yaw)
 // remove Y-rotation component from a Rot6d, returning just the tilt/roll
 // result = inverse(yaw) * rot
 // safe to call with rot == out (handles aliasing)
-static inline void Rot6dRemoveYComponent(const Rot6d& rot, Rot6d& out)
+static inline Rot6d Rot6dRemoveYComponent(const Rot6d& rot)
 {
     const float yaw = Rot6dGetYaw(rot);
     const Rot6d invYaw = Rot6dFromYaw(-yaw);
-    Rot6d tmp;
-    Rot6dMultiply(invYaw, rot, tmp);
-    Rot6dNormalize(tmp);  // ensure orthonormal after multiplication
-    out = tmp;
+    Rot6d result = Rot6dMultiply(invYaw, rot);
+    Rot6dNormalize(result);  // ensure orthonormal after multiplication
+    return result;
 }
 
-void Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt, Vector3& outOmega)
+Vector3 Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt)
 {
-    Quaternion qCurrent, qTarget;
-    Rot6dToQuaternion(current, qCurrent);
-    Rot6dToQuaternion(target, qTarget);
+    const Quaternion qCurrent = Rot6dToQuaternion(current);
+    const Quaternion qTarget = Rot6dToQuaternion(target);
 
     const float qx = qTarget.w * -qCurrent.x + qTarget.x * qCurrent.w + qTarget.y * -qCurrent.z - qTarget.z * -qCurrent.y;
     const float qy = qTarget.w * -qCurrent.y - qTarget.x * -qCurrent.z + qTarget.y * qCurrent.w + qTarget.z * -qCurrent.x;
@@ -778,15 +789,12 @@ void Rot6dGetVelocity(const Rot6d& current, const Rot6d& target, float dt, Vecto
 
     if (angle < 1e-6f)
     {
-        outOmega.x = 0.0f; outOmega.y = 0.0f; outOmega.z = 0.0f;
-        return;
+        return Vector3Zero();
     }
 
     const float sinHalf = std::sqrt(1.0f - absQw * absQw);
     float factor = (angle / dt) / (sinHalf < 1e-6f ? 1.0f : sinHalf);
     if (qw < 0.0f) factor = -factor;
 
-    outOmega.x = qx * factor;
-    outOmega.y = qy * factor;
-    outOmega.z = qz * factor;
+    return Vector3{ qx * factor, qy * factor, qz * factor };
 }

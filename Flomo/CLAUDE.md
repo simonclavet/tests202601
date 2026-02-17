@@ -25,6 +25,8 @@ cmake -G "Visual Studio 17 2022" -A x64 ..
 # Build Debug
 cmake --build . --config Debug
 
+of build.bat
+
 # Build Release
 cmake --build . --config RelWithDebInfo
 
@@ -140,7 +142,3 @@ Flomo/
 - Architecture: SM 86 (RTX 30 series)
 - Flags: `--extended-lambda`, `--expt-relaxed-constexpr`, `-lineinfo`
 
-
-plan for jan 29:
-posvel rep for anims
-motion matching

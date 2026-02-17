@@ -14,6 +14,7 @@
 #include "transform_data.h"
 #include "character_data.h"
 #include "app_config.h"
+#include "kmeans_clustering.h"
 
 
 static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
@@ -36,6 +37,111 @@ static inline void NormalizeFeatureQuery(
         const int ti = static_cast<int>(db->featureTypes[d]);
         const float norm = (clamped - db->featuresMean[d]) / db->featureTypesStd[ti];
         dest[d] = norm * db->featuresConfig.featureTypeWeights[ti];
+    }
+}
+
+// normalize raw features without clamping: (raw - mean) / typeStd * typeWeight
+// suitable for augmented training features that may exceed data bounds
+static inline void NormalizeFeatureRaw(
+    const AnimDatabase* db, const float* raw, float* dest)
+{
+    for (int d = 0; d < db->featureDim; ++d)
+    {
+        const int ti = static_cast<int>(db->featureTypes[d]);
+        const float norm = (raw[d] - db->featuresMean[d]) / db->featureTypesStd[ti];
+        dest[d] = norm * db->featuresConfig.featureTypeWeights[ti];
+    }
+}
+
+// project a flat normalized segment [flatDim] to PCA coefficients [K]
+// coeffs[k] = dot(basis[k], segment - mean)
+static inline void PcaProjectSegment(
+    const AnimDatabase* db, const float* normalizedSegment, float* coeffs)
+{
+    const int K = db->pcaSegmentK;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const float* mean = db->pcaSegmentMean.data();
+    const float* basis = db->pcaSegmentBasis.data();
+
+    for (int k = 0; k < K; ++k)
+    {
+        float dot = 0.0f;
+        const float* row = basis + k * flatDim;
+        for (int d = 0; d < flatDim; ++d)
+        {
+            dot += row[d] * (normalizedSegment[d] - mean[d]);
+        }
+        coeffs[k] = dot;
+    }
+}
+
+// reconstruct a flat normalized segment [flatDim] from PCA coefficients [K]
+// segment[d] = mean[d] + sum_k(coeffs[k] * basis[k][d])
+static inline void PcaReconstructSegment(
+    const AnimDatabase* db, const float* coeffs, float* normalizedSegment)
+{
+    const int K = db->pcaSegmentK;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const float* mean = db->pcaSegmentMean.data();
+    const float* basis = db->pcaSegmentBasis.data();
+
+    for (int d = 0; d < flatDim; ++d)
+    {
+        normalizedSegment[d] = mean[d];
+    }
+    for (int k = 0; k < K; ++k)
+    {
+        const float c = coeffs[k];
+        const float* row = basis + k * flatDim;
+        for (int d = 0; d < flatDim; ++d)
+        {
+            normalizedSegment[d] += c * row[d];
+        }
+    }
+}
+
+// project a single-frame normalized pose [pgDim] to PCA coefficients [pcaPoseK]
+static inline void PcaProjectPose(
+    const AnimDatabase* db, const float* normalizedPose, float* coeffs)
+{
+    const int K = db->pcaPoseK;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const float* mean = db->pcaPoseMean.data();
+    const float* basis = db->pcaPoseBasis.data();
+
+    for (int k = 0; k < K; ++k)
+    {
+        float dot = 0.0f;
+        const float* row = basis + k * pgDim;
+        for (int d = 0; d < pgDim; ++d)
+        {
+            dot += row[d] * (normalizedPose[d] - mean[d]);
+        }
+        coeffs[k] = dot;
+    }
+}
+
+// reconstruct a normalized pose [pgDim] from PCA coefficients [pcaPoseK]
+static inline void PcaReconstructPose(
+    const AnimDatabase* db, const float* coeffs, float* normalizedPose)
+{
+    const int K = db->pcaPoseK;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const float* mean = db->pcaPoseMean.data();
+    const float* basis = db->pcaPoseBasis.data();
+
+    for (int d = 0; d < pgDim; ++d)
+    {
+        normalizedPose[d] = mean[d];
+    }
+    for (int k = 0; k < K; ++k)
+    {
+        const float c = coeffs[k];
+        const float* row = basis + k * pgDim;
+        for (int d = 0; d < pgDim; ++d)
+        {
+            normalizedPose[d] += c * row[d];
+        }
     }
 }
 
@@ -184,6 +290,744 @@ static void AnimDatabaseClusterFeatures(AnimDatabase* db)
         minSize, maxSize, numFrames / (nonEmpty > 0 ? nonEmpty : 1));
 }
 
+// wrapper: gather the normalized features for legal start frames into a contiguous array,
+// run bisection clustering, then map indices back to global frame indices.
+static void AnimDatabaseClusterFeatures2(AnimDatabase* db)
+{
+    const int numFrames = (int)db->legalStartFrames.size();
+    const int dim = db->featureDim;
+
+    if (numFrames == 0 || dim <= 0 || db->normalizedFeatures.empty())
+    {
+        db->clusterCount = 0;
+        db->clusterFrames.clear();
+        return;
+    }
+
+    const int targetK = (numFrames < KMEANS_CLUSTER_COUNT)
+        ? numFrames : KMEANS_CLUSTER_COUNT;
+
+    const Clock::time_point start = Clock::now();
+
+    // gather features into a contiguous array [numFrames x dim]
+    std::vector<float> points(numFrames * dim);
+    for (int i = 0; i < numFrames; ++i)
+    {
+        const int frame = db->legalStartFrames[i];
+        std::span<const float> row = db->normalizedFeatures.row_view(frame);
+        memcpy(&points[i * dim], row.data(), dim * sizeof(float));
+    }
+
+    // run generic bisection clustering
+    std::vector<std::vector<int>> clusterIndices;
+    BisectionCluster_Run(points.data(), numFrames, dim, targetK, clusterIndices);
+
+    // map point indices back to global frame indices
+    const int k = (int)clusterIndices.size();
+    db->clusterCount = k;
+    db->clusterFrames.resize(k);
+    for (int c = 0; c < k; ++c)
+    {
+        const int sz = (int)clusterIndices[c].size();
+        db->clusterFrames[c].resize(sz);
+        for (int i = 0; i < sz; ++i)
+        {
+            db->clusterFrames[c][i] = db->legalStartFrames[clusterIndices[c][i]];
+        }
+    }
+
+    TraceLog(LOG_INFO, "AnimDatabase: bisection clustering done (%.1fs)", ElapsedSeconds(start));
+}
+
+// pick a random legal frame using cluster-stratified sampling if available,
+// otherwise fall back to plain uniform
+static inline int SampleLegalSegmentStartFrame(const AnimDatabase* db)
+{
+    assert(db->clusterCount > 0);
+    if (db->clusterCount <= 0)
+        return db->legalStartFrames[RandomInt((int)db->legalStartFrames.size())];
+
+    const int c = RandomInt(db->clusterCount);
+    const std::vector<int>& frames = db->clusterFrames[c];
+    return frames[RandomInt((int)frames.size())];
+}
+
+// PCA on flat normalized segments using cluster-weighted sampling.
+// must be called after clustering (AnimDatabaseClusterFeatures).
+// each cluster contributes equally, so rare motions are well represented in the basis.
+static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
+{
+    if (db->pcaSegmentK > 0) return;  // already computed
+    if (db->poseGenSegmentFlatDim <= 0) return;
+
+    const int segFrames = db->poseGenSegmentFrameCount;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const int K = PCA_SEGMENT_K;
+
+    // count valid segment starts to size our sample
+    int numValidStarts = 0;
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int room = db->clipEndFrame[c] - db->clipStartFrame[c] - segFrames;
+        if (room >= 0) numValidStarts += room + 1;
+    }
+
+    // sample 2x that using cluster-weighted sampling so rare motions are well represented
+    const int numSamples = numValidStarts * 2;
+    TraceLog(LOG_INFO, "PCA: sampling %d segments cluster-weighted (flatDim=%d, K=%d)", numSamples, flatDim, K);
+
+    torch::Tensor dataMat = torch::empty({numSamples, flatDim});
+    float* dPtr = dataMat.data_ptr<float>();
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const int frame = SampleLegalSegmentStartFrame(db);
+
+        // clamp to valid segment start (must fit segFrames consecutive frames in its clip)
+        int segStart = frame;
+        for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+        {
+            if (frame >= db->clipStartFrame[c] && frame < db->clipEndFrame[c])
+            {
+                segStart = (frame < db->clipEndFrame[c] - segFrames) ? frame : db->clipEndFrame[c] - segFrames;
+                break;
+            }
+        }
+
+        const float* src = db->normalizedPoseGenFeatures.data() + segStart * pgDim;
+        memcpy(dPtr + i * flatDim, src, flatDim * sizeof(float));
+    }
+
+    // compute and subtract mean
+    torch::Tensor meanTensor = dataMat.mean(0);  // [flatDim]
+    dataMat = dataMat - meanTensor.unsqueeze(0);
+
+    // SVD: dataMat = U * S * Vt, we want top K rows of Vt as our basis
+    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+
+    // variance explained
+    torch::Tensor totalVar = S.square().sum();
+    torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
+    const float varianceExplained = topKVar.item<float>() / totalVar.item<float>() * 100.0f;
+    TraceLog(LOG_INFO, "PCA: top %d components explain %.2f%% of variance", K, varianceExplained);
+
+    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x flatDim]
+
+    db->pcaSegmentK = K;
+    db->pcaSegmentMean.resize(flatDim);
+    memcpy(db->pcaSegmentMean.data(), meanTensor.data_ptr<float>(), flatDim * sizeof(float));
+    db->pcaSegmentBasis.resize(K * flatDim);
+    memcpy(db->pcaSegmentBasis.data(), basisTensor.data_ptr<float>(), K * flatDim * sizeof(float));
+
+    TraceLog(LOG_INFO, "PCA segment: stored basis [%d x %d]", K, flatDim);
+}
+
+// PCA on single-frame normalized pose features at the glimpse future offset.
+// uses cluster-weighted sampling, same approach as segment PCA.
+// futureFrame = how many frames ahead (caller computes from GLIMPSE_FUTURE_TIME / frameTime).
+static void AnimDatabaseComputePosePCA(AnimDatabase* db, int futureFrame)
+{
+    if (db->pcaPoseK > 0) return;  // already computed
+    if (db->poseGenFeaturesComputeDim <= 0) return;
+    if (db->normalizedPoseGenFeatures.empty()) return;
+
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int K = PCA_POSE_K;
+
+    // count valid starts (same as segment PCA — frames where frame+futureFrame is in same clip)
+    int numValidStarts = 0;
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int room = db->clipEndFrame[c] - db->clipStartFrame[c] - futureFrame;
+        if (room >= 0) numValidStarts += room + 1;
+    }
+
+    const int numSamples = numValidStarts * 2;
+    TraceLog(LOG_INFO, "PCA pose: sampling %d frames cluster-weighted (pgDim=%d, K=%d)",
+        numSamples, pgDim, K);
+
+    torch::Tensor dataMat = torch::empty({numSamples, pgDim});
+    float* dPtr = dataMat.data_ptr<float>();
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const int frame = SampleLegalSegmentStartFrame(db);
+
+        // the future pose frame — SampleLegalSegmentStartFrame guarantees enough room
+        // for a full segment, and futureFrame <= segFrames, so frame+futureFrame is valid
+        std::span<const float> row =
+            db->normalizedPoseGenFeatures.row_view(frame + futureFrame);
+        memcpy(dPtr + i * pgDim, row.data(), pgDim * sizeof(float));
+    }
+
+    // compute and subtract mean
+    torch::Tensor meanTensor = dataMat.mean(0);  // [pgDim]
+    dataMat = dataMat - meanTensor.unsqueeze(0);
+
+    // SVD
+    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+
+    torch::Tensor totalVar = S.square().sum();
+    torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
+    const float varianceExplained = topKVar.item<float>() / totalVar.item<float>() * 100.0f;
+    TraceLog(LOG_INFO, "PCA pose: top %d components explain %.2f%% of variance", K, varianceExplained);
+
+    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x pgDim]
+
+    db->pcaPoseK = K;
+    db->pcaPoseMean.resize(pgDim);
+    memcpy(db->pcaPoseMean.data(), meanTensor.data_ptr<float>(), pgDim * sizeof(float));
+    db->pcaPoseBasis.resize(K * pgDim);
+    memcpy(db->pcaPoseBasis.data(), basisTensor.data_ptr<float>(), K * pgDim * sizeof(float));
+
+    TraceLog(LOG_INFO, "PCA pose: stored basis [%d x %d]", K, pgDim);
+}
+
+// save clusters + PCA to a binary file so they don't need to be recomputed
+static void AnimDatabaseSaveDerived(const AnimDatabase* db, const std::string& folderPath)
+{
+    const std::string path = folderPath + "/database_derived.bin";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        TraceLog(LOG_ERROR, "Failed to save database derived data: %s", path.c_str());
+        return;
+    }
+
+    // clusters
+    fwrite(&db->clusterCount, sizeof(int), 1, f);
+    for (int c = 0; c < db->clusterCount; ++c)
+    {
+        const int sz = (int)db->clusterFrames[c].size();
+        fwrite(&sz, sizeof(int), 1, f);
+        fwrite(db->clusterFrames[c].data(), sizeof(int), sz, f);
+    }
+
+    // segment PCA
+    fwrite(&db->pcaSegmentK, sizeof(int), 1, f);
+    const int flatDim = db->poseGenSegmentFlatDim;
+    fwrite(&flatDim, sizeof(int), 1, f);
+    if (db->pcaSegmentK > 0)
+    {
+        fwrite(db->pcaSegmentMean.data(), sizeof(float), flatDim, f);
+        fwrite(db->pcaSegmentBasis.data(), sizeof(float), db->pcaSegmentK * flatDim, f);
+    }
+
+    // pose PCA
+    fwrite(&db->pcaPoseK, sizeof(int), 1, f);
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    fwrite(&pgDim, sizeof(int), 1, f);
+    if (db->pcaPoseK > 0)
+    {
+        fwrite(db->pcaPoseMean.data(), sizeof(float), pgDim, f);
+        fwrite(db->pcaPoseBasis.data(), sizeof(float), db->pcaPoseK * pgDim, f);
+    }
+
+    fclose(f);
+    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + pose PCA (K=%d) to: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaPoseK, path.c_str());
+}
+
+// load clusters + PCA from file. returns true if successful.
+static bool AnimDatabaseLoadDerived(AnimDatabase* db, const std::string& folderPath)
+{
+    const std::string path = folderPath + "/database_derived.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    // clusters
+    int clusterCount = 0;
+    fread(&clusterCount, sizeof(int), 1, f);
+    db->clusterCount = clusterCount;
+    db->clusterFrames.resize(clusterCount);
+    for (int c = 0; c < clusterCount; ++c)
+    {
+        int sz = 0;
+        fread(&sz, sizeof(int), 1, f);
+        db->clusterFrames[c].resize(sz);
+        fread(db->clusterFrames[c].data(), sizeof(int), sz, f);
+    }
+
+    // segment PCA
+    int K = 0;
+    int flatDim = 0;
+    fread(&K, sizeof(int), 1, f);
+    fread(&flatDim, sizeof(int), 1, f);
+
+    if (K > 0 && flatDim == db->poseGenSegmentFlatDim)
+    {
+        db->pcaSegmentK = K;
+        db->pcaSegmentMean.resize(flatDim);
+        fread(db->pcaSegmentMean.data(), sizeof(float), flatDim, f);
+        db->pcaSegmentBasis.resize(K * flatDim);
+        fread(db->pcaSegmentBasis.data(), sizeof(float), K * flatDim, f);
+    }
+
+    // pose PCA (may not exist in older files — check for EOF)
+    int poseK = 0;
+    int pgDim = 0;
+    if (fread(&poseK, sizeof(int), 1, f) == 1 && fread(&pgDim, sizeof(int), 1, f) == 1)
+    {
+        if (poseK > 0 && pgDim == db->poseGenFeaturesComputeDim)
+        {
+            db->pcaPoseK = poseK;
+            db->pcaPoseMean.resize(pgDim);
+            fread(db->pcaPoseMean.data(), sizeof(float), pgDim, f);
+            db->pcaPoseBasis.resize(poseK * pgDim);
+            fread(db->pcaPoseBasis.data(), sizeof(float), poseK * pgDim, f);
+        }
+    }
+
+    fclose(f);
+    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + pose PCA (K=%d) from: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaPoseK, path.c_str());
+    return true;
+}
+
+// Compute raw (un-normalized) MM features for a single frame.
+// If populateNames is true, pushes feature names and types into db (call once on first frame).
+// If doAugmentation is true, applies structured noise to future-facing features.
+static inline void ComputeRawFeaturesForFrame(
+    AnimDatabase* db,
+    const MotionMatchingFeaturesConfig& cfg,
+    int frame,
+    float* outFeatures,
+    bool populateNames,
+    bool doAugmentation)
+{
+    using std::string;
+    using std::span;
+
+    const int f = frame;
+    const int clipIdx = FindClipForMotionFrame(db, f);
+    assert(clipIdx != -1);
+
+    const int clipStart = db->clipStartFrame[clipIdx];
+    const int clipEnd = db->clipEndFrame[clipIdx];
+    const float dt = db->animFrameTime[clipIdx];
+    assert(dt > 1e-8f);
+
+    span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
+
+    Vector3 leftPos = { 0.0f, 0.0f, 0.0f };
+    Vector3 rightPos = { 0.0f, 0.0f, 0.0f };
+
+    const int leftIdx = db->toeIndices[SIDE_LEFT];
+    const int rightIdx = db->toeIndices[SIDE_RIGHT];
+
+    if (leftIdx >= 0)
+    {
+        leftPos = posRow[leftIdx];
+    }
+    if (rightIdx >= 0)
+    {
+        rightPos = posRow[rightIdx];
+    }
+
+    const float invMagicYaw = -db->magicYaw[f];
+    const Rot6d invMagicYawRot = Rot6dFromYaw(invMagicYaw);
+    const Vector3 magicPos = db->magicPosition[f];
+
+    int currentFeature = 0;
+
+    // precompute local toe positions (magic horizontal frame)
+    const Vector3 magicToLeft = Vector3Subtract(leftPos, magicPos);
+    const Vector3 localLeftPos = Vector3RotateByRot6d(magicToLeft, invMagicYawRot);
+
+    const Vector3 magicToRight = Vector3Subtract(rightPos, magicPos);
+    const Vector3 localRightPos = Vector3RotateByRot6d(magicToRight, invMagicYawRot);
+
+    // sample augmentation values once per frame
+    const float timescale = doAugmentation
+        ? 1.0f + RandomGaussian() * 0.1f
+        : 1.0f;
+    const float aimAugAngle = doAugmentation
+        ? RandomGaussian() * (10.0f * DEG2RAD)
+        : 0.0f;
+    const Rot6d aimAugRot = Rot6dFromYaw(aimAugAngle);
+
+    // compute a future/past frame offset, clamped to clip bounds
+    const float frameTime = db->animFrameTime[clipIdx];
+    auto futureFrameClamped = [&](float seconds) -> int
+    {
+        const int offset = (int)(seconds * timescale / frameTime + 0.5f);
+        return std::clamp(f + offset, clipStart, clipEnd - 1);
+    };
+    auto pastFrameClamped = [&](float seconds) -> int
+    {
+        const int offset = (int)(seconds * timescale / frameTime + 0.5f);
+        return std::clamp(f - offset, clipStart, clipEnd - 1);
+    };
+
+    // ToePos
+    if (cfg.IsFeatureEnabled(FeatureType::ToePos))
+    {
+        outFeatures[currentFeature++] = localLeftPos.x;
+        outFeatures[currentFeature++] = localLeftPos.z;
+        outFeatures[currentFeature++] = localRightPos.x;
+        outFeatures[currentFeature++] = localRightPos.z;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("LeftToePosX"));
+            db->featureNames.push_back(string("LeftToePosZ"));
+            db->featureNames.push_back(string("RightToePosX"));
+            db->featureNames.push_back(string("RightToePosZ"));
+            db->featureTypes.push_back(FeatureType::ToePos);
+            db->featureTypes.push_back(FeatureType::ToePos);
+            db->featureTypes.push_back(FeatureType::ToePos);
+            db->featureTypes.push_back(FeatureType::ToePos);
+        }
+    }
+
+    // ToeVel
+    if (cfg.IsFeatureEnabled(FeatureType::ToeVel))
+    {
+        Vector3 localLeftVel = Vector3Zero();
+        Vector3 localRightVel = Vector3Zero();
+
+        if (f > clipStart && dt > 0.0f)
+        {
+            span<const Vector3> posPrevRow = db->jointPositionsAnimSpace.row_view(f - 1);
+
+            if (leftIdx >= 0)
+            {
+                const Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
+                const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
+                localLeftVel = Vector3RotateByRot6d(velLeftWorld, invMagicYawRot);
+            }
+
+            if (rightIdx >= 0)
+            {
+                const Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
+                const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
+                localRightVel = Vector3RotateByRot6d(velRightWorld, invMagicYawRot);
+            }
+        }
+
+        outFeatures[currentFeature++] = localLeftVel.x * timescale;
+        outFeatures[currentFeature++] = localLeftVel.z * timescale;
+        outFeatures[currentFeature++] = localRightVel.x * timescale;
+        outFeatures[currentFeature++] = localRightVel.z * timescale;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("LeftToeVelX"));
+            db->featureNames.push_back(string("LeftToeVelZ"));
+            db->featureNames.push_back(string("RightToeVelX"));
+            db->featureNames.push_back(string("RightToeVelZ"));
+            db->featureTypes.push_back(FeatureType::ToeVel);
+            db->featureTypes.push_back(FeatureType::ToeVel);
+            db->featureTypes.push_back(FeatureType::ToeVel);
+            db->featureTypes.push_back(FeatureType::ToeVel);
+        }
+    }
+
+    // ToePosDiff
+    if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff))
+    {
+        outFeatures[currentFeature++] = localLeftPos.x - localRightPos.x;
+        outFeatures[currentFeature++] = localLeftPos.z - localRightPos.z;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("ToePosDiffX"));
+            db->featureNames.push_back(string("ToePosDiffZ"));
+            db->featureTypes.push_back(FeatureType::ToePosDiff);
+            db->featureTypes.push_back(FeatureType::ToePosDiff);
+        }
+    }
+
+    // FutureVel
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
+    {
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[ff];
+            futureVelAnimSpace.y = 0.0f;
+            Vector3 futureVelMagicSpace = Vector3RotateByRot6d(futureVelAnimSpace, invMagicYawRot);
+
+            outFeatures[currentFeature++] = futureVelMagicSpace.x * timescale;
+            outFeatures[currentFeature++] = futureVelMagicSpace.z * timescale;
+
+            if (populateNames)
+            {
+                char nameBufX[64];
+                char nameBufZ[64];
+                snprintf(nameBufX, sizeof(nameBufX), "FutureVelX_%.2fs", futureTime);
+                snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelZ_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBufX));
+                db->featureNames.push_back(string(nameBufZ));
+                db->featureTypes.push_back(FeatureType::FutureVel);
+                db->featureTypes.push_back(FeatureType::FutureVel);
+            }
+        }
+    }
+
+    // FutureVelClamped
+    if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped))
+    {
+        constexpr float MaxFutureVelClampedMag = 1.0f;
+
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[ff];
+            futureVelAnimSpace.y = 0.0f;
+            Vector3 futureVelMagicSpace = Vector3RotateByRot6d(futureVelAnimSpace, invMagicYawRot);
+            futureVelMagicSpace = Vector3Scale(futureVelMagicSpace, timescale);
+
+            const float mag = Vector3Length(futureVelMagicSpace);
+            if (mag > MaxFutureVelClampedMag)
+            {
+                futureVelMagicSpace = Vector3Scale(futureVelMagicSpace, MaxFutureVelClampedMag / mag);
+            }
+
+            outFeatures[currentFeature++] = futureVelMagicSpace.x;
+            outFeatures[currentFeature++] = futureVelMagicSpace.z;
+
+            if (populateNames)
+            {
+                char nameBufX[64];
+                char nameBufZ[64];
+                snprintf(nameBufX, sizeof(nameBufX), "FutureVelClampedX_%.2fs", futureTime);
+                snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelClampedZ_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBufX));
+                db->featureNames.push_back(string(nameBufZ));
+                db->featureTypes.push_back(FeatureType::FutureVelClamped);
+                db->featureTypes.push_back(FeatureType::FutureVelClamped);
+            }
+        }
+    }
+
+    // FutureSpeed
+    if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
+    {
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[ff];
+            futureVelAnimSpace.y = 0.0f;
+            const float futureSpeed = Vector3Length(futureVelAnimSpace) * timescale;
+
+            outFeatures[currentFeature++] = futureSpeed;
+
+            if (populateNames)
+            {
+                char nameBuf[64];
+                snprintf(nameBuf, sizeof(nameBuf), "FutureSpeed_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBuf));
+                db->featureTypes.push_back(FeatureType::FutureSpeed);
+            }
+        }
+    }
+
+    // PastPosition
+    if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
+    {
+        const int pf = pastFrameClamped(cfg.pastTimeOffset);
+        const Vector3 pastMagicPos = db->magicPosition[pf];
+        const Vector3 magicToPastMagic = Vector3Subtract(pastMagicPos, magicPos);
+        const Vector3 pastPosLocal = Vector3RotateByRot6d(magicToPastMagic, invMagicYawRot);
+
+        outFeatures[currentFeature++] = pastPosLocal.x;
+        outFeatures[currentFeature++] = pastPosLocal.z;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("PastPosX"));
+            db->featureNames.push_back(string("PastPosZ"));
+            db->featureTypes.push_back(FeatureType::PastPosition);
+            db->featureTypes.push_back(FeatureType::PastPosition);
+        }
+    }
+
+    // FutureAimDirection: read from precomputed aimDirectionAnimSpace
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAimDirection))
+    {
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            Vector3 aimDirWorld = db->aimDirectionAnimSpace[ff];
+            Vector3 aimDirLocal = Vector3RotateByRot6d(aimDirWorld, invMagicYawRot);
+
+            // augmentation: rotate aim direction by a random angle
+            if (doAugmentation)
+            {
+                aimDirLocal = Vector3RotateByRot6d(aimDirLocal, aimAugRot);
+            }
+
+            outFeatures[currentFeature++] = aimDirLocal.x;
+            outFeatures[currentFeature++] = aimDirLocal.z;
+
+            if (populateNames)
+            {
+                char nameBufX[64];
+                char nameBufZ[64];
+                snprintf(nameBufX, sizeof(nameBufX), "FutureAimDirX_%.2fs", futureTime);
+                snprintf(nameBufZ, sizeof(nameBufZ), "FutureAimDirZ_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBufX));
+                db->featureNames.push_back(string(nameBufZ));
+                db->featureTypes.push_back(FeatureType::FutureAimDirection);
+                db->featureTypes.push_back(FeatureType::FutureAimDirection);
+            }
+        }
+    }
+
+    // FutureAimVelocity: angular velocity of aim direction around Y, rad/s
+    // augmentation angle doesn't affect yaw rate (it's a constant offset)
+    // timescale augmentation scales it proportionally
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAimVelocity))
+    {
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            outFeatures[currentFeature++] = db->aimYawRate[ff] * timescale;
+
+            if (populateNames)
+            {
+                char nameBuf[64];
+                snprintf(nameBuf, sizeof(nameBuf), "FutureAimVel_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBuf));
+                db->featureTypes.push_back(FeatureType::FutureAimVelocity);
+            }
+        }
+    }
+
+    // HeadToSlowestToe
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe))
+    {
+        const int headIdx = db->headIndex;
+        const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
+        const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
+
+        float leftSpeed = 0.0f;
+        float rightSpeed = 0.0f;
+
+        if (f > clipStart && dt > 0.0f)
+        {
+            span<const Vector3> posPrevRow = db->jointPositionsAnimSpace.row_view(f - 1);
+            const Vector3 velLeftWorld = Vector3Scale(
+                Vector3Subtract(posRow[leftIdx], posPrevRow[leftIdx]), 1.0f / dt);
+            const Vector3 velRightWorld = Vector3Scale(
+                Vector3Subtract(posRow[rightIdx], posPrevRow[rightIdx]), 1.0f / dt);
+            leftSpeed = Vector3Length(velLeftWorld);
+            rightSpeed = Vector3Length(velRightWorld);
+        }
+
+        float wLeft, wRight;
+        const float totalSpeed = leftSpeed + rightSpeed;
+        if (totalSpeed < 1e-6f)
+        {
+            wLeft = 0.5f;
+            wRight = 0.5f;
+        }
+        else
+        {
+            wLeft = rightSpeed / totalSpeed;
+            wRight = leftSpeed / totalSpeed;
+        }
+
+        const Vector3 localSlowestToePos = Vector3Add(
+            Vector3Scale(localLeftPos, wLeft),
+            Vector3Scale(localRightPos, wRight));
+        const Vector3 headToSlowest = Vector3Subtract(localSlowestToePos, localHeadPos);
+
+        outFeatures[currentFeature++] = headToSlowest.x;
+        outFeatures[currentFeature++] = headToSlowest.z;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("HeadToSlowestToeX"));
+            db->featureNames.push_back(string("HeadToSlowestToeZ"));
+            db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
+            db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
+        }
+    }
+
+    // HeadToToeAverage
+    if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage))
+    {
+        const int headIdx = db->headIndex;
+        const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
+        const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
+
+        const Vector3 avgToePos = {
+            (localLeftPos.x + localRightPos.x) * 0.5f,
+            (localLeftPos.y + localRightPos.y) * 0.5f,
+            (localLeftPos.z + localRightPos.z) * 0.5f,
+        };
+        const Vector3 headToAvg = Vector3Subtract(avgToePos, localHeadPos);
+
+        outFeatures[currentFeature++] = headToAvg.x;
+        outFeatures[currentFeature++] = headToAvg.z;
+
+        if (populateNames)
+        {
+            db->featureNames.push_back(string("HeadToToeAvgX"));
+            db->featureNames.push_back(string("HeadToToeAvgZ"));
+            db->featureTypes.push_back(FeatureType::HeadToToeAverage);
+            db->featureTypes.push_back(FeatureType::HeadToToeAverage);
+        }
+    }
+
+    // FutureAccelClamped (accel scales by timescale^2)
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped))
+    {
+        constexpr float accelDeadZone = 1.0f;
+        constexpr float accelMaxMag = 3.0f;
+        constexpr float accelRemapScale = accelMaxMag / (accelMaxMag - accelDeadZone);
+        const float timescaleSq = timescale * timescale;
+
+        for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
+        {
+            const float futureTime = cfg.futureTrajPointTimes[p];
+            const int ff = futureFrameClamped(futureTime);
+
+            Vector3 accelAnimSpace = db->magicSmoothedAccelerationAnimSpace[ff];
+            accelAnimSpace.y = 0.0f;
+            Vector3 accelMagic = Vector3RotateByRot6d(accelAnimSpace, invMagicYawRot);
+            accelMagic = Vector3Scale(accelMagic, timescaleSq);
+
+            Vector3 futureAccelMagicSpace = Vector3Zero();
+            const float mag = Vector3Length(accelMagic);
+            if (mag > accelDeadZone)
+            {
+                float remappedMag = (mag - accelDeadZone) * accelRemapScale;
+                if (remappedMag > accelMaxMag) remappedMag = accelMaxMag;
+                futureAccelMagicSpace = Vector3Scale(accelMagic, remappedMag / mag);
+            }
+
+            outFeatures[currentFeature++] = futureAccelMagicSpace.x;
+            outFeatures[currentFeature++] = futureAccelMagicSpace.z;
+
+            if (populateNames)
+            {
+                char nameBufX[64];
+                char nameBufZ[64];
+                snprintf(nameBufX, sizeof(nameBufX), "FutureAccelClampedX_%.2fs", futureTime);
+                snprintf(nameBufZ, sizeof(nameBufZ), "FutureAccelClampedZ_%.2fs", futureTime);
+                db->featureNames.push_back(string(nameBufX));
+                db->featureNames.push_back(string(nameBufZ));
+                db->featureTypes.push_back(FeatureType::FutureAccelClamped);
+                db->featureTypes.push_back(FeatureType::FutureAccelClamped);
+            }
+        }
+    }
+
+    assert(currentFeature == db->featureDim);
+}
+
 // Updated AnimDatabaseRebuild: require all animations to match canonical skeleton.
 // Populate localJointPositions/localJointRotations as well as global arrays.
 // If any clip mismatches jointCount we invalidate the DB (db->valid = false).
@@ -234,6 +1078,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     }
 
     const BVHData* canonBvh = &characterData->bvhData[0];
+    const float animDt = db->animFrameTime[0];
     db->jointCount = canonBvh->jointCount;
 
     // STRICT: require every clip to have the same jointCount as the canonical skeleton.
@@ -445,9 +1290,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             for (int j = 0; j < db->jointCount; ++j)
             {
                 globalPos[j] = tmpXform.globalPositions[j];
-                Rot6dFromQuaternion(tmpXform.globalRotations[j], globalRot[j]);
+                globalRot[j] = QuaternionToRot6d(tmpXform.globalRotations[j]);
                 localPos[j] = tmpXform.localPositions[j];
-                Rot6dFromQuaternion(tmpXform.localRotations[j], localRot[j]);
+                localRot[j] = QuaternionToRot6d(tmpXform.localRotations[j]);
             }
 
             ++motionFrameIdx;
@@ -943,7 +1788,75 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         db->lookaheadRootMotionYawRates[f] = db->lookaheadMagicYawRate[f];
     }
 
+    // precompute aim direction per frame (unit vector in anim-world XZ plane)
+    // and aim yaw rate (angular velocity around Y, rad/s) via finite difference
+    db->aimDirectionAnimSpace.resize(db->motionFrameCount);
+    db->aimYawRate.resize(db->motionFrameCount);
 
+    for (int f = 0; f < db->motionFrameCount; ++f)
+    {
+        Vector3 aimDir = { 0.0f, 0.0f, 1.0f };
+
+        switch (db->featuresConfig.aimDirectionMode)
+        {
+        case AimDirectionMode::HeadToRightHand:
+        {
+            span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
+            aimDir = Vector3Subtract(
+                posRow[db->handIndices[SIDE_RIGHT]], posRow[db->headIndex]);
+            break;
+        }
+        case AimDirectionMode::HeadDirection:
+        {
+            span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
+            aimDir = Vector3RotateByRot6d(
+                Vector3{ 0.0f, 0.0f, 1.0f }, rotRow[db->headIndex]);
+            break;
+        }
+        case AimDirectionMode::HipsDirection:
+        {
+            span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
+            aimDir = Vector3RotateByRot6d(
+                Vector3{ 0.0f, 0.0f, 1.0f }, rotRow[db->hipJointIndex]);
+            break;
+        }
+        default: break;
+        }
+
+        aimDir.y = 0.0f;
+        const float aimLen = Vector3Length(aimDir);
+        if (aimLen > 1e-6f)
+        {
+            aimDir = Vector3Scale(aimDir, 1.0f / aimLen);
+        }
+        else
+        {
+            aimDir = { 0.0f, 0.0f, 1.0f };
+        }
+        db->aimDirectionAnimSpace[f] = aimDir;
+    }
+
+    // compute yaw rate via forward difference, clamped at clip boundaries
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        const int clipStart = db->clipStartFrame[c];
+        const int clipEnd = db->clipEndFrame[c];
+        for (int f = clipStart; f < clipEnd; ++f)
+        {
+            if (f + 1 < clipEnd)
+            {
+                const float angle = SignedAngleY(
+                    db->aimDirectionAnimSpace[f],
+                    db->aimDirectionAnimSpace[f + 1]);
+                db->aimYawRate[f] = angle / animDt;
+            }
+            else
+            {
+                // last frame of clip: copy previous rate (or zero for single-frame clips)
+                db->aimYawRate[f] = (f > clipStart) ? db->aimYawRate[f - 1] : 0.0f;
+            }
+        }
+    }
 
     TraceLog(LOG_INFO, "AnimDatabase: built motion DB with %d frames and %d joints",
         db->motionFrameCount, db->jointCount);
@@ -987,7 +1900,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
 
             // Compute hip rotation relative to magic yaw: hipRotInMagic = invMagicYaw * hipRot
             const Rot6d invMagicYawRot = Rot6dFromYaw(-magicYaw);
-            Rot6dMultiply(invMagicYawRot, hipRot, db->hipRotationInMagicSpace[f]);
+            db->hipRotationInMagicSpace[f] = Rot6dMultiply(invMagicYawRot, hipRot);
         }
     }
 
@@ -1154,7 +2067,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed)) db->featureDim += (int)cfg.futureTrajPointTimes.size();
     if (cfg.IsFeatureEnabled(FeatureType::PastPosition)) db->featureDim += 2;
-    if (cfg.IsFeatureEnabled(FeatureType::AimDirection)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAimDirection)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
+    if (cfg.IsFeatureEnabled(FeatureType::FutureAimVelocity)) db->featureDim += (int)cfg.futureTrajPointTimes.size();
     if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage)) db->featureDim += 2;
     if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped)) db->featureDim += (int)cfg.futureTrajPointTimes.size() * 2;
@@ -1170,525 +2084,11 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         TraceLog(LOG_WARNING, "AnimDatabase: no features enabled in configuration");
         return;
     }
-    // Populate features from jointPositions and jointRotations
+    // Populate features using the shared per-frame function
     for (int f = 0; f < db->motionFrameCount; ++f)
     {
-        const bool isFirstFrame = f == 0;
-        const int clipIdx = FindClipForMotionFrame(db, f);
-        assert(clipIdx != -1);
-
-        const int clipStart = db->clipStartFrame[clipIdx];
-        const int clipEnd = db->clipEndFrame[clipIdx];
-        const float dt = db->animFrameTime[clipIdx];
-        assert(dt > 1e-8f);
-
-        span<const Vector3> posRow = db->jointPositionsAnimSpace.row_view(f);
-        span<const Rot6d> rotRow = db->jointRotationsAnimSpace.row_view(f);
-        span<float> featRow = db->features.row_view(f);
-
-        Vector3 hipPos = { 0.0f, 0.0f, 0.0f };
-        Vector3 leftPos = { 0.0f, 0.0f, 0.0f };
-        Vector3 rightPos = { 0.0f, 0.0f, 0.0f };
-
-        if (db->hipJointIndex >= 0)
-        {
-            hipPos = posRow[db->hipJointIndex];
-        }
-
-        const int leftIdx = db->toeIndices[SIDE_LEFT];
-        const int rightIdx = db->toeIndices[SIDE_RIGHT];
-
-        if (leftIdx >= 0)
-        {
-            leftPos = posRow[leftIdx];
-        }
-        if (rightIdx >= 0)
-        {
-            rightPos = posRow[rightIdx];
-        }
-
-        // Use magic yaw instead of hip yaw for feature extraction (magic space is more stable for blending)
-        const float magicYaw = db->magicYaw[f];  // already computed earlier in rebuild
-        const float invMagicYaw = -magicYaw;
-        const Rot6d magicYawRot = Rot6dFromYaw(magicYaw);
-        const Rot6d invMagicYawRot = Rot6dFromYaw(invMagicYaw);
-
-        // Get magic position for reference frame origin
-        const Vector3 magicPos = db->magicPosition[f];
-
-        int currentFeature = 0;
-
-        // Precompute local toe positions (magic horizontal frame) - used by pos and diff
-        const Vector3 magicToLeft = Vector3Subtract(leftPos, magicPos);
-        Vector3 localLeftPos = Vector3RotateByRot6d(magicToLeft, invMagicYawRot);
-
-        const Vector3 magicToRight = Vector3Subtract(rightPos, magicPos);
-        const Vector3 localRightPos = Vector3RotateByRot6d(magicToRight, invMagicYawRot);
-
-        // POSITION: toePos->Left(X, Z), Right(X, Z)
-        if (cfg.IsFeatureEnabled(FeatureType::ToePos))
-        {
-            featRow[currentFeature++] = localLeftPos.x;
-            featRow[currentFeature++] = localLeftPos.z;
-            featRow[currentFeature++] = localRightPos.x;
-            featRow[currentFeature++] = localRightPos.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("LeftToePosX"));
-                db->featureNames.push_back(string("LeftToePosZ"));
-                db->featureNames.push_back(string("RightToePosX"));
-                db->featureNames.push_back(string("RightToePosZ"));
-                db->featureTypes.push_back(FeatureType::ToePos);
-                db->featureTypes.push_back(FeatureType::ToePos);
-                db->featureTypes.push_back(FeatureType::ToePos);
-                db->featureTypes.push_back(FeatureType::ToePos);
-            }
-        }
-
-        // VELOCITY: toeVel -> compute world finite-difference then rotate into magic frame
-        if (cfg.IsFeatureEnabled(FeatureType::ToeVel))
-        {
-            Vector3 localLeftVel = Vector3Zero();
-            Vector3 localRightVel = Vector3Zero();
-
-            if (f > clipStart && dt > 0.0f)
-            {
-                span<const Vector3> posPrevRow = db->jointPositionsAnimSpace.row_view(f - 1);
-
-                if (leftIdx >= 0)
-                {
-                    const Vector3 deltaLeft = Vector3Subtract(leftPos, posPrevRow[leftIdx]);
-                    const Vector3 velLeftWorld = Vector3Scale(deltaLeft, 1.0f / dt);
-                    localLeftVel = Vector3RotateByRot6d(velLeftWorld, invMagicYawRot);
-                }
-
-                if (rightIdx >= 0)
-                {
-                    const Vector3 deltaRight = Vector3Subtract(rightPos, posPrevRow[rightIdx]);
-                    const Vector3 velRightWorld = Vector3Scale(deltaRight, 1.0f / dt);
-                    localRightVel = Vector3RotateByRot6d(velRightWorld, invMagicYawRot);
-                }
-            }
-
-
-            featRow[currentFeature++] = localLeftVel.x;
-            featRow[currentFeature++] = localLeftVel.z;
-            featRow[currentFeature++] = localRightVel.x;
-            featRow[currentFeature++] = localRightVel.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("LeftToeVelX"));
-                db->featureNames.push_back(string("LeftToeVelZ"));
-                db->featureNames.push_back(string("RightToeVelX"));
-                db->featureNames.push_back(string("RightToeVelZ"));
-                db->featureTypes.push_back(FeatureType::ToeVel);
-                db->featureTypes.push_back(FeatureType::ToeVel);
-                db->featureTypes.push_back(FeatureType::ToeVel);
-                db->featureTypes.push_back(FeatureType::ToeVel);
-            }
-        }
-
-        // DIFFERENCE: toeDifference = Left - Right (in magic horizontal frame) => (dx, dz)
-        if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff))
-        {
-            featRow[currentFeature++] = localLeftPos.x - localRightPos.x;
-            featRow[currentFeature++] = localLeftPos.z - localRightPos.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("ToePosDiffX"));
-                db->featureNames.push_back(string("ToePosDiffZ"));
-                db->featureTypes.push_back(FeatureType::ToePosDiff);
-                db->featureTypes.push_back(FeatureType::ToePosDiff);
-            }
-        }
-
-        // FUTURE TRAJECTORY: future smoothed magic velocity (XZ) at sample points
-        // Uses precomputed gaussian-smoothed velocity in anim space, transformed to current magic space
-        if (cfg.IsFeatureEnabled(FeatureType::FutureVel))
-        {
-            const float frameTime = db->animFrameTime[clipIdx];
-
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-            {
-                const float futureTime = cfg.futureTrajPointTimes[p];
-                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
-                const int futureFrame = f + futureFrameOffset;
-
-                Vector3 futureVelMagicSpace = Vector3Zero();
-
-                if (futureFrame >= clipStart && futureFrame < clipEnd)
-                {
-                    Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[futureFrame];
-                    futureVelAnimSpace.y = 0.0f;  // XZ only
-                    futureVelMagicSpace = Vector3RotateByRot6d(futureVelAnimSpace, invMagicYawRot);
-                }
-
-                featRow[currentFeature++] = futureVelMagicSpace.x;
-                featRow[currentFeature++] = futureVelMagicSpace.z;
-
-                if (isFirstFrame)
-                {
-                    char nameBufX[64];
-                    char nameBufZ[64];
-                    snprintf(nameBufX, sizeof(nameBufX), "FutureVelX_%.2fs", futureTime);
-                    snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelZ_%.2fs", futureTime);
-                    db->featureNames.push_back(string(nameBufX));
-                    db->featureNames.push_back(string(nameBufZ));
-                    db->featureTypes.push_back(FeatureType::FutureVel);
-                    db->featureTypes.push_back(FeatureType::FutureVel);
-                }
-            }
-        }
-
-        // FUTURE VELOCITY CLAMPED: future smoothed velocity clamped to max magnitude
-        if (cfg.IsFeatureEnabled(FeatureType::FutureVelClamped))
-        {
-            constexpr float MaxFutureVelClampedMag = 1.0f;
-
-            const float frameTime = db->animFrameTime[clipIdx];
-
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-            {
-                const float futureTime = cfg.futureTrajPointTimes[p];
-                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
-                const int futureFrame = f + futureFrameOffset;
-
-                Vector3 futureVelMagicSpace = Vector3Zero();
-
-                if (futureFrame >= clipStart && futureFrame < clipEnd)
-                {
-                    Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[futureFrame];
-                    futureVelAnimSpace.y = 0.0f;  // XZ only
-
-                    futureVelMagicSpace = Vector3RotateByRot6d(futureVelAnimSpace, invMagicYawRot);
-
-                    // Clamp to max magnitude
-                    const float mag = Vector3Length(futureVelMagicSpace);
-                    if (mag > MaxFutureVelClampedMag)
-                    {
-                        futureVelMagicSpace = Vector3Scale(futureVelMagicSpace, MaxFutureVelClampedMag / mag);
-                    }
-                }
-
-                featRow[currentFeature++] = futureVelMagicSpace.x;
-                featRow[currentFeature++] = futureVelMagicSpace.z;
-
-                if (isFirstFrame)
-                {
-                    char nameBufX[64];
-                    char nameBufZ[64];
-                    snprintf(nameBufX, sizeof(nameBufX), "FutureVelClampedX_%.2fs", futureTime);
-                    snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelClampedZ_%.2fs", futureTime);
-                    db->featureNames.push_back(string(nameBufX));
-                    db->featureNames.push_back(string(nameBufZ));
-                    db->featureTypes.push_back(FeatureType::FutureVelClamped);
-                    db->featureTypes.push_back(FeatureType::FutureVelClamped);
-                }
-            }
-        }
-
-        // FUTURE SPEED: scalar speed at future sample points from smoothed magic velocity
-        if (cfg.IsFeatureEnabled(FeatureType::FutureSpeed))
-        {
-            const float frameTime = db->animFrameTime[clipIdx];
-
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-            {
-                const float futureTime = cfg.futureTrajPointTimes[p];
-                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
-                const int futureFrame = f + futureFrameOffset;
-
-                float futureSpeed = 0.0f;
-
-                if (futureFrame >= clipStart && futureFrame < clipEnd)
-                {
-                    Vector3 futureVelAnimSpace = db->magicSmoothedVelocityAnimSpace[futureFrame];
-                    futureVelAnimSpace.y = 0.0f;  // XZ only
-                    futureSpeed = Vector3Length(futureVelAnimSpace);
-                }
-
-                featRow[currentFeature++] = futureSpeed;
-
-                if (isFirstFrame)
-                {
-                    char nameBuf[64];
-                    snprintf(nameBuf, sizeof(nameBuf), "FutureSpeed_%.2fs", futureTime);
-                    db->featureNames.push_back(string(nameBuf));
-                    db->featureTypes.push_back(FeatureType::FutureSpeed);
-                }
-            }
-        }
-
-        // PAST POSITION: past magic position in current magic horizontal frame (XZ)
-        if (cfg.IsFeatureEnabled(FeatureType::PastPosition))
-        {
-            Vector3 pastPosLocal = Vector3Zero();
-
-            const float frameTime = db->animFrameTime[clipIdx];
-            const float pastTime = cfg.pastTimeOffset;
-            const int pastFrameOffset = (int)(pastTime / frameTime + 0.5f);
-            const int pastFrame = f - pastFrameOffset;
-
-            // Check if past frame is within the same clip
-            if (pastFrame >= clipStart && pastFrame < clipEnd)
-            {
-                // Get past magic position (already computed)
-                const Vector3 pastMagicPos = db->magicPosition[pastFrame];
-
-                // Compute vector from current magic to past magic
-                const Vector3 magicToPastMagic = Vector3Subtract(pastMagicPos, magicPos);
-
-                // Transform to current magic horizontal frame
-                pastPosLocal = Vector3RotateByRot6d(magicToPastMagic, invMagicYawRot);
-            }
-
-            // Store only XZ components (horizontal position)
-            featRow[currentFeature++] = pastPosLocal.x;
-            featRow[currentFeature++] = pastPosLocal.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("PastPosX"));
-                db->featureNames.push_back(string("PastPosZ"));
-                db->featureTypes.push_back(FeatureType::PastPosition);
-                db->featureTypes.push_back(FeatureType::PastPosition);
-            }
-        }
-
-        // AIM DIRECTION: direction at future trajectory times, relative to current magic yaw
-        // mode controls what direction is extracted from the animation
-        if (cfg.IsFeatureEnabled(FeatureType::AimDirection))
-        {
-            const float frameTime = db->animFrameTime[clipIdx];
-
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-            {
-                const float futureTime = cfg.futureTrajPointTimes[p];
-                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
-                const int futureFrame = f + futureFrameOffset;
-
-                Vector3 aimDirLocal = { 0.0f, 0.0f, 1.0f };
-
-                if (futureFrame >= clipStart && futureFrame < clipEnd)
-                {
-                    Vector3 aimDirWorld = { 0.0f, 0.0f, 1.0f };
-
-                    switch (cfg.aimDirectionMode)
-                    {
-                    case AimDirectionMode::HeadToRightHand:
-                    {
-                        span<const Vector3> futurePosRow =
-                            db->jointPositionsAnimSpace
-                                .row_view(futureFrame);
-                        const Vector3 headPos =
-                            futurePosRow[db->headIndex];
-                        const Vector3 handPos =
-                            futurePosRow[
-                                db->handIndices[SIDE_RIGHT]];
-                        aimDirWorld = Vector3Subtract(
-                            handPos, headPos);
-                        break;
-                    }
-                    case AimDirectionMode::HeadDirection:
-                    {
-                        span<const Rot6d> futureRotRow =
-                            db->jointRotationsAnimSpace
-                                .row_view(futureFrame);
-                        aimDirWorld = Vector3RotateByRot6d(
-                            Vector3{ 0.0f, 0.0f, 1.0f },
-                            futureRotRow[db->headIndex]);
-                        break;
-                    }
-                    case AimDirectionMode::HipsDirection:
-                    {
-                        span<const Rot6d> futureRotRow =
-                            db->jointRotationsAnimSpace
-                                .row_view(futureFrame);
-                        aimDirWorld = Vector3RotateByRot6d(
-                            Vector3{ 0.0f, 0.0f, 1.0f },
-                            futureRotRow[db->hipJointIndex]);
-                        break;
-                    }
-                    default: break;
-                    }
-
-                    // project to XZ plane and normalize
-                    aimDirWorld.y = 0.0f;
-                    const float aimLen =
-                        Vector3Length(aimDirWorld);
-                    if (aimLen > 1e-6f)
-                    {
-                        aimDirWorld = Vector3Scale(
-                            aimDirWorld, 1.0f / aimLen);
-                    }
-                    else
-                    {
-                        aimDirWorld = { 0.0f, 0.0f, 1.0f };
-                    }
-
-                    aimDirLocal = Vector3RotateByRot6d(
-                        aimDirWorld, invMagicYawRot);
-                }
-
-                featRow[currentFeature++] = aimDirLocal.x;
-                featRow[currentFeature++] = aimDirLocal.z;
-
-                if (isFirstFrame)
-                {
-                    char nameBufX[64];
-                    char nameBufZ[64];
-                    snprintf(nameBufX, sizeof(nameBufX),
-                        "AimDirX_%.2fs", futureTime);
-                    snprintf(nameBufZ, sizeof(nameBufZ),
-                        "AimDirZ_%.2fs", futureTime);
-                    db->featureNames.push_back(
-                        string(nameBufX));
-                    db->featureNames.push_back(
-                        string(nameBufZ));
-                    db->featureTypes.push_back(
-                        FeatureType::AimDirection);
-                    db->featureTypes.push_back(
-                        FeatureType::AimDirection);
-                }
-            }
-        }
-
-        // HEAD TO SLOWEST TOE: vector from head to a speed-weighted average of toe positions
-        if (cfg.IsFeatureEnabled(FeatureType::HeadToSlowestToe))
-        {
-            const int headIdx = db->headIndex;
-
-            // Get head and toe positions in magic space
-            const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
-            const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
-
-            // Compute local toe speeds using the same method as ToeVel
-            float leftSpeed = 0.0f;
-            float rightSpeed = 0.0f;
-
-            if (f > clipStart && dt > 0.0f)
-            {
-                span<const Vector3> posPrevRow = db->jointPositionsAnimSpace.row_view(f - 1);
-                const Vector3 velLeftWorld = Vector3Scale(Vector3Subtract(posRow[leftIdx], posPrevRow[leftIdx]), 1.0f / dt);
-                const Vector3 velRightWorld = Vector3Scale(Vector3Subtract(posRow[rightIdx], posPrevRow[rightIdx]), 1.0f / dt);
-                leftSpeed = Vector3Length(velLeftWorld);
-                rightSpeed = Vector3Length(velRightWorld);
-            }
-
-            // Weight logic: more speed on other foot -> more weight on this foot
-            float wLeft, wRight;
-            float totalSpeed = leftSpeed + rightSpeed;
-            if (totalSpeed < 1e-6f)
-            {
-                wLeft = 0.5f;
-                wRight = 0.5f;
-            }
-            else
-            {
-                wLeft = rightSpeed / totalSpeed;
-                wRight = leftSpeed / totalSpeed;
-            }
-
-            // P_slowest = wLeft*P_left + wRight*P_right
-            const Vector3 localSlowestToePos = Vector3Add(
-                Vector3Scale(localLeftPos, wLeft),
-                Vector3Scale(localRightPos, wRight));
-
-            const Vector3 headToSlowest = Vector3Subtract(localSlowestToePos, localHeadPos);
-
-            featRow[currentFeature++] = headToSlowest.x;
-            featRow[currentFeature++] = headToSlowest.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("HeadToSlowestToeX"));
-                db->featureNames.push_back(string("HeadToSlowestToeZ"));
-                db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
-                db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
-            }
-        }
-
-        // HEAD TO TOE AVERAGE: vector from head to the simple average of both toe positions
-        if (cfg.IsFeatureEnabled(FeatureType::HeadToToeAverage))
-        {
-            const int headIdx = db->headIndex;
-            const Vector3 magicToHead = Vector3Subtract(posRow[headIdx], magicPos);
-            const Vector3 localHeadPos = Vector3RotateByRot6d(magicToHead, invMagicYawRot);
-
-            const Vector3 avgToePos = {
-                (localLeftPos.x + localRightPos.x) * 0.5f,
-                (localLeftPos.y + localRightPos.y) * 0.5f,
-                (localLeftPos.z + localRightPos.z) * 0.5f,
-            };
-            const Vector3 headToAvg = Vector3Subtract(avgToePos, localHeadPos);
-
-            featRow[currentFeature++] = headToAvg.x;
-            featRow[currentFeature++] = headToAvg.z;
-
-            if (isFirstFrame)
-            {
-                db->featureNames.push_back(string("HeadToToeAvgX"));
-                db->featureNames.push_back(string("HeadToToeAvgZ"));
-                db->featureTypes.push_back(FeatureType::HeadToToeAverage);
-                db->featureTypes.push_back(FeatureType::HeadToToeAverage);
-            }
-        }
-
-        // FUTURE ACCELERATION CLAMPED: smoothed acceleration with dead zone and cap
-        // mag < 1 m/s2 → 0, mag in [1,3] → remapped to [0,3], mag > 3 → clamped at 3
-        if (cfg.IsFeatureEnabled(FeatureType::FutureAccelClamped))
-        {
-            constexpr float accelDeadZone = 1.0f;   // below this magnitude, output is zero
-            constexpr float accelMaxMag = 3.0f;      // clamp above this
-            constexpr float accelRemapScale = accelMaxMag / (accelMaxMag - accelDeadZone); // maps [1,3] → [0,3]
-
-            const float frameTime = db->animFrameTime[clipIdx];
-
-            for (int p = 0; p < (int)cfg.futureTrajPointTimes.size(); ++p)
-            {
-                const float futureTime = cfg.futureTrajPointTimes[p];
-                const int futureFrameOffset = (int)(futureTime / frameTime + 0.5f);
-                const int futureFrame = f + futureFrameOffset;
-
-                Vector3 futureAccelMagicSpace = Vector3Zero();
-
-                if (futureFrame >= clipStart && futureFrame < clipEnd)
-                {
-                    Vector3 accelAnimSpace = db->magicSmoothedAccelerationAnimSpace[futureFrame];
-                    accelAnimSpace.y = 0.0f;  // XZ only
-                    Vector3 accelMagic = Vector3RotateByRot6d(accelAnimSpace, invMagicYawRot);
-
-                    const float mag = Vector3Length(accelMagic);
-                    if (mag > accelDeadZone)
-                    {
-                        // remap: (mag - deadZone) * scale, capped at maxMag
-                        float remappedMag = (mag - accelDeadZone) * accelRemapScale;
-                        if (remappedMag > accelMaxMag) remappedMag = accelMaxMag;
-                        futureAccelMagicSpace = Vector3Scale(accelMagic, remappedMag / mag);
-                    }
-                }
-
-                featRow[currentFeature++] = futureAccelMagicSpace.x;
-                featRow[currentFeature++] = futureAccelMagicSpace.z;
-
-                if (isFirstFrame)
-                {
-                    char nameBufX[64];
-                    char nameBufZ[64];
-                    snprintf(nameBufX, sizeof(nameBufX), "FutureAccelClampedX_%.2fs", futureTime);
-                    snprintf(nameBufZ, sizeof(nameBufZ), "FutureAccelClampedZ_%.2fs", futureTime);
-                    db->featureNames.push_back(string(nameBufX));
-                    db->featureNames.push_back(string(nameBufZ));
-                    db->featureTypes.push_back(FeatureType::FutureAccelClamped);
-                    db->featureTypes.push_back(FeatureType::FutureAccelClamped);
-                }
-            }
-        }
-
-        assert(currentFeature == db->featureDim);
+        float* featRow = db->features.row_view(f).data();
+        ComputeRawFeaturesForFrame(db, cfg, f, featRow, /*populateNames=*/ f == 0, /*doAugmentation=*/ false);
     }
 
 
@@ -1923,7 +2323,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             {"LeftToeBase",0.005f},{"LeftToeBaseEnd",0.00063f},
         };
         constexpr float defaultBoneWeight = 0.01f;
-        constexpr float nonRotWeight = 0.4f;
+        constexpr float notSoBigWeight = 0.4f;
         constexpr float footPosVelWeight = 1.0f;
 
         const BVHData* skeleton = &characterData->bvhData[0];
@@ -1941,9 +2341,9 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             w *= 5.0f; // scale up weights so the most important bones have weight around 1.0f, to avoid too small values after normalization
             weightPose.lookaheadLocalRotations[j] = { w, w, w, w, w, w };
         }
-        weightPose.rootLocalPosition = { nonRotWeight, nonRotWeight, nonRotWeight };
-        weightPose.lookaheadRootVelocity = { nonRotWeight, nonRotWeight, nonRotWeight };
-        weightPose.rootYawRate = nonRotWeight;
+        weightPose.rootLocalPosition = { notSoBigWeight, notSoBigWeight, notSoBigWeight };
+        weightPose.lookaheadRootVelocity = { notSoBigWeight, notSoBigWeight, notSoBigWeight };
+        weightPose.rootYawRate = 3.0f;// this one is very important (?)
         for (int side : sides)
         {
             weightPose.lookaheadToePositionsRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };

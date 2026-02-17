@@ -2,6 +2,8 @@
 
 //#include "raylib.h"
 
+constexpr int PCA_SEGMENT_K = 128;
+constexpr int PCA_POSE_K = 16;
 
 // Animation playback mode for controlled character
 enum class AnimationMode : int
@@ -15,6 +17,7 @@ enum class AnimationMode : int
     SinglePosePredictor,               // deterministic: features -> pose latent -> decoded pose
     UnconditionedAdvance,              // hybrid: conditioned search + unconditioned latent advance
     MondayPredictor,                   // conditioned delta: (features, pose latent) → pose latent delta
+    GlimpseMode,                       // flow-sampled future pose -> deterministic segment decompression
     COUNT
 };
 
@@ -31,6 +34,7 @@ static inline const char* AnimationModeName(AnimationMode mode)
     case AnimationMode::SinglePosePredictor: return "Single Pose Predictor";
     case AnimationMode::UnconditionedAdvance: return "Unconditioned Advance";
     case AnimationMode::MondayPredictor: return "Monday Predictor";
+    case AnimationMode::GlimpseMode: return "Glimpse Mode";
     default: return "Unknown";
     }
 }
@@ -64,7 +68,8 @@ enum class FeatureType : int
     FutureVelClamped,    // future root velocity clamped to max magnitude (XZ) => 2 * points
     FutureSpeed,         // future root speed (scalar) at sample points => 1 * points
     PastPosition,        // past hip position (XZ) in current hip horizontal frame => 2 dims
-    AimDirection,        // aim direction (head→rightHand) at trajectory times => 2 * points
+    FutureAimDirection,  // aim direction at trajectory times => 2 * points
+    FutureAimVelocity,   // aim angular velocity (rad/s around Y) at trajectory times => 1 * points
     HeadToSlowestToe,    // head to slowest foot vector (XZ) in root space => 2 dims
     HeadToToeAverage,    // head to average of both toe positions (XZ) in root space => 2 dims
     FutureAccelClamped,  // future root acceleration clamped: dead zone below 1m/s2, capped at 3m/s2 => 2 * points
@@ -84,7 +89,8 @@ static inline const char* FeatureTypeName(FeatureType type)
     case FeatureType::FutureVelClamped: return "Future Vel Clamped";
     case FeatureType::FutureSpeed: return "Future Speed";
     case FeatureType::PastPosition: return "Past Position";
-    case FeatureType::AimDirection: return "Aim Direction";
+    case FeatureType::FutureAimDirection: return "Future Aim Direction";
+    case FeatureType::FutureAimVelocity: return "Future Aim Velocity";
     case FeatureType::HeadToSlowestToe: return "Head To Slowest Toe";
     case FeatureType::HeadToToeAverage: return "Head To Toe Average";
     case FeatureType::FutureAccelClamped: return "Future Accel Clamped";
@@ -268,6 +274,7 @@ struct AppConfig {
     bool useMMFeatureDenoiser = false;
     bool testSegmentAutoEncoder = false;
     bool testPoseAutoEncoder = false;
+    bool testPcaReconstruction = false;
 
     // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
     MotionMatchingFeaturesConfig mmConfigEditor;
@@ -565,6 +572,10 @@ struct AnimDatabase
     std::vector<Vector3> lookaheadMagicVelocity;  // [motionFrameCount] - extrapolated
     std::vector<float> lookaheadMagicYawRate;     // [motionFrameCount] - extrapolated
 
+    // precomputed aim direction per frame (unit vector in anim-world XZ plane)
+    std::vector<Vector3> aimDirectionAnimSpace;   // [motionFrameCount]
+    std::vector<float> aimYawRate;                // [motionFrameCount] rad/s
+
     // Hip transform relative to Magic anchor (for placing skeleton when using Magic root motion)
     std::vector<Vector3> hipPositionInMagicSpace;        // [motionFrameCount] - hip offset from magic, in magic-heading space
     std::vector<Rot6d> hipRotationInMagicSpace;          // [motionFrameCount] - full hip rotation relative to magic yaw
@@ -582,7 +593,7 @@ struct AnimDatabase
     // This is what the network should output given the motion matching features as input
     int poseGenFeaturesComputeDim = -1;        
     Array2D<float> poseGenFeatures;            // [motionFrameCount x poseGenFeaturesComputeDim]
-    float poseGenFeaturesSegmentLength = 0.4f; // how many seconds of poseGenFeatures a cursor copies
+    float poseGenFeaturesSegmentLength = 0.3f; // how many seconds of poseGenFeatures a cursor copies
 
     // normalization for poseGenFeatures (for segment autoencoder training)
     std::vector<float> poseGenFeaturesMean;    // per-dim mean [poseGenFeaturesComputeDim]
@@ -595,6 +606,16 @@ struct AnimDatabase
     // segment autoencoder sizing (computed at build time from frame rate and segmentLength)
     int poseGenSegmentFrameCount = -1;         // how many frames in a segment
     int poseGenSegmentFlatDim = -1;            // poseGenSegmentFrameCount * poseGenFeaturesComputeDim
+
+    // PCA on flat normalized segments (computed at build time)
+    int pcaSegmentK = -1;                       // number of PCA components kept
+    std::vector<float> pcaSegmentMean;          // [flatDim] mean of flat normalized segments
+    std::vector<float> pcaSegmentBasis;         // [K * flatDim] row-major, each row is a principal component
+
+    // PCA on single-frame normalized pose features (for glimpse flow conditioning)
+    int pcaPoseK = -1;                          // number of PCA components kept
+    std::vector<float> pcaPoseMean;             // [pgDim] mean of normalized pose features
+    std::vector<float> pcaPoseBasis;            // [K * pgDim] row-major
 
     // k-means clusters on normalizedFeatures for stratified training sampling
     // clusterFrames[c] holds the global frame indices belonging to cluster c
@@ -635,6 +656,8 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->magicYawRate.clear();
     db->lookaheadMagicVelocity.clear();
     db->lookaheadMagicYawRate.clear();
+    db->aimDirectionAnimSpace.clear();
+    db->aimYawRate.clear();
     for (int side : sides)
     {
         db->toePositionsRootSpace[side].clear();
@@ -661,6 +684,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->normalizedPoseGenFeatures.clear();
     db->poseGenSegmentFrameCount = -1;
     db->poseGenSegmentFlatDim = -1;
+    db->pcaPoseK = -1;
+    db->pcaPoseMean.clear();
+    db->pcaPoseBasis.clear();
     db->clusterCount = 0;
     db->clusterFrames.clear();
 }
@@ -831,6 +857,10 @@ struct ControlledCharacter {
     // Blended lookahead pose for debugging
     TransformData xformLookahead;
 
+    // Glimpse flow predicted future pose for debugging
+    TransformData xformGlimpsePose;
+    bool glimpsePoseValid = false;
+
     // Visual properties
     Color color;
     float opacity;
@@ -969,6 +999,38 @@ struct FridayFlowModelImpl : torch::nn::Module
 };
 TORCH_MODULE(FridayFlowModel);
 
+// Glimpse flow: noise -> pose PCA coefficients, conditioned on MM features + time
+// deeper than FullFlowModel: 256 -> 512 -> 256 with condition re-injected at each layer
+struct GlimpseFlowModelImpl : torch::nn::Module
+{
+    torch::nn::Linear layer1{nullptr};
+    torch::nn::Linear layer2{nullptr};
+    torch::nn::Linear layer3{nullptr};
+    torch::nn::Linear outputLayer{nullptr};
+    int condTimeDim = 0;
+
+    GlimpseFlowModelImpl(int featureDim, int posePcaDim);
+    torch::Tensor forward(const torch::Tensor& xt,
+                          const torch::Tensor& condTime);
+};
+TORCH_MODULE(GlimpseFlowModel);
+
+// Glimpse decompressor: (futurePose, features) -> segment, features re-injected at each layer
+struct GlimpseDecompressorModelImpl : torch::nn::Module
+{
+    torch::nn::Linear layer1{nullptr};
+    torch::nn::Linear layer2{nullptr};
+    torch::nn::Linear layer3{nullptr};
+    torch::nn::Linear outputLayer{nullptr};
+    int condDim = 0;
+    int poseDim = 0;
+
+    GlimpseDecompressorModelImpl(int featureDim, int pgDim, int segmentFlatDim);
+    torch::Tensor forward(const torch::Tensor& futurePose,
+                          const torch::Tensor& cond);
+};
+TORCH_MODULE(GlimpseDecompressorModel);
+
 //----------------------------------------------------------------------------------
 // Neural Network state
 //----------------------------------------------------------------------------------
@@ -1079,6 +1141,25 @@ struct NetworkState {
     std::vector<float> mondayDeltaMean;   // per-dim mean of latent deltas [POSE_AE_LATENT_DIM]
     std::vector<float> mondayDeltaStd;    // per-dim std of latent deltas [POSE_AE_LATENT_DIM]
     double mondayDeltaStatsTimer = 0.0;   // time since last stats recomputation
+
+    // glimpse flow: noise -> pose PCA coefficients at 0.3s, conditioned on MM features
+    GlimpseFlowModel glimpseFlow = nullptr;
+    std::shared_ptr<torch::optim::Adam> glimpseFlowOptimizer = nullptr;
+    float glimpseFlowLoss = 0.0f;
+    float glimpseFlowLossSmoothed = 0.0f;
+    int glimpseFlowIterations = 0;
+    std::vector<float> glimpseFlowLossHistory;
+
+    // per-dim std of normalizedPoseGenFeatures (for noise scaling in glimpse flow)
+    std::vector<float> glimpseTargetStd;
+
+    // glimpse decompressor: (MM features, future pose) -> full segment
+    GlimpseDecompressorModel glimpseDecompressor = nullptr;
+    std::shared_ptr<torch::optim::Adam> glimpseDecompressorOptimizer = nullptr;
+    float glimpseDecompressorLoss = 0.0f;
+    float glimpseDecompressorLossSmoothed = 0.0f;
+    int glimpseDecompressorIterations = 0;
+    std::vector<float> glimpseDecompressorLossHistory;
 
     // loss history — one sample every LOSS_LOG_INTERVAL_SECONDS,
     // all networks logged at the same time so curves are directly comparable

@@ -46,6 +46,7 @@ set(FLOMO_HEADERS
     leg_ik.h
     character_data.h
     anim_database.h
+    kmeans_clustering.h
     controlled_character.h
     motion_matching.h
     networks.h

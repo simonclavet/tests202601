@@ -47,6 +47,22 @@ static inline int RandomInt(int maxExclusive)
     return dist(rng);
 }
 
+// random float in [0, 1)
+static inline float RandomFloat01()
+{
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    return dist(rng);
+}
+
+// random float from standard normal distribution N(0, 1)
+static inline float RandomGaussian()
+{
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    return dist(rng);
+}
+
 //----------------------------------------------------------------------------------
 // Command Line Args
 //----------------------------------------------------------------------------------
