@@ -109,9 +109,7 @@ static inline void ComputeFutureAimDirections(
 // Extract motion features from current character state
 // This produces a feature vector in the same format as AnimDatabase features
 // Used by motion matching to build query vector from runtime character state
-// poseAlpha: how far into the next database frame we are (dt / dbFrameTime, clamped to [0,1]).
-// 1.0 = full database frame step (use "next" values as-is), 0.5 = half step (lerp halfway).
-// This matters for ToeVel, ToePosDiff, HeadToSlowestToe which use next-frame quantities.
+// poseAlpha: currently unused (was used for next-frame lerping, now removed).
 static void ComputeMotionFeatures(
     const AnimDatabase* db,
     const ControlledCharacter* cc,
@@ -163,16 +161,11 @@ static void ComputeMotionFeatures(
     const Vector3 magicToRight = Vector3Subtract(rightToePos, magicPos);
     const Vector3 localRightPos = Vector3RotateByQuaternion(magicToRight, invMagicWorldRot);
 
-    // Compute toe velocities in magic-local frame, lerped between current and next
-    // based on poseAlpha to handle runtime framerate != database framerate
-    const Vector3 leftVelWorld = Vector3Lerp(
-        cc->toeBlendedVelocityWorld[SIDE_LEFT],
-        cc->nextToeBlendedVelocityWorld[SIDE_LEFT], poseAlpha);
-    const Vector3 rightVelWorld = Vector3Lerp(
-        cc->toeBlendedVelocityWorld[SIDE_RIGHT],
-        cc->nextToeBlendedVelocityWorld[SIDE_RIGHT], poseAlpha);
-    const Vector3 localLeftVel = Vector3RotateByQuaternion(leftVelWorld, invMagicWorldRot);
-    const Vector3 localRightVel = Vector3RotateByQuaternion(rightVelWorld, invMagicWorldRot);
+    // Compute toe velocities in magic-local frame (current frame, no next-frame lerp)
+    const Vector3 localLeftVel = Vector3RotateByQuaternion(
+        cc->toeBlendedVelocityWorld[SIDE_LEFT], invMagicWorldRot);
+    const Vector3 localRightVel = Vector3RotateByQuaternion(
+        cc->toeBlendedVelocityWorld[SIDE_RIGHT], invMagicWorldRot);
 
     // Fill the feature vector in the same order as database features
     int fi = 0;
@@ -195,14 +188,11 @@ static void ComputeMotionFeatures(
         outFeatures[fi++] = localRightVel.z;
     }
 
-    // ToePosDiff: (left - right) toe pos diff, lerped between current and next frame
+    // ToePosDiff: (left - right) toe pos diff (current frame)
     if (cfg.IsFeatureEnabled(FeatureType::ToePosDiff))
     {
-        const Vector3 posDiff = Vector3Lerp(
-            cc->toeBlendedPosDiffRootSpace,
-            cc->nextToeBlendedPosDiffRootSpace, poseAlpha);
-        outFeatures[fi++] = posDiff.x;
-        outFeatures[fi++] = posDiff.z;
+        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.x;
+        outFeatures[fi++] = cc->toeBlendedPosDiffRootSpace.z;
     }
 
 
@@ -445,9 +435,9 @@ static void ComputeMotionFeatures(
         const Vector3 magicToHead = Vector3Subtract(headPos, magicPos);
         const Vector3 localHeadPos = Vector3RotateByQuaternion(magicToHead, invMagicWorldRot);
 
-        // Get toe speeds from lerped velocity (same lerp as ToeVel feature)
-        const float leftSpeed = Vector3Length(leftVelWorld);
-        const float rightSpeed = Vector3Length(rightVelWorld);
+        // Get toe speeds from current blended velocity
+        const float leftSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_LEFT]);
+        const float rightSpeed = Vector3Length(cc->toeBlendedVelocityWorld[SIDE_RIGHT]);
 
         float wLeft, wRight;
         float totalSpeed = leftSpeed + rightSpeed;

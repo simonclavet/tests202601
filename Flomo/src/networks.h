@@ -1482,16 +1482,16 @@ static inline void NetworkLoadFullFlow(
 // glimpse flow: noise -> single future poseFeature
 //---------------------------------------------------------
 
-// compute per-dim std of joint-PCA-projected concatenated glimpse poses for noise scaling.
-// the flow operates in pcaGlimpsePoseK dims (joint PCA of all future poses concatenated).
+// compute per-dim std of the glimpse target vector (K PCA dims + 6 motion dims)
+// for noise scaling in the flow.
 static inline void ComputeGlimpseTargetStd(
     NetworkState* state,
     const AnimDatabase* db)
 {
-    const int K = db->pcaGlimpsePoseK;
-    if (K <= 0 || db->poseGenFeaturesComputeDim <= 0) return;
+    const int K = db->pcaGlimpseToeK;
+    if (K <= 0) return;
 
-    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int glimpseDim = K;
     const float animDt = db->animFrameTime[0];
 
     int futureFrames[GLIMPSE_POSE_COUNT];
@@ -1503,36 +1503,33 @@ static inline void ComputeGlimpseTargetStd(
     const int numSamples = std::min(10000, (int)db->legalStartFrames.size());
     if (numSamples <= 0) return;
 
-    state->glimpseTargetStd.assign(K, 0.0f);
-    std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
-    std::vector<float> coeffs(K);
+    state->glimpseTargetStd.assign(glimpseDim, 0.0f);
+    float raw16[GLIMPSE_TOE_RAW_DIM];
+    float coeffs[GLIMPSE_TOE_PCA_K];
 
     for (int i = 0; i < numSamples; ++i)
     {
         const int frame = SampleLegalSegmentStartFrame(db);
-        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+        BuildRawGlimpseToe(db, frame, futureFrames, raw16);
+        PcaProjectGlimpseToe(db, raw16, coeffs);
+
+        for (int d = 0; d < glimpseDim; ++d)
         {
-            std::span<const float> row =
-                db->normalizedPoseGenFeatures.row_view(frame + futureFrames[t]);
-            memcpy(concat.data() + t * pgDim, row.data(), pgDim * sizeof(float));
-        }
-        PcaProjectGlimpsePose(db, concat.data(), coeffs.data());
-        for (int k = 0; k < K; ++k)
-        {
-            state->glimpseTargetStd[k] += coeffs[k] * coeffs[k];
+            state->glimpseTargetStd[d] += coeffs[d] * coeffs[d];
         }
     }
 
-    for (int k = 0; k < K; ++k)
+    for (int d = 0; d < glimpseDim; ++d)
     {
-        state->glimpseTargetStd[k] = sqrtf(state->glimpseTargetStd[k] / (float)numSamples);
-        if (state->glimpseTargetStd[k] < 1e-6f)
+        state->glimpseTargetStd[d] = sqrtf(state->glimpseTargetStd[d] / (float)numSamples);
+        if (state->glimpseTargetStd[d] < 1e-6f)
         {
-            state->glimpseTargetStd[k] = 1e-6f;
+            state->glimpseTargetStd[d] = 1e-6f;
         }
     }
 
-    TraceLog(LOG_INFO, "Computed glimpse target std (%d joint PCA dims, %d samples)", K, numSamples);
+    TraceLog(LOG_INFO, "Computed glimpse target std (%d toe PCA dims, %d samples)",
+        glimpseDim, numSamples);
 }
 
 static inline void NetworkInitGlimpseFlow(
@@ -1822,7 +1819,7 @@ static inline void NetworkLoadAll(
         {
             futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
         }
-        AnimDatabaseComputeGlimpsePosePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
+        AnimDatabaseComputeGlimpseToePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
     }
 
     const int featureDim = db->featureDim;
@@ -1845,11 +1842,12 @@ static inline void NetworkLoadAll(
         POSE_AE_LATENT_DIM, db);
     NetworkLoadUncondAdvance(state, POSE_AE_LATENT_DIM, folderPath);
     NetworkLoadMonday(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM, folderPath);
-    if (db->pcaGlimpsePoseK > 0 && db->pcaSegmentK > 0)
+    if (db->pcaGlimpseToeK > 0 && db->pcaSegmentK > 0)
     {
-        NetworkLoadGlimpseFlow(state, featureDim, db->pcaGlimpsePoseK, folderPath);
+        const int glimpseDim = db->pcaGlimpseToeK;
+        NetworkLoadGlimpseFlow(state, featureDim, glimpseDim, folderPath);
         NetworkLoadGlimpseDecompressor(
-            state, featureDim, db->pcaGlimpsePoseK, db->pcaSegmentK, folderPath);
+            state, featureDim, glimpseDim, db->pcaSegmentK, folderPath);
     }
     LossHistoryLoad(state, folderPath);
 }
@@ -3418,13 +3416,11 @@ static inline void NetworkTrainGlimpseFlowForTime(
     if (!state->glimpseFlow) return;
     if (budgetSeconds <= 0.0) return;
     if (db->normalizedFeatures.empty()) return;
-    if (db->normalizedPoseGenFeatures.empty()) return;
-    if (db->pcaGlimpsePoseK <= 0) return;
+    if (db->pcaGlimpseToeK <= 0) return;
 
     const int batchSize = 256;
     const int featureDim = db->featureDim;
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    const int K = db->pcaGlimpsePoseK;
+    const int glimpseDim = db->pcaGlimpseToeK;
     const float animDt = db->animFrameTime[0];
     int futureFrames[GLIMPSE_POSE_COUNT];
     for (int i = 0; i < GLIMPSE_POSE_COUNT; ++i)
@@ -3440,12 +3436,12 @@ static inline void NetworkTrainGlimpseFlowForTime(
         while (ElapsedSeconds(start) < budgetSeconds)
         {
             torch::Tensor condBatch = torch::empty({batchSize, featureDim});
-            torch::Tensor x1Batch = torch::empty({batchSize, K});
+            torch::Tensor x1Batch = torch::empty({batchSize, glimpseDim});
             float* cPtr = condBatch.data_ptr<float>();
             float* xPtr = x1Batch.data_ptr<float>();
 
             std::vector<float> rawFeat(featureDim);
-            std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
+            float raw16[GLIMPSE_TOE_RAW_DIM];
             for (int b = 0; b < batchSize; ++b)
             {
                 const int frame = SampleLegalSegmentStartFrame(db);
@@ -3457,35 +3453,29 @@ static inline void NetworkTrainGlimpseFlowForTime(
                     frame, rawFeat.data(), nullptr, nullptr, true);
                 NormalizeFeatureRaw(db, rawFeat.data(), cPtr + b * featureDim);
 
-                // target (x1): concatenate normalized future poses, then joint PCA project
-                for (int p = 0; p < GLIMPSE_POSE_COUNT; ++p)
-                {
-                    std::span<const float> pRow =
-                        db->normalizedPoseGenFeatures.row_view(
-                            frame + futureFrames[p]);
-                    memcpy(concat.data() + p * pgDim, pRow.data(), pgDim * sizeof(float));
-                }
-                PcaProjectGlimpsePose(db, concat.data(), xPtr + b * K);
+                // target: 16 raw toe dims projected to 8 PCA coefficients
+                BuildRawGlimpseToe(db, frame, futureFrames, raw16);
+                PcaProjectGlimpseToe(db, raw16, xPtr + b * glimpseDim);
             }
 
             condBatch = condBatch.to(state->device);
             x1Batch = x1Batch.to(state->device);
 
             // flow matching setup: random time t in [0,1], and a starting noise sample x0.
-            // at t=0 we're at pure noise, at t=1 we should be at the real poses.
+            // at t=0 we're at pure noise, at t=1 we should be at the real data.
             torch::Tensor t = torch::rand(
                 {batchSize, 1},
                 torch::TensorOptions().device(state->device));
             torch::Tensor x0 = torch::randn(
-                {batchSize, K},
+                {batchSize, glimpseDim},
                 torch::TensorOptions().device(state->device));
 
-            // scale the noise to match the per-dim std of the joint PCA targets
+            // scale the noise to match the per-dim std of the targets
             if (!state->glimpseTargetStd.empty())
             {
                 torch::Tensor stdTensor = torch::from_blob(
                     (void*)state->glimpseTargetStd.data(),
-                    {1, K}, torch::kFloat32)
+                    {1, glimpseDim}, torch::kFloat32)
                     .clone().to(state->device);
                 x0 = x0 * stdTensor;
             }
@@ -3530,37 +3520,21 @@ static inline void NetworkTrainGlimpseFlowForTime(
 // glimpse decompressor training: (features, future pose) -> segment
 //---------------------------------------------------------
 
-// GlimpseDecompressor training: given a future pose and current features, predict the
+// GlimpseDecompressor training: given future toe info and current features, predict the
 // full segment of animation that connects "now" to "there".
 //
-// the idea is a two-stage glimpse pipeline:
-//   1. GlimpseFlow:         "where will the body be in 0.3s?"  -> 16 PCA pose coefficients
+// two-stage glimpse pipeline:
+//   1. GlimpseFlow:         "where will the toes go?"  -> 8 toe PCA coefficients
 //   2. GlimpseDecompressor: "ok, fill in the motion to get there" -> 128 PCA segment coefficients
 //
-// both inputs and outputs live in PCA space, but they're different PCAs:
-//
-//   POSE PCA (16 dims): compresses a single future frame of normalized pose features.
-//     this is what the flow produces. it tells the decompressor the "destination" —
-//     a compact snapshot of the future body configuration.
-//
-//   SEGMENT PCA (128 dims): compresses a full segment (~9 frames x ~150 dims = ~1350 floats)
-//     of normalized pose features. this is what the decompressor outputs. it encodes the
-//     entire trajectory from now to the future pose.
-//
-// the conditioning features are the same normalized MM features as the flow uses.
-// they tell the decompressor "what is the character currently doing" — foot positions,
-// velocities, trajectory, etc. these are re-injected at every layer of the network so
-// the decompressor never forgets the current context while synthesizing the segment.
-//
-// so the decompressor sees two things:
-//   - futurePose (16 dims): where we're going   (from flow or from ground truth)
-//   - condition  (featureDim): where we are now  (MM features)
+// the decompressor sees two things:
+//   - glimpseVec (8 dims): toe PCA coefficients (from flow or ground truth)
+//   - condition  (featureDim): where we are now (MM features)
 // and produces:
 //   - segment PCA coefficients (128 dims): the full motion to get there
 //
-// during training we use ground truth pose PCA (not the flow's output) so the
-// decompressor learns from clean targets. the flow gets a headstart before the
-// decompressor starts training, but the decompressor doesn't depend on flow quality.
+// during training we use ground truth toe PCA (not the flow's output) so the
+// decompressor learns from clean targets.
 //
 static inline void NetworkTrainGlimpseDecompressorForTime(
     NetworkState* state,
@@ -3570,13 +3544,12 @@ static inline void NetworkTrainGlimpseDecompressorForTime(
     if (!state->glimpseDecompressor) return;
     if (budgetSeconds <= 0.0) return;
     if (db->normalizedFeatures.empty()) return;
-    if (db->normalizedPoseGenFeatures.empty()) return;
-    if (db->pcaGlimpsePoseK <= 0 || db->pcaSegmentK <= 0) return;
+    if (db->pcaGlimpseToeK <= 0 || db->pcaSegmentK <= 0) return;
 
     const int batchSize = 64;
     const int featureDim = db->featureDim;
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int poseK = db->pcaGlimpsePoseK;
+    const int glimpseDim = db->pcaGlimpseToeK;
     const int segK = db->pcaSegmentK;
     const float animDt = db->animFrameTime[0];
     int futureFrames[GLIMPSE_POSE_COUNT];
@@ -3593,14 +3566,14 @@ static inline void NetworkTrainGlimpseDecompressorForTime(
         while (ElapsedSeconds(start) < budgetSeconds)
         {
             torch::Tensor condBatch = torch::empty({batchSize, featureDim});
-            torch::Tensor poseBatch = torch::empty({batchSize, poseK});
+            torch::Tensor toeBatch = torch::empty({batchSize, glimpseDim});
             torch::Tensor targetBatch = torch::empty({batchSize, segK});
             float* cPtr = condBatch.data_ptr<float>();
-            float* pPtr = poseBatch.data_ptr<float>();
+            float* pPtr = toeBatch.data_ptr<float>();
             float* tPtr = targetBatch.data_ptr<float>();
 
             std::vector<float> rawFeat(featureDim);
-            std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
+            float raw16[GLIMPSE_TOE_RAW_DIM];
             for (int b = 0; b < batchSize; ++b)
             {
                 const int frame = SampleLegalSegmentStartFrame(db);
@@ -3611,30 +3584,22 @@ static inline void NetworkTrainGlimpseDecompressorForTime(
                     frame, rawFeat.data(), nullptr, nullptr, true);
                 NormalizeFeatureRaw(db, rawFeat.data(), cPtr + b * featureDim);
 
-                // future poses: concatenate normalized poses at each glimpse time,
-                // then joint PCA project to K coefficients
-                for (int p = 0; p < GLIMPSE_POSE_COUNT; ++p)
-                {
-                    std::span<const float> pRow =
-                        db->normalizedPoseGenFeatures.row_view(
-                            frame + futureFrames[p]);
-                    memcpy(concat.data() + p * pgDim, pRow.data(), pgDim * sizeof(float));
-                }
-                PcaProjectGlimpsePose(db, concat.data(), pPtr + b * poseK);
+                // toe PCA: 16 raw toe dims projected to 8 coefficients
+                BuildRawGlimpseToe(db, frame, futureFrames, raw16);
+                PcaProjectGlimpseToe(db, raw16, pPtr + b * glimpseDim);
 
-                // target: the full segment starting at this frame (9 frames x ~150 dims),
-                // projected down to 128 PCA coefficients. this is what the decompressor
-                // should output — the complete trajectory encoded in compact form.
+                // target: the full segment starting at this frame,
+                // projected down to 128 PCA coefficients
                 const float* src = db->normalizedPoseGenFeatures.data() + frame * pgDim;
                 PcaProjectSegment(db, src, tPtr + b * segK);
             }
 
             condBatch = condBatch.to(state->device);
-            poseBatch = poseBatch.to(state->device);
+            toeBatch = toeBatch.to(state->device);
             targetBatch = targetBatch.to(state->device);
 
             state->glimpseDecompressorOptimizer->zero_grad();
-            torch::Tensor predicted = state->glimpseDecompressor->forward(poseBatch, condBatch);
+            torch::Tensor predicted = state->glimpseDecompressor->forward(toeBatch, condBatch);
             torch::Tensor loss = torch::mse_loss(predicted, targetBatch);
 
             loss.backward();
@@ -3695,22 +3660,24 @@ static inline double NetworkTrainAll(
         NetworkInitFullFlow(state, db->featureDim, db->poseGenSegmentFlatDim);
     }
 
-    // auto-init glimpse networks immediately (no headstart, operates in joint PCA space)
+    // auto-init glimpse networks immediately (no headstart, operates in toe PCA space)
     if (!state->glimpseFlow && BUDGET_WEIGHT_GLIMPSE_FLOW > 0.0f
-        && db->featureDim > 0 && db->pcaGlimpsePoseK > 0)
+        && db->featureDim > 0 && db->pcaGlimpseToeK > 0)
     {
-        NetworkInitGlimpseFlow(state, db->featureDim, db->pcaGlimpsePoseK);
+        const int glimpseDim = db->pcaGlimpseToeK;
+        NetworkInitGlimpseFlow(state, db->featureDim, glimpseDim);
         ComputeGlimpseTargetStd(state, db);
     }
     // decompressor waits for flow headstart so it never trains on pure noise
     if (!state->glimpseDecompressor && BUDGET_WEIGHT_GLIMPSE_DECOMPRESSOR > 0.0f
-        && db->featureDim > 0 && db->pcaGlimpsePoseK > 0
+        && db->featureDim > 0 && db->pcaGlimpseToeK > 0
         && db->pcaSegmentK > 0
         && state->glimpseFlow
         && state->trainingElapsedSeconds >= GLIMPSE_DECOMPRESSOR_HEADSTART)
     {
+        const int glimpseDim = db->pcaGlimpseToeK;
         NetworkInitGlimpseDecompressor(
-            state, db->featureDim, db->pcaGlimpsePoseK,
+            state, db->featureDim, glimpseDim,
             db->pcaSegmentK);
     }
 
@@ -3924,7 +3891,7 @@ static inline void NetworkInitAllForTraining(
         {
             futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
         }
-        AnimDatabaseComputeGlimpsePosePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
+        AnimDatabaseComputeGlimpseToePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
     }
 
     if (BUDGET_WEIGHT_FEATURE_AE > 0.0f)
@@ -4376,10 +4343,10 @@ static inline bool NetworkPredictFullFlow(
 //     we clamp to data bounds here (unlike training which uses unclamped augmented features)
 //     because at runtime we want to be conservative with out-of-distribution inputs.
 //
-//   step 1: GlimpseFlow — sample future poses in joint PCA space (K dims)
+//   step 1: GlimpseFlow — sample glimpse vector (K PCA + 6 motion dims)
 //     start from shaped noise (gaussian scaled by per-component std, halved for less
 //     randomness) and iteratively push it through the learned velocity field.
-//     after all steps, x contains concatenated PCA vectors for poses at 0.1s and 0.3s.
+//     after all steps, x contains K PCA pose coefficients + 6 displacement/yaw values.
 //
 //   step 1b (optional): reconstruct the last pose (0.3s) for visualization
 //     PCA coefficients -> normalized pose (~150) -> denormalized raw pose (~150)
@@ -4402,11 +4369,11 @@ static inline bool NetworkPredictGlimpse(
     if (!state->glimpseFlow) return false;
     if (!state->glimpseDecompressor) return false;
     if ((int)rawQuery.size() != db->featureDim) return false;
-    if (db->pcaGlimpsePoseK <= 0) return false;
+    if (db->pcaGlimpseToeK <= 0) return false;
 
     const int featureDim = db->featureDim;
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int K = db->pcaGlimpsePoseK;
+    const int glimpseDim = db->pcaGlimpseToeK;
     const int segFrames = db->poseGenSegmentFrameCount;
 
     segment.resize(segFrames, pgDim);
@@ -4423,15 +4390,15 @@ static inline bool NetworkPredictGlimpse(
     {
         torch::NoGradGuard noGrad;
 
-        // step 1: flow — walk from noise to future poses in joint PCA space (K dims).
+        // step 1: flow — walk from noise to 8 toe PCA coefficients.
         // we start at half the distribution-matched noise.
         torch::Tensor x = torch::randn(
-            {1, K}, torch::TensorOptions().device(state->device));
+            {1, glimpseDim}, torch::TensorOptions().device(state->device));
         if (!state->glimpseTargetStd.empty())
         {
             torch::Tensor stdTensor = torch::from_blob(
                 (void*)state->glimpseTargetStd.data(),
-                {1, K}, torch::kFloat32)
+                {1, glimpseDim}, torch::kFloat32)
                 .clone().to(state->device);
             x = x * stdTensor * 0.5f;
         }
@@ -4461,32 +4428,15 @@ static inline bool NetworkPredictGlimpse(
 #endif
         }
 
-        // x is now K joint PCA coefficients encoding all future poses at once
+        // x is now [1, glimpseDim]: 8 toe PCA coefficients
 
-        // step 1b: reconstruct the last pose (0.3s) for visualization if requested
+        // no full pose reconstruction available with toe-only PCA
         if (futurePoseRaw)
         {
-            torch::Tensor xCpu = x.to(torch::kCPU);
-            const float* coeffs = xCpu.data_ptr<float>();
-
-            // reconstruct concatenated poses, take the last pgDim slice (last time point)
-            std::vector<float> concatenated(GLIMPSE_POSE_COUNT * pgDim);
-            PcaReconstructGlimpsePose(db, coeffs, concatenated.data());
-
-            const float* lastPose = concatenated.data() + (GLIMPSE_POSE_COUNT - 1) * pgDim;
-
-            futurePoseRaw->resize(pgDim);
-            for (int d = 0; d < pgDim; ++d)
-            {
-                const float w = db->poseGenFeaturesWeight[d];
-                (*futurePoseRaw)[d] = (w > 1e-10f)
-                    ? (lastPose[d] / w * db->poseGenFeaturesStd[d]
-                       + db->poseGenFeaturesMean[d])
-                    : db->poseGenFeaturesMean[d];
-            }
+            futurePoseRaw->clear();
         }
 
-        // step 2: decompressor takes all K PCA coefficients + features
+        // step 2: decompressor takes toe PCA coefficients + features
         // and produces segment PCA coefficients
         result = state->glimpseDecompressor->forward(x, condTensor);
         result = result.to(torch::kCPU);

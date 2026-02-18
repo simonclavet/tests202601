@@ -101,48 +101,82 @@ static inline void PcaReconstructSegment(
 }
 
 // project concatenated glimpse poses [GLIMPSE_POSE_COUNT * pgDim] to PCA coefficients [K]
-static inline void PcaProjectGlimpsePose(
-    const AnimDatabase* db, const float* concatenatedPoses, float* coeffs)
+// project 16 raw glimpse toe dims to K PCA coefficients
+static inline void PcaProjectGlimpseToe(
+    const AnimDatabase* db, const float* rawToe, float* coeffs)
 {
-    const int K = db->pcaGlimpsePoseK;
-    const int totalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
-    const float* mean = db->pcaGlimpsePoseMean.data();
-    const float* basis = db->pcaGlimpsePoseBasis.data();
+    const int K = db->pcaGlimpseToeK;
+    const float* mean = db->pcaGlimpseToeMean.data();
+    const float* basis = db->pcaGlimpseToeBasis.data();
 
     for (int k = 0; k < K; ++k)
     {
         float dot = 0.0f;
-        const float* row = basis + k * totalDim;
-        for (int d = 0; d < totalDim; ++d)
+        const float* row = basis + k * GLIMPSE_TOE_RAW_DIM;
+        for (int d = 0; d < GLIMPSE_TOE_RAW_DIM; ++d)
         {
-            dot += row[d] * (concatenatedPoses[d] - mean[d]);
+            dot += row[d] * (rawToe[d] - mean[d]);
         }
         coeffs[k] = dot;
     }
 }
 
-// reconstruct concatenated glimpse poses [GLIMPSE_POSE_COUNT * pgDim] from PCA coefficients [K]
-static inline void PcaReconstructGlimpsePose(
-    const AnimDatabase* db, const float* coeffs, float* concatenatedPoses)
+// reconstruct 16 raw glimpse toe dims from K PCA coefficients
+static inline void PcaReconstructGlimpseToe(
+    const AnimDatabase* db, const float* coeffs, float* rawToe)
 {
-    const int K = db->pcaGlimpsePoseK;
-    const int totalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
-    const float* mean = db->pcaGlimpsePoseMean.data();
-    const float* basis = db->pcaGlimpsePoseBasis.data();
+    const int K = db->pcaGlimpseToeK;
+    const float* mean = db->pcaGlimpseToeMean.data();
+    const float* basis = db->pcaGlimpseToeBasis.data();
 
-    for (int d = 0; d < totalDim; ++d)
+    for (int d = 0; d < GLIMPSE_TOE_RAW_DIM; ++d)
     {
-        concatenatedPoses[d] = mean[d];
+        rawToe[d] = mean[d];
     }
     for (int k = 0; k < K; ++k)
     {
         const float c = coeffs[k];
-        const float* row = basis + k * totalDim;
-        for (int d = 0; d < totalDim; ++d)
+        const float* row = basis + k * GLIMPSE_TOE_RAW_DIM;
+        for (int d = 0; d < GLIMPSE_TOE_RAW_DIM; ++d)
         {
-            concatenatedPoses[d] += c * row[d];
+            rawToe[d] += c * row[d];
         }
     }
+}
+
+// build 16 raw toe dims for a given frame: 2 future times x 2 toes x (pos_xz + vel_xz)
+// positions are world toe positions transformed to current root space
+// velocities are rotated from future root space to current root space
+static inline void BuildRawGlimpseToe(
+    const AnimDatabase* db, int frame, const int* futureFrames, float* raw16)
+{
+    const float curYaw = db->magicYaw[frame];
+    const float cosC = cosf(-curYaw);
+    const float sinC = sinf(-curYaw);
+    int idx = 0;
+    for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+    {
+        const int futureF = frame + futureFrames[t];
+        const float deltaYaw = db->magicYaw[futureF] - curYaw;
+        const float cosD = cosf(deltaYaw);
+        const float sinD = sinf(deltaYaw);
+        for (int side : sides)
+        {
+            // position: world toe -> current root space (XZ only)
+            const Vector3 toeWorld =
+                db->jointPositionsAnimSpace.row_view(futureF)[db->toeIndices[side]];
+            const float dx = toeWorld.x - db->magicPosition[frame].x;
+            const float dz = toeWorld.z - db->magicPosition[frame].z;
+            raw16[idx++] = dx * cosC - dz * sinC;
+            raw16[idx++] = dx * sinC + dz * cosC;
+            // velocity: future root space -> current root space (XZ only)
+            const Vector3 vel =
+                db->jointVelocitiesRootSpace.row_view(futureF)[db->toeIndices[side]];
+            raw16[idx++] = vel.x * cosD - vel.z * sinD;
+            raw16[idx++] = vel.x * sinD + vel.z * cosD;
+        }
+    }
+    assert(idx == GLIMPSE_TOE_RAW_DIM);
 }
 
 constexpr int KMEANS_CLUSTER_COUNT = 500;
@@ -425,17 +459,16 @@ static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
 // joint PCA on concatenated glimpse poses.
 // for each sampled frame, concatenates the normalized poses at all future offsets
 // into one [GLIMPSE_POSE_COUNT * pgDim] vector, then runs SVD on that.
-static void AnimDatabaseComputeGlimpsePosePCA(
+static void AnimDatabaseComputeGlimpseToePCA(
     AnimDatabase* db, const int* futureFrames, int futureFrameCount)
 {
-    if (db->pcaGlimpsePoseK > 0) return;  // already computed
-    if (db->poseGenFeaturesComputeDim <= 0) return;
-    if (db->normalizedPoseGenFeatures.empty()) return;
+    if (db->pcaGlimpseToeK > 0) return;  // already computed
+    if (db->jointPositionsAnimSpace.empty()) return;
+    if (db->jointVelocitiesRootSpace.empty()) return;
+    if (db->toeIndices[0] < 0 || db->toeIndices[1] < 0) return;
     assert(futureFrameCount == GLIMPSE_POSE_COUNT);
 
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    const int totalDim = GLIMPSE_POSE_COUNT * pgDim;
-    const int K = PCA_GLIMPSE_POSE_K;
+    const int K = GLIMPSE_TOE_PCA_K;
 
     // find the largest future offset to determine valid starts
     int maxFutureFrame = 0;
@@ -453,25 +486,19 @@ static void AnimDatabaseComputeGlimpsePosePCA(
     }
 
     const int numSamples = numValidStarts * 2;
-    TraceLog(LOG_INFO, "PCA glimpse pose: sampling %d frames (totalDim=%d, K=%d)",
-        numSamples, totalDim, K);
+    TraceLog(LOG_INFO, "PCA glimpse toe: sampling %d frames (rawDim=%d, K=%d)",
+        numSamples, GLIMPSE_TOE_RAW_DIM, K);
 
-    torch::Tensor dataMat = torch::empty({numSamples, totalDim});
+    torch::Tensor dataMat = torch::empty({numSamples, GLIMPSE_TOE_RAW_DIM});
     float* dPtr = dataMat.data_ptr<float>();
     for (int i = 0; i < numSamples; ++i)
     {
         const int frame = SampleLegalSegmentStartFrame(db);
-        float* dst = dPtr + i * totalDim;
-        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
-        {
-            std::span<const float> row =
-                db->normalizedPoseGenFeatures.row_view(frame + futureFrames[t]);
-            memcpy(dst + t * pgDim, row.data(), pgDim * sizeof(float));
-        }
+        BuildRawGlimpseToe(db, frame, futureFrames, dPtr + i * GLIMPSE_TOE_RAW_DIM);
     }
 
     // compute and subtract mean
-    torch::Tensor meanTensor = dataMat.mean(0);  // [totalDim]
+    torch::Tensor meanTensor = dataMat.mean(0);  // [GLIMPSE_TOE_RAW_DIM]
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
     // SVD
@@ -480,20 +507,20 @@ static void AnimDatabaseComputeGlimpsePosePCA(
     torch::Tensor totalVar = S.square().sum();
     torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
     const float varianceExplained = topKVar.item<float>() / totalVar.item<float>() * 100.0f;
-    TraceLog(LOG_INFO, "PCA glimpse pose: top %d of %d components explain %.2f%% of variance",
-        K, totalDim, varianceExplained);
+    TraceLog(LOG_INFO, "PCA glimpse toe: top %d of %d components explain %.2f%% of variance",
+        K, GLIMPSE_TOE_RAW_DIM, varianceExplained);
 
-    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x totalDim]
+    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x GLIMPSE_TOE_RAW_DIM]
 
-    db->pcaGlimpsePoseK = K;
-    db->pcaGlimpsePoseMean.resize(totalDim);
-    memcpy(db->pcaGlimpsePoseMean.data(), meanTensor.data_ptr<float>(),
-        totalDim * sizeof(float));
-    db->pcaGlimpsePoseBasis.resize(K * totalDim);
-    memcpy(db->pcaGlimpsePoseBasis.data(), basisTensor.data_ptr<float>(),
-        K * totalDim * sizeof(float));
+    db->pcaGlimpseToeK = K;
+    db->pcaGlimpseToeMean.resize(GLIMPSE_TOE_RAW_DIM);
+    memcpy(db->pcaGlimpseToeMean.data(), meanTensor.data_ptr<float>(),
+        GLIMPSE_TOE_RAW_DIM * sizeof(float));
+    db->pcaGlimpseToeBasis.resize(K * GLIMPSE_TOE_RAW_DIM);
+    memcpy(db->pcaGlimpseToeBasis.data(), basisTensor.data_ptr<float>(),
+        K * GLIMPSE_TOE_RAW_DIM * sizeof(float));
 
-    TraceLog(LOG_INFO, "PCA glimpse pose: stored basis [%d x %d]", K, totalDim);
+    TraceLog(LOG_INFO, "PCA glimpse toe: stored basis [%d x %d]", K, GLIMPSE_TOE_RAW_DIM);
 }
 
 // save clusters + PCA to a binary file so they don't need to be recomputed
@@ -526,20 +553,20 @@ static void AnimDatabaseSaveDerived(const AnimDatabase* db, const std::string& f
         fwrite(db->pcaSegmentBasis.data(), sizeof(float), db->pcaSegmentK * flatDim, f);
     }
 
-    // glimpse pose PCA (joint, on concatenated poses)
-    fwrite(&db->pcaGlimpsePoseK, sizeof(int), 1, f);
-    const int glimpsePoseTotalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
-    fwrite(&glimpsePoseTotalDim, sizeof(int), 1, f);
-    if (db->pcaGlimpsePoseK > 0)
+    // glimpse toe PCA
+    fwrite(&db->pcaGlimpseToeK, sizeof(int), 1, f);
+    const int glimpseToeDim = GLIMPSE_TOE_RAW_DIM;
+    fwrite(&glimpseToeDim, sizeof(int), 1, f);
+    if (db->pcaGlimpseToeK > 0)
     {
-        fwrite(db->pcaGlimpsePoseMean.data(), sizeof(float), glimpsePoseTotalDim, f);
-        fwrite(db->pcaGlimpsePoseBasis.data(), sizeof(float),
-            db->pcaGlimpsePoseK * glimpsePoseTotalDim, f);
+        fwrite(db->pcaGlimpseToeMean.data(), sizeof(float), glimpseToeDim, f);
+        fwrite(db->pcaGlimpseToeBasis.data(), sizeof(float),
+            db->pcaGlimpseToeK * glimpseToeDim, f);
     }
 
     fclose(f);
-    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + glimpse pose PCA (K=%d) to: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaGlimpsePoseK, path.c_str());
+    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + glimpse toe PCA (K=%d) to: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK, path.c_str());
 }
 
 // load clusters + PCA from file. returns true if successful.
@@ -577,25 +604,24 @@ static bool AnimDatabaseLoadDerived(AnimDatabase* db, const std::string& folderP
         fread(db->pcaSegmentBasis.data(), sizeof(float), K * flatDim, f);
     }
 
-    // glimpse pose PCA (may not exist in older files — check for EOF)
-    int poseK = 0;
-    int poseTotalDim = 0;
-    const int expectedGlimpsePoseDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
-    if (fread(&poseK, sizeof(int), 1, f) == 1 && fread(&poseTotalDim, sizeof(int), 1, f) == 1)
+    // glimpse toe PCA (may not exist in older files — check for EOF)
+    int toeK = 0;
+    int toeDim = 0;
+    if (fread(&toeK, sizeof(int), 1, f) == 1 && fread(&toeDim, sizeof(int), 1, f) == 1)
     {
-        if (poseK > 0 && poseTotalDim == expectedGlimpsePoseDim)
+        if (toeK > 0 && toeDim == GLIMPSE_TOE_RAW_DIM)
         {
-            db->pcaGlimpsePoseK = poseK;
-            db->pcaGlimpsePoseMean.resize(poseTotalDim);
-            fread(db->pcaGlimpsePoseMean.data(), sizeof(float), poseTotalDim, f);
-            db->pcaGlimpsePoseBasis.resize(poseK * poseTotalDim);
-            fread(db->pcaGlimpsePoseBasis.data(), sizeof(float), poseK * poseTotalDim, f);
+            db->pcaGlimpseToeK = toeK;
+            db->pcaGlimpseToeMean.resize(toeDim);
+            fread(db->pcaGlimpseToeMean.data(), sizeof(float), toeDim, f);
+            db->pcaGlimpseToeBasis.resize(toeK * toeDim);
+            fread(db->pcaGlimpseToeBasis.data(), sizeof(float), toeK * toeDim, f);
         }
     }
 
     fclose(f);
-    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + glimpse pose PCA (K=%d) from: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaGlimpsePoseK, path.c_str());
+    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + glimpse toe PCA (K=%d) from: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK, path.c_str());
     return true;
 }
 
@@ -2254,24 +2280,10 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             tempPose.toeVelocitiesRootSpace[side] = jointVelRootSpaceRow[toeIdx];
         }
 
-        // next-frame toe velocities (for MM query: what the feet are about to do)
-        const int nextF = (f + 1 < db->motionFrameCount) ? f + 1 : f;
-        span<const Vector3> nextJointVelRow = db->jointVelocitiesRootSpace.row_view(nextF);
-        for (int side : sides)
-        {
-            const int toeIdx = db->toeIndices[side];
-            tempPose.nextToeVelocitiesRootSpace[side] = nextJointVelRow[toeIdx];
-        }
-
         // current-frame 2D toe position difference (crisp, directly from world positions)
         const Vector3 leftToe = db->toePositionsRootSpace[SIDE_LEFT][f];
         const Vector3 rightToe = db->toePositionsRootSpace[SIDE_RIGHT][f];
         tempPose.toePosDiffRootSpace = { leftToe.x - rightToe.x, 0.0f, leftToe.z - rightToe.z };
-
-        // next-frame toe pos diff (for MM query: what the feet are about to do)
-        const Vector3 nextLeftToe = db->toePositionsRootSpace[SIDE_LEFT][nextF];
-        const Vector3 nextRightToe = db->toePositionsRootSpace[SIDE_RIGHT][nextF];
-        tempPose.nextToePosDiffRootSpace = { nextLeftToe.x - nextRightToe.x, 0.0f, nextLeftToe.z - nextRightToe.z };
 
         // toe speed difference magnitude (always positive — can't regress to zero)
         const float leftSpeedXZ = Vector3Length2D(jointVelRootSpaceRow[db->toeIndices[SIDE_LEFT]]);
@@ -2373,10 +2385,8 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
         {
             weightPose.lookaheadToePositionsRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
             weightPose.toeVelocitiesRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
-            weightPose.nextToeVelocitiesRootSpace[side] = { footPosVelWeight, footPosVelWeight, footPosVelWeight };
         }
         weightPose.toePosDiffRootSpace = { footPosVelWeight, 0.0f, footPosVelWeight };
-        weightPose.nextToePosDiffRootSpace = { footPosVelWeight, 0.0f, footPosVelWeight };
         weightPose.toeSpeedDiff = footPosVelWeight;
 
         db->poseGenFeaturesWeight.resize(pgDim);

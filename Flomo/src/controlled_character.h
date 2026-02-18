@@ -1167,9 +1167,7 @@ static void ControlledCharacterUpdate(
     Vector3 toeBlendedPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedLookaheadPositionRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
-    Vector3 nextToeBlendedVelocityRootSpace[SIDES_COUNT] = { Vector3Zero(), Vector3Zero() };
     Vector3 toeBlendedPosDiffRootSpace = Vector3Zero();
-    Vector3 nextToeBlendedPosDiffRootSpace = Vector3Zero();
     float blendedToeSpeedDiff = 0.0f;
     
     Vector3 blendedRootVelocityRootSpace = Vector3Zero();
@@ -1256,21 +1254,12 @@ static void ControlledCharacterUpdate(
                 poseFeat0.toeVelocitiesRootSpace[side],
                 poseFeat1.toeVelocitiesRootSpace[side], sAlpha);
             toeBlendedVelocityRootSpace[side] = Vector3Add(toeBlendedVelocityRootSpace[side], Vector3Scale(toeVel, w));
-
-            const Vector3 nextToeVel = Vector3Lerp(
-                poseFeat0.nextToeVelocitiesRootSpace[side],
-                poseFeat1.nextToeVelocitiesRootSpace[side], sAlpha);
-            nextToeBlendedVelocityRootSpace[side] = Vector3Add(nextToeBlendedVelocityRootSpace[side], Vector3Scale(nextToeVel, w));
         }
 
         // toe position difference (left - right) in root space
         const Vector3 toePosDiff = Vector3Lerp(
             poseFeat0.toePosDiffRootSpace, poseFeat1.toePosDiffRootSpace, sAlpha);
         toeBlendedPosDiffRootSpace = Vector3Add(toeBlendedPosDiffRootSpace, Vector3Scale(toePosDiff, w));
-
-        const Vector3 nextToePosDiff = Vector3Lerp(
-            poseFeat0.nextToePosDiffRootSpace, poseFeat1.nextToePosDiffRootSpace, sAlpha);
-        nextToeBlendedPosDiffRootSpace = Vector3Add(nextToeBlendedPosDiffRootSpace, Vector3Scale(nextToePosDiff, w));
 
         // toe speed difference magnitude (always positive)
         const float speedDiff = Lerp(poseFeat0.toeSpeedDiff, poseFeat1.toeSpeedDiff, sAlpha);
@@ -1283,14 +1272,12 @@ static void ControlledCharacterUpdate(
     {
         // toes velocity in world space from blended toe velocities in root space
         cc->toeBlendedVelocityWorld[side] = Vector3RotateByQuaternion(toeBlendedVelocityRootSpace[side], cc->worldRotation);
-        cc->nextToeBlendedVelocityWorld[side] = Vector3RotateByQuaternion(nextToeBlendedVelocityRootSpace[side], cc->worldRotation);
         // toes position in world space from blended toe positions in root space
         cc->toeBlendedPositionWorld[side] = Vector3Add(
             Vector3RotateByQuaternion(toeBlendedPositionRootSpace[side], cc->worldRotation),
             cc->worldPosition);
     }
     cc->toeBlendedPosDiffRootSpace = toeBlendedPosDiffRootSpace;
-    cc->nextToeBlendedPosDiffRootSpace = nextToeBlendedPosDiffRootSpace;
     cc->blendedToeSpeedDiff = blendedToeSpeedDiff;
 
     // --- Rot6d blending using normalized weights

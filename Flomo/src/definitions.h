@@ -3,11 +3,14 @@
 //#include "raylib.h"
 
 constexpr int PCA_SEGMENT_K = 128;
-constexpr int PCA_GLIMPSE_POSE_K = 32;
 
 // how many future poses the glimpse flow predicts, and at what times
 constexpr int GLIMPSE_POSE_COUNT = 2;
 constexpr float GLIMPSE_POSE_TIMES[GLIMPSE_POSE_COUNT] = { 0.1f, 0.3f };
+
+// glimpse toe PCA: 2 times x 2 toes x (pos_xz + vel_xz) = 16 raw dims, compressed to 8
+constexpr int GLIMPSE_TOE_RAW_DIM = GLIMPSE_POSE_COUNT * 2 * 4;  // 16
+constexpr int GLIMPSE_TOE_PCA_K = 8;
 
 // Animation playback mode for controlled character
 enum class AnimationMode : int
@@ -318,19 +321,17 @@ struct PoseFeatures
     // Foot IK data (lookahead positions, current velocities for speed clamping)
     Vector3 lookaheadToePositionsRootSpace[SIDES_COUNT];  // [left, right]
     Vector3 toeVelocitiesRootSpace[SIDES_COUNT];          // [left, right] current velocities
-    Vector3 nextToeVelocitiesRootSpace[SIDES_COUNT];      // [left, right] next-frame velocities (for MM query)
 
     // 2D (XZ) difference between left and right toe positions in root space (current frame)
     // crisp direct signal from joint world positions — doesn't go through FK chain
     Vector3 toePosDiffRootSpace;                              // only x,z used; serialized as 2 floats
-    Vector3 nextToePosDiffRootSpace;                          // next-frame toe pos diff (for MM query)
 
     // magnitude of XZ speed difference between left and right toes in root space
     // always >= 0, so the network can't regress it to zero without penalty
     // at runtime we pick the fast foot from blended velocities, then enforce this contrast
     float toeSpeedDiff = 0.0f;
 
-    // flat layout: [jc*6 rotations] [3 rootPos] [2 rootVelXZ] [1 yawRate] [6 toePos] [6 toeVel] [6 nextToeVel] [2 toePosDiff] [2 nextToePosDiff] [1 toeSpeedDiff]
+    // flat layout: [jc*6 rotations] [3 rootPos] [2 rootVelXZ] [1 yawRate] [6 toePos] [6 toeVel] [2 toePosDiff] [1 toeSpeedDiff]
     static int GetDim(int jointCount)
     {
         int dim = 0;
@@ -340,11 +341,9 @@ struct PoseFeatures
         dim += 1;               // rootYawRate (float)
         dim += 3 * 2;           // lookaheadToePositionsRootSpace (Vector3 x 2 sides)
         dim += 3 * 2;           // toeVelocitiesRootSpace (Vector3 x 2 sides)
-        dim += 3 * 2;           // nextToeVelocitiesRootSpace (Vector3 x 2 sides)
         dim += 2;               // toePosDiffRootSpace (XZ only)
-        dim += 2;               // nextToePosDiffRootSpace (XZ only)
         dim += 1;               // toeSpeedDiff (scalar)
-        return dim;             // = jc*6 + 29
+        return dim;             // = jc*6 + 21
     }
 
     void Resize(int jointCount)
@@ -357,10 +356,8 @@ struct PoseFeatures
         {
             lookaheadToePositionsRootSpace[side] = Vector3Zero();
             toeVelocitiesRootSpace[side] = Vector3Zero();
-            nextToeVelocitiesRootSpace[side] = Vector3Zero();
         }
         toePosDiffRootSpace = Vector3Zero();
-        nextToePosDiffRootSpace = Vector3Zero();
         toeSpeedDiff = 0.0f;
     }
 
@@ -401,18 +398,8 @@ struct PoseFeatures
             dest[idx++] = toeVelocitiesRootSpace[side].z;
         }
 
-        for (int side : sides)
-        {
-            dest[idx++] = nextToeVelocitiesRootSpace[side].x;
-            dest[idx++] = nextToeVelocitiesRootSpace[side].y;
-            dest[idx++] = nextToeVelocitiesRootSpace[side].z;
-        }
-
         dest[idx++] = toePosDiffRootSpace.x;
         dest[idx++] = toePosDiffRootSpace.z;
-
-        dest[idx++] = nextToePosDiffRootSpace.x;
-        dest[idx++] = nextToePosDiffRootSpace.z;
 
         dest[idx++] = toeSpeedDiff;
 
@@ -459,20 +446,9 @@ struct PoseFeatures
             toeVelocitiesRootSpace[side].z = src[idx++];
         }
 
-        for (int side : sides)
-        {
-            nextToeVelocitiesRootSpace[side].x = src[idx++];
-            nextToeVelocitiesRootSpace[side].y = src[idx++];
-            nextToeVelocitiesRootSpace[side].z = src[idx++];
-        }
-
         toePosDiffRootSpace.x = src[idx++];
         toePosDiffRootSpace.y = 0.0f;
         toePosDiffRootSpace.z = src[idx++];
-
-        nextToePosDiffRootSpace.x = src[idx++];
-        nextToePosDiffRootSpace.y = 0.0f;
-        nextToePosDiffRootSpace.z = src[idx++];
 
         toeSpeedDiff = src[idx++];
 
@@ -616,10 +592,10 @@ struct AnimDatabase
     std::vector<float> pcaSegmentMean;          // [flatDim] mean of flat normalized segments
     std::vector<float> pcaSegmentBasis;         // [K * flatDim] row-major, each row is a principal component
 
-    // PCA on concatenated glimpse poses (GLIMPSE_POSE_COUNT future poses stacked)
-    int pcaGlimpsePoseK = -1;                          // number of PCA components kept
-    std::vector<float> pcaGlimpsePoseMean;             // [GLIMPSE_POSE_COUNT * pgDim]
-    std::vector<float> pcaGlimpsePoseBasis;            // [K * GLIMPSE_POSE_COUNT * pgDim] row-major
+    // PCA on glimpse toe data (2 times x 2 toes x (pos_xz + vel_xz) = 16 raw dims -> 8)
+    int pcaGlimpseToeK = -1;                           // number of PCA components kept
+    std::vector<float> pcaGlimpseToeMean;              // [GLIMPSE_TOE_RAW_DIM]
+    std::vector<float> pcaGlimpseToeBasis;             // [K * GLIMPSE_TOE_RAW_DIM] row-major
 
     // k-means clusters on normalizedFeatures for stratified training sampling
     // clusterFrames[c] holds the global frame indices belonging to cluster c
@@ -688,9 +664,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->normalizedPoseGenFeatures.clear();
     db->poseGenSegmentFrameCount = -1;
     db->poseGenSegmentFlatDim = -1;
-    db->pcaGlimpsePoseK = -1;
-    db->pcaGlimpsePoseMean.clear();
-    db->pcaGlimpsePoseBasis.clear();
+    db->pcaGlimpseToeK = -1;
+    db->pcaGlimpseToeMean.clear();
+    db->pcaGlimpseToeBasis.clear();
     db->clusterCount = 0;
     db->clusterFrames.clear();
 }
@@ -911,11 +887,9 @@ struct ControlledCharacter {
     Vector3 prevToeGlobalPosPreIK[SIDES_COUNT];   // previous frame positions (before IK)
     Vector3 toeVelocityPreIK[SIDES_COUNT];        // velocity from FK result (before IK)
     Vector3 toeBlendedVelocityWorld[SIDES_COUNT];      // blended from cursor toe velocities (current frame)
-    Vector3 nextToeBlendedVelocityWorld[SIDES_COUNT];  // blended from cursor next-frame toe velocities (for MM query)
     Vector3 toeBlendedPositionWorld[SIDES_COUNT];      // blended from cursor toe positions
     float blendedToeSpeedDiff = 0.0f;                 // from network-predicted pose features
     Vector3 toeBlendedPosDiffRootSpace;                // blended (left-right) toe diff from segments
-    Vector3 nextToeBlendedPosDiffRootSpace;            // blended next-frame toe pos diff (for MM query)
     bool toeTrackingPreIKInitialized = false;
 
     Vector3 prevToeGlobalPos[SIDES_COUNT];        // previous frame positions (after IK)
