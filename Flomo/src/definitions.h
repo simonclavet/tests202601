@@ -3,7 +3,11 @@
 //#include "raylib.h"
 
 constexpr int PCA_SEGMENT_K = 128;
-constexpr int PCA_POSE_K = 16;
+constexpr int PCA_GLIMPSE_POSE_K = 32;
+
+// how many future poses the glimpse flow predicts, and at what times
+constexpr int GLIMPSE_POSE_COUNT = 2;
+constexpr float GLIMPSE_POSE_TIMES[GLIMPSE_POSE_COUNT] = { 0.1f, 0.3f };
 
 // Animation playback mode for controlled character
 enum class AnimationMode : int
@@ -612,10 +616,10 @@ struct AnimDatabase
     std::vector<float> pcaSegmentMean;          // [flatDim] mean of flat normalized segments
     std::vector<float> pcaSegmentBasis;         // [K * flatDim] row-major, each row is a principal component
 
-    // PCA on single-frame normalized pose features (for glimpse flow conditioning)
-    int pcaPoseK = -1;                          // number of PCA components kept
-    std::vector<float> pcaPoseMean;             // [pgDim] mean of normalized pose features
-    std::vector<float> pcaPoseBasis;            // [K * pgDim] row-major
+    // PCA on concatenated glimpse poses (GLIMPSE_POSE_COUNT future poses stacked)
+    int pcaGlimpsePoseK = -1;                          // number of PCA components kept
+    std::vector<float> pcaGlimpsePoseMean;             // [GLIMPSE_POSE_COUNT * pgDim]
+    std::vector<float> pcaGlimpsePoseBasis;            // [K * GLIMPSE_POSE_COUNT * pgDim] row-major
 
     // k-means clusters on normalizedFeatures for stratified training sampling
     // clusterFrames[c] holds the global frame indices belonging to cluster c
@@ -684,9 +688,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->normalizedPoseGenFeatures.clear();
     db->poseGenSegmentFrameCount = -1;
     db->poseGenSegmentFlatDim = -1;
-    db->pcaPoseK = -1;
-    db->pcaPoseMean.clear();
-    db->pcaPoseBasis.clear();
+    db->pcaGlimpsePoseK = -1;
+    db->pcaGlimpsePoseMean.clear();
+    db->pcaGlimpsePoseBasis.clear();
     db->clusterCount = 0;
     db->clusterFrames.clear();
 }

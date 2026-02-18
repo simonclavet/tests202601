@@ -100,47 +100,47 @@ static inline void PcaReconstructSegment(
     }
 }
 
-// project a single-frame normalized pose [pgDim] to PCA coefficients [pcaPoseK]
-static inline void PcaProjectPose(
-    const AnimDatabase* db, const float* normalizedPose, float* coeffs)
+// project concatenated glimpse poses [GLIMPSE_POSE_COUNT * pgDim] to PCA coefficients [K]
+static inline void PcaProjectGlimpsePose(
+    const AnimDatabase* db, const float* concatenatedPoses, float* coeffs)
 {
-    const int K = db->pcaPoseK;
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    const float* mean = db->pcaPoseMean.data();
-    const float* basis = db->pcaPoseBasis.data();
+    const int K = db->pcaGlimpsePoseK;
+    const int totalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
+    const float* mean = db->pcaGlimpsePoseMean.data();
+    const float* basis = db->pcaGlimpsePoseBasis.data();
 
     for (int k = 0; k < K; ++k)
     {
         float dot = 0.0f;
-        const float* row = basis + k * pgDim;
-        for (int d = 0; d < pgDim; ++d)
+        const float* row = basis + k * totalDim;
+        for (int d = 0; d < totalDim; ++d)
         {
-            dot += row[d] * (normalizedPose[d] - mean[d]);
+            dot += row[d] * (concatenatedPoses[d] - mean[d]);
         }
         coeffs[k] = dot;
     }
 }
 
-// reconstruct a normalized pose [pgDim] from PCA coefficients [pcaPoseK]
-static inline void PcaReconstructPose(
-    const AnimDatabase* db, const float* coeffs, float* normalizedPose)
+// reconstruct concatenated glimpse poses [GLIMPSE_POSE_COUNT * pgDim] from PCA coefficients [K]
+static inline void PcaReconstructGlimpsePose(
+    const AnimDatabase* db, const float* coeffs, float* concatenatedPoses)
 {
-    const int K = db->pcaPoseK;
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    const float* mean = db->pcaPoseMean.data();
-    const float* basis = db->pcaPoseBasis.data();
+    const int K = db->pcaGlimpsePoseK;
+    const int totalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
+    const float* mean = db->pcaGlimpsePoseMean.data();
+    const float* basis = db->pcaGlimpsePoseBasis.data();
 
-    for (int d = 0; d < pgDim; ++d)
+    for (int d = 0; d < totalDim; ++d)
     {
-        normalizedPose[d] = mean[d];
+        concatenatedPoses[d] = mean[d];
     }
     for (int k = 0; k < K; ++k)
     {
         const float c = coeffs[k];
-        const float* row = basis + k * pgDim;
-        for (int d = 0; d < pgDim; ++d)
+        const float* row = basis + k * totalDim;
+        for (int d = 0; d < totalDim; ++d)
         {
-            normalizedPose[d] += c * row[d];
+            concatenatedPoses[d] += c * row[d];
         }
     }
 }
@@ -422,45 +422,56 @@ static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
     TraceLog(LOG_INFO, "PCA segment: stored basis [%d x %d]", K, flatDim);
 }
 
-// PCA on single-frame normalized pose features at the glimpse future offset.
-// uses cluster-weighted sampling, same approach as segment PCA.
-// futureFrame = how many frames ahead (caller computes from GLIMPSE_FUTURE_TIME / frameTime).
-static void AnimDatabaseComputePosePCA(AnimDatabase* db, int futureFrame)
+// joint PCA on concatenated glimpse poses.
+// for each sampled frame, concatenates the normalized poses at all future offsets
+// into one [GLIMPSE_POSE_COUNT * pgDim] vector, then runs SVD on that.
+static void AnimDatabaseComputeGlimpsePosePCA(
+    AnimDatabase* db, const int* futureFrames, int futureFrameCount)
 {
-    if (db->pcaPoseK > 0) return;  // already computed
+    if (db->pcaGlimpsePoseK > 0) return;  // already computed
     if (db->poseGenFeaturesComputeDim <= 0) return;
     if (db->normalizedPoseGenFeatures.empty()) return;
+    assert(futureFrameCount == GLIMPSE_POSE_COUNT);
 
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int K = PCA_POSE_K;
+    const int totalDim = GLIMPSE_POSE_COUNT * pgDim;
+    const int K = PCA_GLIMPSE_POSE_K;
 
-    // count valid starts (same as segment PCA — frames where frame+futureFrame is in same clip)
+    // find the largest future offset to determine valid starts
+    int maxFutureFrame = 0;
+    for (int i = 0; i < futureFrameCount; ++i)
+    {
+        if (futureFrames[i] > maxFutureFrame) maxFutureFrame = futureFrames[i];
+    }
+
+    // count valid starts (frames where frame + maxFutureFrame is in same clip)
     int numValidStarts = 0;
     for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
     {
-        const int room = db->clipEndFrame[c] - db->clipStartFrame[c] - futureFrame;
+        const int room = db->clipEndFrame[c] - db->clipStartFrame[c] - maxFutureFrame;
         if (room >= 0) numValidStarts += room + 1;
     }
 
     const int numSamples = numValidStarts * 2;
-    TraceLog(LOG_INFO, "PCA pose: sampling %d frames cluster-weighted (pgDim=%d, K=%d)",
-        numSamples, pgDim, K);
+    TraceLog(LOG_INFO, "PCA glimpse pose: sampling %d frames (totalDim=%d, K=%d)",
+        numSamples, totalDim, K);
 
-    torch::Tensor dataMat = torch::empty({numSamples, pgDim});
+    torch::Tensor dataMat = torch::empty({numSamples, totalDim});
     float* dPtr = dataMat.data_ptr<float>();
     for (int i = 0; i < numSamples; ++i)
     {
         const int frame = SampleLegalSegmentStartFrame(db);
-
-        // the future pose frame — SampleLegalSegmentStartFrame guarantees enough room
-        // for a full segment, and futureFrame <= segFrames, so frame+futureFrame is valid
-        std::span<const float> row =
-            db->normalizedPoseGenFeatures.row_view(frame + futureFrame);
-        memcpy(dPtr + i * pgDim, row.data(), pgDim * sizeof(float));
+        float* dst = dPtr + i * totalDim;
+        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+        {
+            std::span<const float> row =
+                db->normalizedPoseGenFeatures.row_view(frame + futureFrames[t]);
+            memcpy(dst + t * pgDim, row.data(), pgDim * sizeof(float));
+        }
     }
 
     // compute and subtract mean
-    torch::Tensor meanTensor = dataMat.mean(0);  // [pgDim]
+    torch::Tensor meanTensor = dataMat.mean(0);  // [totalDim]
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
     // SVD
@@ -469,17 +480,20 @@ static void AnimDatabaseComputePosePCA(AnimDatabase* db, int futureFrame)
     torch::Tensor totalVar = S.square().sum();
     torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
     const float varianceExplained = topKVar.item<float>() / totalVar.item<float>() * 100.0f;
-    TraceLog(LOG_INFO, "PCA pose: top %d components explain %.2f%% of variance", K, varianceExplained);
+    TraceLog(LOG_INFO, "PCA glimpse pose: top %d of %d components explain %.2f%% of variance",
+        K, totalDim, varianceExplained);
 
-    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x pgDim]
+    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();  // [K x totalDim]
 
-    db->pcaPoseK = K;
-    db->pcaPoseMean.resize(pgDim);
-    memcpy(db->pcaPoseMean.data(), meanTensor.data_ptr<float>(), pgDim * sizeof(float));
-    db->pcaPoseBasis.resize(K * pgDim);
-    memcpy(db->pcaPoseBasis.data(), basisTensor.data_ptr<float>(), K * pgDim * sizeof(float));
+    db->pcaGlimpsePoseK = K;
+    db->pcaGlimpsePoseMean.resize(totalDim);
+    memcpy(db->pcaGlimpsePoseMean.data(), meanTensor.data_ptr<float>(),
+        totalDim * sizeof(float));
+    db->pcaGlimpsePoseBasis.resize(K * totalDim);
+    memcpy(db->pcaGlimpsePoseBasis.data(), basisTensor.data_ptr<float>(),
+        K * totalDim * sizeof(float));
 
-    TraceLog(LOG_INFO, "PCA pose: stored basis [%d x %d]", K, pgDim);
+    TraceLog(LOG_INFO, "PCA glimpse pose: stored basis [%d x %d]", K, totalDim);
 }
 
 // save clusters + PCA to a binary file so they don't need to be recomputed
@@ -512,19 +526,20 @@ static void AnimDatabaseSaveDerived(const AnimDatabase* db, const std::string& f
         fwrite(db->pcaSegmentBasis.data(), sizeof(float), db->pcaSegmentK * flatDim, f);
     }
 
-    // pose PCA
-    fwrite(&db->pcaPoseK, sizeof(int), 1, f);
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    fwrite(&pgDim, sizeof(int), 1, f);
-    if (db->pcaPoseK > 0)
+    // glimpse pose PCA (joint, on concatenated poses)
+    fwrite(&db->pcaGlimpsePoseK, sizeof(int), 1, f);
+    const int glimpsePoseTotalDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
+    fwrite(&glimpsePoseTotalDim, sizeof(int), 1, f);
+    if (db->pcaGlimpsePoseK > 0)
     {
-        fwrite(db->pcaPoseMean.data(), sizeof(float), pgDim, f);
-        fwrite(db->pcaPoseBasis.data(), sizeof(float), db->pcaPoseK * pgDim, f);
+        fwrite(db->pcaGlimpsePoseMean.data(), sizeof(float), glimpsePoseTotalDim, f);
+        fwrite(db->pcaGlimpsePoseBasis.data(), sizeof(float),
+            db->pcaGlimpsePoseK * glimpsePoseTotalDim, f);
     }
 
     fclose(f);
-    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + pose PCA (K=%d) to: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaPoseK, path.c_str());
+    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + glimpse pose PCA (K=%d) to: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpsePoseK, path.c_str());
 }
 
 // load clusters + PCA from file. returns true if successful.
@@ -562,40 +577,45 @@ static bool AnimDatabaseLoadDerived(AnimDatabase* db, const std::string& folderP
         fread(db->pcaSegmentBasis.data(), sizeof(float), K * flatDim, f);
     }
 
-    // pose PCA (may not exist in older files — check for EOF)
+    // glimpse pose PCA (may not exist in older files — check for EOF)
     int poseK = 0;
-    int pgDim = 0;
-    if (fread(&poseK, sizeof(int), 1, f) == 1 && fread(&pgDim, sizeof(int), 1, f) == 1)
+    int poseTotalDim = 0;
+    const int expectedGlimpsePoseDim = GLIMPSE_POSE_COUNT * db->poseGenFeaturesComputeDim;
+    if (fread(&poseK, sizeof(int), 1, f) == 1 && fread(&poseTotalDim, sizeof(int), 1, f) == 1)
     {
-        if (poseK > 0 && pgDim == db->poseGenFeaturesComputeDim)
+        if (poseK > 0 && poseTotalDim == expectedGlimpsePoseDim)
         {
-            db->pcaPoseK = poseK;
-            db->pcaPoseMean.resize(pgDim);
-            fread(db->pcaPoseMean.data(), sizeof(float), pgDim, f);
-            db->pcaPoseBasis.resize(poseK * pgDim);
-            fread(db->pcaPoseBasis.data(), sizeof(float), poseK * pgDim, f);
+            db->pcaGlimpsePoseK = poseK;
+            db->pcaGlimpsePoseMean.resize(poseTotalDim);
+            fread(db->pcaGlimpsePoseMean.data(), sizeof(float), poseTotalDim, f);
+            db->pcaGlimpsePoseBasis.resize(poseK * poseTotalDim);
+            fread(db->pcaGlimpsePoseBasis.data(), sizeof(float), poseK * poseTotalDim, f);
         }
     }
 
     fclose(f);
-    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + pose PCA (K=%d) from: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaPoseK, path.c_str());
+    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + glimpse pose PCA (K=%d) from: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpsePoseK, path.c_str());
     return true;
 }
 
 // Compute raw (un-normalized) MM features for a single frame.
-// If populateNames is true, pushes feature names and types into db (call once on first frame).
+// If outNames/outTypes are non-null, pushes feature names and types (call once on first frame).
 // If doAugmentation is true, applies structured noise to future-facing features.
 static inline void ComputeRawFeaturesForFrame(
-    AnimDatabase* db,
+    const AnimDatabase* db,
     const MotionMatchingFeaturesConfig& cfg,
     int frame,
     float* outFeatures,
-    bool populateNames,
+    std::vector<std::string>* outNames,
+    std::vector<FeatureType>* outTypes,
     bool doAugmentation)
 {
     using std::string;
     using std::span;
+
+    assert((outNames == nullptr) == (outTypes == nullptr));
+    const bool populateNames = (outNames != nullptr);
 
     const int f = frame;
     const int clipIdx = FindClipForMotionFrame(db, f);
@@ -668,14 +688,14 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("LeftToePosX"));
-            db->featureNames.push_back(string("LeftToePosZ"));
-            db->featureNames.push_back(string("RightToePosX"));
-            db->featureNames.push_back(string("RightToePosZ"));
-            db->featureTypes.push_back(FeatureType::ToePos);
-            db->featureTypes.push_back(FeatureType::ToePos);
-            db->featureTypes.push_back(FeatureType::ToePos);
-            db->featureTypes.push_back(FeatureType::ToePos);
+            outNames->push_back(string("LeftToePosX"));
+            outNames->push_back(string("LeftToePosZ"));
+            outNames->push_back(string("RightToePosX"));
+            outNames->push_back(string("RightToePosZ"));
+            outTypes->push_back(FeatureType::ToePos);
+            outTypes->push_back(FeatureType::ToePos);
+            outTypes->push_back(FeatureType::ToePos);
+            outTypes->push_back(FeatureType::ToePos);
         }
     }
 
@@ -711,14 +731,14 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("LeftToeVelX"));
-            db->featureNames.push_back(string("LeftToeVelZ"));
-            db->featureNames.push_back(string("RightToeVelX"));
-            db->featureNames.push_back(string("RightToeVelZ"));
-            db->featureTypes.push_back(FeatureType::ToeVel);
-            db->featureTypes.push_back(FeatureType::ToeVel);
-            db->featureTypes.push_back(FeatureType::ToeVel);
-            db->featureTypes.push_back(FeatureType::ToeVel);
+            outNames->push_back(string("LeftToeVelX"));
+            outNames->push_back(string("LeftToeVelZ"));
+            outNames->push_back(string("RightToeVelX"));
+            outNames->push_back(string("RightToeVelZ"));
+            outTypes->push_back(FeatureType::ToeVel);
+            outTypes->push_back(FeatureType::ToeVel);
+            outTypes->push_back(FeatureType::ToeVel);
+            outTypes->push_back(FeatureType::ToeVel);
         }
     }
 
@@ -730,10 +750,10 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("ToePosDiffX"));
-            db->featureNames.push_back(string("ToePosDiffZ"));
-            db->featureTypes.push_back(FeatureType::ToePosDiff);
-            db->featureTypes.push_back(FeatureType::ToePosDiff);
+            outNames->push_back(string("ToePosDiffX"));
+            outNames->push_back(string("ToePosDiffZ"));
+            outTypes->push_back(FeatureType::ToePosDiff);
+            outTypes->push_back(FeatureType::ToePosDiff);
         }
     }
 
@@ -758,10 +778,10 @@ static inline void ComputeRawFeaturesForFrame(
                 char nameBufZ[64];
                 snprintf(nameBufX, sizeof(nameBufX), "FutureVelX_%.2fs", futureTime);
                 snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelZ_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBufX));
-                db->featureNames.push_back(string(nameBufZ));
-                db->featureTypes.push_back(FeatureType::FutureVel);
-                db->featureTypes.push_back(FeatureType::FutureVel);
+                outNames->push_back(string(nameBufX));
+                outNames->push_back(string(nameBufZ));
+                outTypes->push_back(FeatureType::FutureVel);
+                outTypes->push_back(FeatureType::FutureVel);
             }
         }
     }
@@ -796,10 +816,10 @@ static inline void ComputeRawFeaturesForFrame(
                 char nameBufZ[64];
                 snprintf(nameBufX, sizeof(nameBufX), "FutureVelClampedX_%.2fs", futureTime);
                 snprintf(nameBufZ, sizeof(nameBufZ), "FutureVelClampedZ_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBufX));
-                db->featureNames.push_back(string(nameBufZ));
-                db->featureTypes.push_back(FeatureType::FutureVelClamped);
-                db->featureTypes.push_back(FeatureType::FutureVelClamped);
+                outNames->push_back(string(nameBufX));
+                outNames->push_back(string(nameBufZ));
+                outTypes->push_back(FeatureType::FutureVelClamped);
+                outTypes->push_back(FeatureType::FutureVelClamped);
             }
         }
     }
@@ -822,8 +842,8 @@ static inline void ComputeRawFeaturesForFrame(
             {
                 char nameBuf[64];
                 snprintf(nameBuf, sizeof(nameBuf), "FutureSpeed_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBuf));
-                db->featureTypes.push_back(FeatureType::FutureSpeed);
+                outNames->push_back(string(nameBuf));
+                outTypes->push_back(FeatureType::FutureSpeed);
             }
         }
     }
@@ -841,10 +861,10 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("PastPosX"));
-            db->featureNames.push_back(string("PastPosZ"));
-            db->featureTypes.push_back(FeatureType::PastPosition);
-            db->featureTypes.push_back(FeatureType::PastPosition);
+            outNames->push_back(string("PastPosX"));
+            outNames->push_back(string("PastPosZ"));
+            outTypes->push_back(FeatureType::PastPosition);
+            outTypes->push_back(FeatureType::PastPosition);
         }
     }
 
@@ -874,10 +894,10 @@ static inline void ComputeRawFeaturesForFrame(
                 char nameBufZ[64];
                 snprintf(nameBufX, sizeof(nameBufX), "FutureAimDirX_%.2fs", futureTime);
                 snprintf(nameBufZ, sizeof(nameBufZ), "FutureAimDirZ_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBufX));
-                db->featureNames.push_back(string(nameBufZ));
-                db->featureTypes.push_back(FeatureType::FutureAimDirection);
-                db->featureTypes.push_back(FeatureType::FutureAimDirection);
+                outNames->push_back(string(nameBufX));
+                outNames->push_back(string(nameBufZ));
+                outTypes->push_back(FeatureType::FutureAimDirection);
+                outTypes->push_back(FeatureType::FutureAimDirection);
             }
         }
     }
@@ -898,8 +918,8 @@ static inline void ComputeRawFeaturesForFrame(
             {
                 char nameBuf[64];
                 snprintf(nameBuf, sizeof(nameBuf), "FutureAimVel_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBuf));
-                db->featureTypes.push_back(FeatureType::FutureAimVelocity);
+                outNames->push_back(string(nameBuf));
+                outTypes->push_back(FeatureType::FutureAimVelocity);
             }
         }
     }
@@ -948,10 +968,10 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("HeadToSlowestToeX"));
-            db->featureNames.push_back(string("HeadToSlowestToeZ"));
-            db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
-            db->featureTypes.push_back(FeatureType::HeadToSlowestToe);
+            outNames->push_back(string("HeadToSlowestToeX"));
+            outNames->push_back(string("HeadToSlowestToeZ"));
+            outTypes->push_back(FeatureType::HeadToSlowestToe);
+            outTypes->push_back(FeatureType::HeadToSlowestToe);
         }
     }
 
@@ -974,10 +994,10 @@ static inline void ComputeRawFeaturesForFrame(
 
         if (populateNames)
         {
-            db->featureNames.push_back(string("HeadToToeAvgX"));
-            db->featureNames.push_back(string("HeadToToeAvgZ"));
-            db->featureTypes.push_back(FeatureType::HeadToToeAverage);
-            db->featureTypes.push_back(FeatureType::HeadToToeAverage);
+            outNames->push_back(string("HeadToToeAvgX"));
+            outNames->push_back(string("HeadToToeAvgZ"));
+            outTypes->push_back(FeatureType::HeadToToeAverage);
+            outTypes->push_back(FeatureType::HeadToToeAverage);
         }
     }
 
@@ -1017,10 +1037,10 @@ static inline void ComputeRawFeaturesForFrame(
                 char nameBufZ[64];
                 snprintf(nameBufX, sizeof(nameBufX), "FutureAccelClampedX_%.2fs", futureTime);
                 snprintf(nameBufZ, sizeof(nameBufZ), "FutureAccelClampedZ_%.2fs", futureTime);
-                db->featureNames.push_back(string(nameBufX));
-                db->featureNames.push_back(string(nameBufZ));
-                db->featureTypes.push_back(FeatureType::FutureAccelClamped);
-                db->featureTypes.push_back(FeatureType::FutureAccelClamped);
+                outNames->push_back(string(nameBufX));
+                outNames->push_back(string(nameBufZ));
+                outTypes->push_back(FeatureType::FutureAccelClamped);
+                outTypes->push_back(FeatureType::FutureAccelClamped);
             }
         }
     }
@@ -2088,7 +2108,12 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     for (int f = 0; f < db->motionFrameCount; ++f)
     {
         float* featRow = db->features.row_view(f).data();
-        ComputeRawFeaturesForFrame(db, cfg, f, featRow, /*populateNames=*/ f == 0, /*doAugmentation=*/ false);
+        const bool isFirstFrame = (f == 0);
+        ComputeRawFeaturesForFrame(
+            db, cfg, f, featRow,
+            isFirstFrame ? &db->featureNames : nullptr,
+            isFirstFrame ? &db->featureTypes : nullptr,
+            false);
     }
 
 

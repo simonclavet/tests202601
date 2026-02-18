@@ -1,20 +1,13 @@
 # Flomo Project Guidelines
 
 ## Project Overview
-Flomo is a BVH/FBX animation file viewer with CUDA and LibTorch integration. Originally ported from orangeduck's BVHView (C) to C++, using raylib for rendering and raygui for UI.
-
-## Features
-- Load and view BVH animation files
-- Load and view FBX animation files (via ufbx library)
-- Convert FBX to BVH via command line: `flomo.exe -fbx2bvh input.fbx`
-- CUDA acceleration
-- LibTorch integration (for future ML features)
+Flomo is a BVH/FBX animation file viewer with CUDA and LibTorch integration. It is also a motion matching, and neural network animation system.
 
 ## Build System
 - **CMake** (minimum 3.21)
 - **C++20** standard, **CUDA 17**
 - **Visual Studio 2022** generator on Windows
-- Dependencies in `thirdparty/` (no downloads during build)
+- Dependencies in `thirdparty/` (no downloads during build), download with setup_dependencies.ps1
 
 ### Build Commands
 ```bash
@@ -80,6 +73,7 @@ possible for any new - Prefer `int` as the main integer type (don't warn about s
 - always use braces for if/for/while
 - when writing comments, be casual, no need for things like ---- and other heading decorations like numbers or letters for steps
 - no need for private and public. Use structs only, unless when we really want to.
+- Use the more explicit "if (somePointer != nullptr)" instead of "if (somePointer)"
 - I like small helpers that can really be shared, but not helpers that are just hiding important logic. 
 - And I also sometimes like very long functions, for the main interesting parts of the program. I dont want to have a function that does important things, that is called only once from an other important function that does important things. Important and complicated things should not be hidden, they should be there, in plain sight, showing what they are doing. 
 - Try to keep things simple. If you spot opportunities for removing abstractions, deadcode, unecessary complications, tell the human about it.

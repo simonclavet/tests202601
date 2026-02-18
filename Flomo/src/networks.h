@@ -32,7 +32,6 @@ constexpr float BUDGET_WEIGHT_UNCOND_ADVANCE = 0.0f;
 constexpr float BUDGET_WEIGHT_MONDAY = 0.0f;
 constexpr float BUDGET_WEIGHT_GLIMPSE_FLOW = 1.0f;
 constexpr float BUDGET_WEIGHT_GLIMPSE_DECOMPRESSOR = 1.0f;
-constexpr float GLIMPSE_FUTURE_TIME = 0.3f;
 constexpr float GLIMPSE_DECOMPRESSOR_HEADSTART = 60.0f;
 
 // switch between ReLU and GELU for all networks
@@ -41,8 +40,8 @@ constexpr float GLIMPSE_DECOMPRESSOR_HEADSTART = 60.0f;
     #define NN_ACTIVATION() torch::nn::GELU()
     #define nn_activate(x) torch::gelu(x)
 #else
-    #define NN_ACTIVATION() NN_ACTIVATION()
-    #define nn_activate(x) nn_activate(x)
+    #define NN_ACTIVATION() torch::nn::RELU()
+    #define nn_activate(x) torch::relu(x)
 #endif
 
 // Flow matching mode: if defined, predict delta from average latent (condition on avgLatent)
@@ -1483,32 +1482,41 @@ static inline void NetworkLoadFullFlow(
 // glimpse flow: noise -> single future poseFeature
 //---------------------------------------------------------
 
-// compute per-dim std of normalizedPoseGenFeatures for glimpse noise scaling
-// mean is zero by construction, so std = sqrt(E[x^2])
-// compute per-dim std of PCA-projected future poses for noise scaling in glimpse flow.
-// the flow operates in PCA pose space (pcaPoseK dims).
+// compute per-dim std of joint-PCA-projected concatenated glimpse poses for noise scaling.
+// the flow operates in pcaGlimpsePoseK dims (joint PCA of all future poses concatenated).
 static inline void ComputeGlimpseTargetStd(
     NetworkState* state,
     const AnimDatabase* db)
 {
-    const int K = db->pcaPoseK;
-    const int pgDim = db->poseGenFeaturesComputeDim;
-    const int futureFrame = (int)roundf(GLIMPSE_FUTURE_TIME / db->animFrameTime[0]);
-    if (K <= 0 || pgDim <= 0) return;
+    const int K = db->pcaGlimpsePoseK;
+    if (K <= 0 || db->poseGenFeaturesComputeDim <= 0) return;
 
-    // sample a bunch of frames, project to PCA, compute std
-    const int sampleCount = std::min(10000, (int)db->legalStartFrames.size());
-    if (sampleCount <= 0) return;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const float animDt = db->animFrameTime[0];
+
+    int futureFrames[GLIMPSE_POSE_COUNT];
+    for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+    {
+        futureFrames[t] = (int)roundf(GLIMPSE_POSE_TIMES[t] / animDt);
+    }
+
+    const int numSamples = std::min(10000, (int)db->legalStartFrames.size());
+    if (numSamples <= 0) return;
 
     state->glimpseTargetStd.assign(K, 0.0f);
+    std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
     std::vector<float> coeffs(K);
 
-    for (int i = 0; i < sampleCount; ++i)
+    for (int i = 0; i < numSamples; ++i)
     {
         const int frame = SampleLegalSegmentStartFrame(db);
-        std::span<const float> row =
-            db->normalizedPoseGenFeatures.row_view(frame + futureFrame);
-        PcaProjectPose(db, row.data(), coeffs.data());
+        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+        {
+            std::span<const float> row =
+                db->normalizedPoseGenFeatures.row_view(frame + futureFrames[t]);
+            memcpy(concat.data() + t * pgDim, row.data(), pgDim * sizeof(float));
+        }
+        PcaProjectGlimpsePose(db, concat.data(), coeffs.data());
         for (int k = 0; k < K; ++k)
         {
             state->glimpseTargetStd[k] += coeffs[k] * coeffs[k];
@@ -1517,14 +1525,14 @@ static inline void ComputeGlimpseTargetStd(
 
     for (int k = 0; k < K; ++k)
     {
-        state->glimpseTargetStd[k] = sqrtf(state->glimpseTargetStd[k] / (float)sampleCount);
+        state->glimpseTargetStd[k] = sqrtf(state->glimpseTargetStd[k] / (float)numSamples);
         if (state->glimpseTargetStd[k] < 1e-6f)
         {
             state->glimpseTargetStd[k] = 1e-6f;
         }
     }
 
-    TraceLog(LOG_INFO, "Computed glimpse target std (%d PCA dims)", K);
+    TraceLog(LOG_INFO, "Computed glimpse target std (%d joint PCA dims, %d samples)", K, numSamples);
 }
 
 static inline void NetworkInitGlimpseFlow(
@@ -1806,10 +1814,15 @@ static inline void NetworkLoadAll(
             AnimDatabaseClusterFeatures2(db);
         AnimDatabaseComputeSegmentPCA(db);
     }
-    // pose PCA may be missing from older derived files — compute if needed
+    // glimpse pose PCA may be missing from older derived files — compute if needed
     {
-        const int futureFrame = (int)roundf(GLIMPSE_FUTURE_TIME / db->animFrameTime[0]);
-        AnimDatabaseComputePosePCA(db, futureFrame);
+        const float animDt = db->animFrameTime[0];
+        int futureFrames[GLIMPSE_POSE_COUNT];
+        for (int i = 0; i < GLIMPSE_POSE_COUNT; ++i)
+        {
+            futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
+        }
+        AnimDatabaseComputeGlimpsePosePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
     }
 
     const int featureDim = db->featureDim;
@@ -1832,11 +1845,11 @@ static inline void NetworkLoadAll(
         POSE_AE_LATENT_DIM, db);
     NetworkLoadUncondAdvance(state, POSE_AE_LATENT_DIM, folderPath);
     NetworkLoadMonday(state, FEATURE_AE_LATENT_DIM, POSE_AE_LATENT_DIM, folderPath);
-    if (db->pcaPoseK > 0 && db->pcaSegmentK > 0)
+    if (db->pcaGlimpsePoseK > 0 && db->pcaSegmentK > 0)
     {
-        NetworkLoadGlimpseFlow(state, featureDim, db->pcaPoseK, folderPath);
+        NetworkLoadGlimpseFlow(state, featureDim, db->pcaGlimpsePoseK, folderPath);
         NetworkLoadGlimpseDecompressor(
-            state, featureDim, db->pcaPoseK, db->pcaSegmentK, folderPath);
+            state, featureDim, db->pcaGlimpsePoseK, db->pcaSegmentK, folderPath);
     }
     LossHistoryLoad(state, folderPath);
 }
@@ -1901,8 +1914,10 @@ static inline void NetworkTrainFeatureAEForTime(
             state->featureAEOptimizer->step();
 
             state->featureAELoss = loss.item<float>();
-            state->featureAELossSmoothed = state->featureAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->featureAELoss * LOSS_SMOOTHING_FACTOR;
+            state->featureAELossSmoothed = state->featureAEIterations == 0
+                ? state->featureAELoss
+                : state->featureAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->featureAELoss * LOSS_SMOOTHING_FACTOR;
             state->featureAEIterations++;
         }
     }
@@ -1992,8 +2007,10 @@ static inline void NetworkTrainPoseAEForTime(
             state->poseAEOptimizer->step();
 
             state->poseAELoss = loss.item<float>();
-            state->poseAELossSmoothed = state->poseAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->poseAELoss * LOSS_SMOOTHING_FACTOR;
+            state->poseAELossSmoothed = state->poseAEIterations == 0
+                ? state->poseAELoss
+                : state->poseAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->poseAELoss * LOSS_SMOOTHING_FACTOR;
             state->poseAEIterations++;
         }
     }
@@ -2061,8 +2078,10 @@ static inline void NetworkTrainSegmentAEForTime(
             state->segmentOptimizer->step();
 
             state->segmentAELoss = loss.item<float>();
-            state->segmentAELossSmoothed = state->segmentAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->segmentAELoss * LOSS_SMOOTHING_FACTOR;
+            state->segmentAELossSmoothed = state->segmentAEIterations == 0
+                ? state->segmentAELoss
+                : state->segmentAELossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->segmentAELoss * LOSS_SMOOTHING_FACTOR;
             state->segmentAEIterations++;
 
             //if (state->segmentAEIterations % 1000 == 0)
@@ -2168,8 +2187,10 @@ static inline void NetworkTrainLatentSegmentPredictorForTime(
             state->latentSegmentPredictorOptimizer->step();
 
             state->latentSegmentPredictorLoss = loss.item<float>();
-            state->latentSegmentPredictorLossSmoothed = state->latentSegmentPredictorLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->latentSegmentPredictorLoss * LOSS_SMOOTHING_FACTOR;
+            state->latentSegmentPredictorLossSmoothed = state->latentSegmentPredictorIterations == 0
+                ? state->latentSegmentPredictorLoss
+                : state->latentSegmentPredictorLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->latentSegmentPredictorLoss * LOSS_SMOOTHING_FACTOR;
             state->latentSegmentPredictorIterations++;
         }
     }
@@ -2388,8 +2409,10 @@ static inline void NetworkTrainFlowForTime(
             state->flowOptimizer->step();
 
             state->flowLoss = loss.item<float>();
-            state->flowLossSmoothed = state->flowLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
-                + state->flowLoss * LOSS_SMOOTHING_FACTOR;
+            state->flowLossSmoothed = state->flowIterations == 0
+                ? state->flowLoss
+                : state->flowLossSmoothed * (1.0f - LOSS_SMOOTHING_FACTOR)
+                    + state->flowLoss * LOSS_SMOOTHING_FACTOR;
             state->flowIterations++;
         }
     }
@@ -3396,12 +3419,18 @@ static inline void NetworkTrainGlimpseFlowForTime(
     if (budgetSeconds <= 0.0) return;
     if (db->normalizedFeatures.empty()) return;
     if (db->normalizedPoseGenFeatures.empty()) return;
-    if (db->pcaPoseK <= 0) return;
+    if (db->pcaGlimpsePoseK <= 0) return;
 
     const int batchSize = 256;
     const int featureDim = db->featureDim;
-    const int K = db->pcaPoseK;
-    const int futureFrame = (int)roundf(GLIMPSE_FUTURE_TIME / db->animFrameTime[0]);
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int K = db->pcaGlimpsePoseK;
+    const float animDt = db->animFrameTime[0];
+    int futureFrames[GLIMPSE_POSE_COUNT];
+    for (int i = 0; i < GLIMPSE_POSE_COUNT; ++i)
+    {
+        futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
+    }
     const Clock::time_point start = Clock::now();
 
     state->glimpseFlow->train();
@@ -3415,8 +3444,8 @@ static inline void NetworkTrainGlimpseFlowForTime(
             float* cPtr = condBatch.data_ptr<float>();
             float* xPtr = x1Batch.data_ptr<float>();
 
-            assert(featureDim <= 128);
-            float rawFeat[128];
+            std::vector<float> rawFeat(featureDim);
+            std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
             for (int b = 0; b < batchSize; ++b)
             {
                 const int frame = SampleLegalSegmentStartFrame(db);
@@ -3424,23 +3453,26 @@ static inline void NetworkTrainGlimpseFlowForTime(
                 // condition: compute raw MM features for this frame (with noise augmentation),
                 // then normalize into the feature space the network expects
                 ComputeRawFeaturesForFrame(
-                    const_cast<AnimDatabase*>(db), db->featuresConfig,
-                    frame, rawFeat, false, true);
-                NormalizeFeatureRaw(db, rawFeat, cPtr + b * featureDim);
+                    db, db->featuresConfig,
+                    frame, rawFeat.data(), nullptr, nullptr, true);
+                NormalizeFeatureRaw(db, rawFeat.data(), cPtr + b * featureDim);
 
-                // target (x1): grab the normalized pose 0.3s into the future,
-                // then project it down to 16 PCA coefficients. this is what the
-                // flow must learn to produce from noise.
-                std::span<const float> pRow =
-                    db->normalizedPoseGenFeatures.row_view(frame + futureFrame);
-                PcaProjectPose(db, pRow.data(), xPtr + b * K);
+                // target (x1): concatenate normalized future poses, then joint PCA project
+                for (int p = 0; p < GLIMPSE_POSE_COUNT; ++p)
+                {
+                    std::span<const float> pRow =
+                        db->normalizedPoseGenFeatures.row_view(
+                            frame + futureFrames[p]);
+                    memcpy(concat.data() + p * pgDim, pRow.data(), pgDim * sizeof(float));
+                }
+                PcaProjectGlimpsePose(db, concat.data(), xPtr + b * K);
             }
 
             condBatch = condBatch.to(state->device);
             x1Batch = x1Batch.to(state->device);
 
             // flow matching setup: random time t in [0,1], and a starting noise sample x0.
-            // at t=0 we're at pure noise, at t=1 we should be at the real pose.
+            // at t=0 we're at pure noise, at t=1 we should be at the real poses.
             torch::Tensor t = torch::rand(
                 {batchSize, 1},
                 torch::TensorOptions().device(state->device));
@@ -3448,12 +3480,7 @@ static inline void NetworkTrainGlimpseFlowForTime(
                 {batchSize, K},
                 torch::TensorOptions().device(state->device));
 
-            // scale the noise to match the per-dim std of the PCA targets.
-            // PCA component 1 might have std=5 while component 16 has std=0.1,
-            // so isotropic noise would be a terrible starting distribution —
-            // the flow would waste capacity just learning to rescale dimensions.
-            // by matching the shape of the target distribution we get straighter
-            // transport paths and faster convergence.
+            // scale the noise to match the per-dim std of the joint PCA targets
             if (!state->glimpseTargetStd.empty())
             {
                 torch::Tensor stdTensor = torch::from_blob(
@@ -3544,14 +3571,19 @@ static inline void NetworkTrainGlimpseDecompressorForTime(
     if (budgetSeconds <= 0.0) return;
     if (db->normalizedFeatures.empty()) return;
     if (db->normalizedPoseGenFeatures.empty()) return;
-    if (db->pcaPoseK <= 0 || db->pcaSegmentK <= 0) return;
+    if (db->pcaGlimpsePoseK <= 0 || db->pcaSegmentK <= 0) return;
 
     const int batchSize = 64;
     const int featureDim = db->featureDim;
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int poseK = db->pcaPoseK;
+    const int poseK = db->pcaGlimpsePoseK;
     const int segK = db->pcaSegmentK;
-    const int futureFrame = (int)roundf(GLIMPSE_FUTURE_TIME / db->animFrameTime[0]);
+    const float animDt = db->animFrameTime[0];
+    int futureFrames[GLIMPSE_POSE_COUNT];
+    for (int i = 0; i < GLIMPSE_POSE_COUNT; ++i)
+    {
+        futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
+    }
     const Clock::time_point start = Clock::now();
 
     state->glimpseDecompressor->train();
@@ -3567,24 +3599,28 @@ static inline void NetworkTrainGlimpseDecompressorForTime(
             float* pPtr = poseBatch.data_ptr<float>();
             float* tPtr = targetBatch.data_ptr<float>();
 
-            assert(featureDim <= 128);
-            float rawFeat[128];
+            std::vector<float> rawFeat(featureDim);
+            std::vector<float> concat(GLIMPSE_POSE_COUNT * pgDim);
             for (int b = 0; b < batchSize; ++b)
             {
                 const int frame = SampleLegalSegmentStartFrame(db);
 
                 // condition: current MM features, augmented + normalized
                 ComputeRawFeaturesForFrame(
-                    const_cast<AnimDatabase*>(db), db->featuresConfig,
-                    frame, rawFeat, false, true);
-                NormalizeFeatureRaw(db, rawFeat, cPtr + b * featureDim);
+                    db, db->featuresConfig,
+                    frame, rawFeat.data(), nullptr, nullptr, true);
+                NormalizeFeatureRaw(db, rawFeat.data(), cPtr + b * featureDim);
 
-                // future pose: grab the normalized pose at frame+futureFrame and project
-                // to 16 PCA coefficients. this is the "destination" the decompressor
-                // must fill in the motion towards.
-                std::span<const float> pRow =
-                    db->normalizedPoseGenFeatures.row_view(frame + futureFrame);
-                PcaProjectPose(db, pRow.data(), pPtr + b * poseK);
+                // future poses: concatenate normalized poses at each glimpse time,
+                // then joint PCA project to K coefficients
+                for (int p = 0; p < GLIMPSE_POSE_COUNT; ++p)
+                {
+                    std::span<const float> pRow =
+                        db->normalizedPoseGenFeatures.row_view(
+                            frame + futureFrames[p]);
+                    memcpy(concat.data() + p * pgDim, pRow.data(), pgDim * sizeof(float));
+                }
+                PcaProjectGlimpsePose(db, concat.data(), pPtr + b * poseK);
 
                 // target: the full segment starting at this frame (9 frames x ~150 dims),
                 // projected down to 128 PCA coefficients. this is what the decompressor
@@ -3659,27 +3695,27 @@ static inline double NetworkTrainAll(
         NetworkInitFullFlow(state, db->featureDim, db->poseGenSegmentFlatDim);
     }
 
-    // auto-init glimpse networks immediately (no headstart, operates in PCA space)
+    // auto-init glimpse networks immediately (no headstart, operates in joint PCA space)
     if (!state->glimpseFlow && BUDGET_WEIGHT_GLIMPSE_FLOW > 0.0f
-        && db->featureDim > 0 && db->pcaPoseK > 0)
+        && db->featureDim > 0 && db->pcaGlimpsePoseK > 0)
     {
-        NetworkInitGlimpseFlow(state, db->featureDim, db->pcaPoseK);
+        NetworkInitGlimpseFlow(state, db->featureDim, db->pcaGlimpsePoseK);
         ComputeGlimpseTargetStd(state, db);
     }
     // decompressor waits for flow headstart so it never trains on pure noise
     if (!state->glimpseDecompressor && BUDGET_WEIGHT_GLIMPSE_DECOMPRESSOR > 0.0f
-        && db->featureDim > 0 && db->pcaPoseK > 0
+        && db->featureDim > 0 && db->pcaGlimpsePoseK > 0
         && db->pcaSegmentK > 0
         && state->glimpseFlow
         && state->trainingElapsedSeconds >= GLIMPSE_DECOMPRESSOR_HEADSTART)
     {
         NetworkInitGlimpseDecompressor(
-            state, db->featureDim, db->pcaPoseK,
+            state, db->featureDim, db->pcaGlimpsePoseK,
             db->pcaSegmentK);
     }
 
     const bool hasFullFlow =
-        static_cast<bool>(state->latentFlowModel);
+        static_cast<bool>(state->fullFlowModel);
 
     // split budget among existing networks using relative weights
     const float wFeature = BUDGET_WEIGHT_FEATURE_AE;
@@ -3881,8 +3917,15 @@ static inline void NetworkInitAllForTraining(
 
     // PCA on segments and poses using cluster-weighted sampling (lazy, only once)
     AnimDatabaseComputeSegmentPCA(db);
-    const int futureFrame = (int)roundf(GLIMPSE_FUTURE_TIME / db->animFrameTime[0]);
-    AnimDatabaseComputePosePCA(db, futureFrame);
+    {
+        const float animDt = db->animFrameTime[0];
+        int futureFrames[GLIMPSE_POSE_COUNT];
+        for (int i = 0; i < GLIMPSE_POSE_COUNT; ++i)
+        {
+            futureFrames[i] = (int)roundf(GLIMPSE_POSE_TIMES[i] / animDt);
+        }
+        AnimDatabaseComputeGlimpsePosePCA(db, futureFrames, GLIMPSE_POSE_COUNT);
+    }
 
     if (BUDGET_WEIGHT_FEATURE_AE > 0.0f)
     {
@@ -4333,27 +4376,20 @@ static inline bool NetworkPredictFullFlow(
 //     we clamp to data bounds here (unlike training which uses unclamped augmented features)
 //     because at runtime we want to be conservative with out-of-distribution inputs.
 //
-//   step 1: GlimpseFlow — sample a future pose in PCA space (16 dims)
+//   step 1: GlimpseFlow — sample future poses in joint PCA space (K dims)
 //     start from shaped noise (gaussian scaled by per-component std, halved for less
 //     randomness) and iteratively push it through the learned velocity field.
-//     each step: x += v(x, features, t) * dt
-//     after all steps, x is a 16-dim PCA coefficient vector representing a plausible
-//     future pose. different noise seeds give different futures — that's the diversity.
+//     after all steps, x contains concatenated PCA vectors for poses at 0.1s and 0.3s.
 //
-//   step 1b (optional): reconstruct the future pose for visualization
-//     PCA coefficients (16) -> normalized pose (~150) -> denormalized raw pose (~150)
-//     the denormalization undoes: normalized = (raw - mean) / std * weight
-//     so: raw = normalized / weight * std + mean
-//     this gives us joint rotations, root velocity, etc. in physical units that we
-//     can deserialize into a skeleton and draw as a ghost.
+//   step 1b (optional): reconstruct the last pose (0.3s) for visualization
+//     PCA coefficients -> normalized pose (~150) -> denormalized raw pose (~150)
 //
-//   step 2: GlimpseDecompressor — expand future pose into a full segment
-//     (16 PCA pose coefficients, normalized features) -> 128 PCA segment coefficients
-//     the decompressor knows "where we're going" (pose) and "where we are" (features)
-//     and fills in the trajectory between them.
+//   step 2: GlimpseDecompressor — expand future poses into a full segment
+//     (all PCA pose coefficients, normalized features) -> 128 PCA segment coefficients
+//     the decompressor sees both future poses and the current features.
 //
 //   step 3: reconstruct the segment from PCA
-//     128 PCA coefficients -> flat normalized segment (~1350 floats) -> denormalized
+//     128 PCA coefficients -> flat normalized segment -> denormalized
 //     then reshape into [segFrames x pgDim] for the caller to use.
 //
 static inline bool NetworkPredictGlimpse(
@@ -4366,11 +4402,11 @@ static inline bool NetworkPredictGlimpse(
     if (!state->glimpseFlow) return false;
     if (!state->glimpseDecompressor) return false;
     if ((int)rawQuery.size() != db->featureDim) return false;
-    if (db->pcaPoseK <= 0) return false;
+    if (db->pcaGlimpsePoseK <= 0) return false;
 
     const int featureDim = db->featureDim;
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int poseK = db->pcaPoseK;
+    const int K = db->pcaGlimpsePoseK;
     const int segFrames = db->poseGenSegmentFrameCount;
 
     segment.resize(segFrames, pgDim);
@@ -4387,16 +4423,15 @@ static inline bool NetworkPredictGlimpse(
     {
         torch::NoGradGuard noGrad;
 
-        // step 1: flow — walk from noise to a future pose in PCA space.
-        // we start at half the distribution-matched noise: the 0.5 factor trades off
-        // diversity (full noise) vs consistency (zero = always the mean prediction).
+        // step 1: flow — walk from noise to future poses in joint PCA space (K dims).
+        // we start at half the distribution-matched noise.
         torch::Tensor x = torch::randn(
-            {1, poseK}, torch::TensorOptions().device(state->device));
+            {1, K}, torch::TensorOptions().device(state->device));
         if (!state->glimpseTargetStd.empty())
         {
             torch::Tensor stdTensor = torch::from_blob(
                 (void*)state->glimpseTargetStd.data(),
-                {1, poseK}, torch::kFloat32)
+                {1, K}, torch::kFloat32)
                 .clone().to(state->device);
             x = x * stdTensor * 0.5f;
         }
@@ -4417,50 +4452,47 @@ static inline bool NetworkPredictGlimpse(
             torch::Tensor condTime = torch::cat({condTensor, tTensor}, 1);
 
 #ifdef FLOW_PREDICT_X1
-            // x1-prediction mode: network predicts the final destination directly,
-            // we interpolate between our starting noise and that prediction
             torch::Tensor x1Hat = state->glimpseFlow->forward(x, condTime);
             const float nextT = (float)(step + 1) / steps;
             x = (1.0f - nextT) * x0 + nextT * x1Hat;
 #else
-            // velocity mode: network predicts the velocity field, we euler-step along it
             torch::Tensor v = state->glimpseFlow->forward(x, condTime);
             x = x + v * (1.0f / steps);
 #endif
         }
 
-        // x is now 16 PCA coefficients describing the future pose
+        // x is now K joint PCA coefficients encoding all future poses at once
 
-        // step 1b: if the caller wants the future pose for visualization, we need to
-        // climb back up the chain: PCA space -> normalized pose space -> raw pose space
+        // step 1b: reconstruct the last pose (0.3s) for visualization if requested
         if (futurePoseRaw)
         {
             torch::Tensor xCpu = x.to(torch::kCPU);
             const float* coeffs = xCpu.data_ptr<float>();
 
-            // PCA reconstruct: 16 coefficients -> ~150 dim normalized pose
-            std::vector<float> normalizedPose(pgDim);
-            PcaReconstructPose(db, coeffs, normalizedPose.data());
+            // reconstruct concatenated poses, take the last pgDim slice (last time point)
+            std::vector<float> concatenated(GLIMPSE_POSE_COUNT * pgDim);
+            PcaReconstructGlimpsePose(db, coeffs, concatenated.data());
 
-            // denormalize: undo the (raw - mean) / std * weight transform
+            const float* lastPose = concatenated.data() + (GLIMPSE_POSE_COUNT - 1) * pgDim;
+
             futurePoseRaw->resize(pgDim);
             for (int d = 0; d < pgDim; ++d)
             {
                 const float w = db->poseGenFeaturesWeight[d];
                 (*futurePoseRaw)[d] = (w > 1e-10f)
-                    ? (normalizedPose[d] / w * db->poseGenFeaturesStd[d]
+                    ? (lastPose[d] / w * db->poseGenFeaturesStd[d]
                        + db->poseGenFeaturesMean[d])
                     : db->poseGenFeaturesMean[d];
             }
         }
 
-        // step 2: decompressor takes the 16 PCA pose coefficients + features
-        // and produces 128 PCA segment coefficients
+        // step 2: decompressor takes all K PCA coefficients + features
+        // and produces segment PCA coefficients
         result = state->glimpseDecompressor->forward(x, condTensor);
         result = result.to(torch::kCPU);
     }
 
-    // step 3: reconstruct the full segment from the 128 PCA coefficients,
+    // step 3: reconstruct the full segment from the PCA coefficients,
     // then denormalize each frame back to raw pose feature space
     const int flatDim = db->poseGenSegmentFlatDim;
     std::vector<float> normalizedFlat(flatDim);
