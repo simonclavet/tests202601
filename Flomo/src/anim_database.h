@@ -17,6 +17,22 @@
 #include "kmeans_clustering.h"
 
 
+// augmentation parameters sampled per training example.
+// passed to feature computation and target construction so everything is consistent.
+struct MotionTrainingAugmentations
+{
+    float timescale = 1.0f;     // playback speed multiplier (1.0 = original)
+    float aimAngleOffset = 0.0f; // random aim direction rotation (radians)
+};
+
+static inline MotionTrainingAugmentations SampleTrainingAugmentations()
+{
+    MotionTrainingAugmentations aug;
+    aug.timescale = 1.0f + RandomGaussian() * 0.1f;
+    aug.aimAngleOffset = RandomGaussian() * (10.0f * DEG2RAD);
+    return aug;
+}
+
 static inline int FindClipForMotionFrame(const AnimDatabase* db, int frame)
 {
     for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
@@ -177,6 +193,143 @@ static inline void BuildRawGlimpseToe(
         }
     }
     assert(idx == GLIMPSE_TOE_RAW_DIM);
+}
+
+// build 16 raw toe dims with augmentation: future offsets become fractional,
+// positions are interpolated, velocities are interpolated and scaled by timescale.
+static inline void BuildRawGlimpseToeAugmented(
+    const AnimDatabase* db,
+    int frame,
+    const MotionTrainingAugmentations& aug,
+    float animDt,
+    int clipStart,
+    int clipEnd,
+    float* raw16)
+{
+    const float curYaw = db->magicYaw[frame];
+    const float cosC = cosf(-curYaw);
+    const float sinC = sinf(-curYaw);
+    int idx = 0;
+    for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+    {
+        const float srcFrac = (float)frame + GLIMPSE_POSE_TIMES[t] * aug.timescale / animDt;
+        const float srcClamped = std::clamp(srcFrac, (float)clipStart, (float)(clipEnd - 1) - 0.001f);
+        const int f0 = (int)srcClamped;
+        const int f1 = std::min(f0 + 1, clipEnd - 1);
+        const float alpha = srcClamped - (float)f0;
+
+        // interpolate magicYaw at the future time for velocity rotation
+        const float futureYaw = db->magicYaw[f0] * (1.0f - alpha) + db->magicYaw[f1] * alpha;
+        const float deltaYaw = futureYaw - curYaw;
+        const float cosD = cosf(deltaYaw);
+        const float sinD = sinf(deltaYaw);
+
+        for (int side : sides)
+        {
+            const int toeIdx = db->toeIndices[side];
+
+            // position: interpolate world toe positions, then transform to current root space
+            const Vector3 toe0 = db->jointPositionsAnimSpace.row_view(f0)[toeIdx];
+            const Vector3 toe1 = db->jointPositionsAnimSpace.row_view(f1)[toeIdx];
+            const float px = toe0.x + alpha * (toe1.x - toe0.x) - db->magicPosition[frame].x;
+            const float pz = toe0.z + alpha * (toe1.z - toe0.z) - db->magicPosition[frame].z;
+            raw16[idx++] = px * cosC - pz * sinC;
+            raw16[idx++] = px * sinC + pz * cosC;
+
+            // velocity: interpolate, rotate to current root space, scale by timescale
+            const Vector3 vel0 = db->jointVelocitiesRootSpace.row_view(f0)[toeIdx];
+            const Vector3 vel1 = db->jointVelocitiesRootSpace.row_view(f1)[toeIdx];
+            const float vx = vel0.x + alpha * (vel1.x - vel0.x);
+            const float vz = vel0.z + alpha * (vel1.z - vel0.z);
+            raw16[idx++] = (vx * cosD - vz * sinD) * aug.timescale;
+            raw16[idx++] = (vx * sinD + vz * cosD) * aug.timescale;
+        }
+    }
+    assert(idx == GLIMPSE_TOE_RAW_DIM);
+}
+
+// returns true if dimension d of poseGenFeatures is a velocity/rate
+// that should be scaled by timescale during augmentation.
+// layout from PoseFeatures::SerializeTo (definitions.h):
+//   [0, jc*6):        rotations              — no
+//   [jc*6, jc*6+3):   root position          — no
+//   [jc*6+3, jc*6+5): root velocity XZ       — yes
+//   [jc*6+5]:          root yaw rate          — yes
+//   [jc*6+6, jc*6+12): toe positions (2x3)   — no
+//   [jc*6+12, jc*6+18): toe velocities (2x3) — yes
+//   [jc*6+18, jc*6+20): toe pos diff XZ      — no
+//   [jc*6+20]:         toe speed diff         — yes
+static inline bool IsPoseGenVelocityDim(int d, int jointCount)
+{
+    const int jc6 = jointCount * 6;
+    if (d >= jc6 + 3 && d <= jc6 + 5) return true;   // root vel XZ + yaw rate
+    if (d >= jc6 + 12 && d <= jc6 + 17) return true;  // toe velocities
+    if (d == jc6 + 20) return true;                    // toe speed diff
+    return false;
+}
+
+// build an augmented normalized segment for decompressor training.
+// for each output frame i, interpolates raw poseGenFeatures at
+// source frame (frame + i * aug.timescale), scales velocity dims, normalizes.
+// outNormFlat must have room for segFrameCount * pgDim floats.
+static inline void BuildAugmentedNormalizedSegment(
+    const AnimDatabase* db,
+    int frame,
+    const MotionTrainingAugmentations& aug,
+    int clipStart,
+    int clipEnd,
+    float* outNormFlat)
+{
+    const int segFrames = db->poseGenSegmentFrameCount;
+    const int pgDim = db->poseGenFeaturesComputeDim;
+    const int jc = db->jointCount;
+
+    for (int i = 0; i < segFrames; ++i)
+    {
+        // playback frame i maps to i * timescale original frames ahead
+        const float srcFrac = (float)frame + (float)i * aug.timescale;
+        const float srcClamped = std::clamp(srcFrac, (float)clipStart, (float)(clipEnd - 1) - 0.001f);
+        const int f0 = (int)srcClamped;
+        const int f1 = std::min(f0 + 1, clipEnd - 1);
+        const float alpha = srcClamped - (float)f0;
+
+        std::span<const float> row0 = db->poseGenFeatures.row_view(f0);
+        std::span<const float> row1 = db->poseGenFeatures.row_view(f1);
+
+        for (int d = 0; d < pgDim; ++d)
+        {
+            float rawInterp = row0[d] + alpha * (row1[d] - row0[d]);
+            if (IsPoseGenVelocityDim(d, jc))
+            {
+                rawInterp *= aug.timescale;
+            }
+            outNormFlat[i * pgDim + d] =
+                (rawInterp - db->poseGenFeaturesMean[d])
+                / db->poseGenFeaturesStd[d]
+                * db->poseGenFeaturesWeight[d];
+        }
+    }
+}
+
+// project normalized MM feature vector [featureDim] to PCA coefficients [pcaFeatureK]
+static inline void PcaProjectFeature(
+    const AnimDatabase* db, const float* normalizedFeature, float* coeffs)
+{
+    const int K = db->pcaFeatureK;
+    const int dim = db->featureDim;
+    const float* mean = db->pcaFeatureMean.data();
+    const float* basis = db->pcaFeatureBasis.data();
+
+    for (int k = 0; k < K; ++k)
+    {
+        float dot = 0.0f;
+        const float* row = basis + k * dim;
+        for (int d = 0; d < dim; ++d)
+        {
+            dot += row[d] * (normalizedFeature[d] - mean[d]);
+        }
+        coeffs[k] = dot;
+    }
 }
 
 constexpr int KMEANS_CLUSTER_COUNT = 500;
@@ -523,6 +676,57 @@ static void AnimDatabaseComputeGlimpseToePCA(
     TraceLog(LOG_INFO, "PCA glimpse toe: stored basis [%d x %d]", K, GLIMPSE_TOE_RAW_DIM);
 }
 
+// PCA on normalized MM features for compact glimpse conditioning
+static void AnimDatabaseComputeFeaturePCA(AnimDatabase* db)
+{
+    if (db->pcaFeatureK > 0) return;  // already computed
+    if (db->normalizedFeatures.empty()) return;
+    if (db->featureDim <= 0) return;
+
+    const int dim = db->featureDim;
+    const int K = PCA_FEATURE_K;
+
+    int numValidStarts = 0;
+    for (int c = 0; c < (int)db->clipStartFrame.size(); ++c)
+    {
+        numValidStarts += db->clipEndFrame[c] - db->clipStartFrame[c];
+    }
+
+    const int numSamples = numValidStarts * 2;
+    TraceLog(LOG_INFO, "PCA feature: sampling %d frames (featureDim=%d, K=%d)",
+        numSamples, dim, K);
+
+    torch::Tensor dataMat = torch::empty({numSamples, dim});
+    float* dPtr = dataMat.data_ptr<float>();
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const int frame = SampleLegalSegmentStartFrame(db);
+        std::span<const float> row = db->normalizedFeatures.row_view(frame);
+        memcpy(dPtr + i * dim, row.data(), dim * sizeof(float));
+    }
+
+    torch::Tensor meanTensor = dataMat.mean(0);
+    dataMat = dataMat - meanTensor.unsqueeze(0);
+
+    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+
+    torch::Tensor totalVar = S.square().sum();
+    torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
+    const float varianceExplained = topKVar.item<float>() / totalVar.item<float>() * 100.0f;
+    TraceLog(LOG_INFO, "PCA feature: top %d of %d components explain %.2f%% of variance",
+        K, dim, varianceExplained);
+
+    torch::Tensor basisTensor = Vt.slice(0, 0, K).contiguous();
+
+    db->pcaFeatureK = K;
+    db->pcaFeatureMean.resize(dim);
+    memcpy(db->pcaFeatureMean.data(), meanTensor.data_ptr<float>(), dim * sizeof(float));
+    db->pcaFeatureBasis.resize(K * dim);
+    memcpy(db->pcaFeatureBasis.data(), basisTensor.data_ptr<float>(), K * dim * sizeof(float));
+
+    TraceLog(LOG_INFO, "PCA feature: stored basis [%d x %d]", K, dim);
+}
+
 // save clusters + PCA to a binary file so they don't need to be recomputed
 static void AnimDatabaseSaveDerived(const AnimDatabase* db, const std::string& folderPath)
 {
@@ -564,9 +768,21 @@ static void AnimDatabaseSaveDerived(const AnimDatabase* db, const std::string& f
             db->pcaGlimpseToeK * glimpseToeDim, f);
     }
 
+    // feature PCA (for compact glimpse conditioning)
+    fwrite(&db->pcaFeatureK, sizeof(int), 1, f);
+    fwrite(&db->featureDim, sizeof(int), 1, f);
+    if (db->pcaFeatureK > 0)
+    {
+        fwrite(db->pcaFeatureMean.data(), sizeof(float), db->featureDim, f);
+        fwrite(db->pcaFeatureBasis.data(), sizeof(float),
+            db->pcaFeatureK * db->featureDim, f);
+    }
+
     fclose(f);
-    TraceLog(LOG_INFO, "Saved clusters (%d) + segment PCA (K=%d) + glimpse toe PCA (K=%d) to: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK, path.c_str());
+    TraceLog(LOG_INFO,
+        "Saved clusters(%d) segPCA(K=%d) toePCA(K=%d) featPCA(K=%d) to: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK,
+        db->pcaFeatureK, path.c_str());
 }
 
 // load clusters + PCA from file. returns true if successful.
@@ -619,15 +835,32 @@ static bool AnimDatabaseLoadDerived(AnimDatabase* db, const std::string& folderP
         }
     }
 
+    // feature PCA (may not exist in older files)
+    int featK = 0;
+    int featDim = 0;
+    if (fread(&featK, sizeof(int), 1, f) == 1 && fread(&featDim, sizeof(int), 1, f) == 1)
+    {
+        if (featK > 0 && featDim == db->featureDim)
+        {
+            db->pcaFeatureK = featK;
+            db->pcaFeatureMean.resize(featDim);
+            fread(db->pcaFeatureMean.data(), sizeof(float), featDim, f);
+            db->pcaFeatureBasis.resize(featK * featDim);
+            fread(db->pcaFeatureBasis.data(), sizeof(float), featK * featDim, f);
+        }
+    }
+
     fclose(f);
-    TraceLog(LOG_INFO, "Loaded clusters (%d) + segment PCA (K=%d) + glimpse toe PCA (K=%d) from: %s",
-        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK, path.c_str());
+    TraceLog(LOG_INFO,
+        "Loaded clusters(%d) segPCA(K=%d) toePCA(K=%d) featPCA(K=%d) from: %s",
+        db->clusterCount, db->pcaSegmentK, db->pcaGlimpseToeK,
+        db->pcaFeatureK, path.c_str());
     return true;
 }
 
 // Compute raw (un-normalized) MM features for a single frame.
 // If outNames/outTypes are non-null, pushes feature names and types (call once on first frame).
-// If doAugmentation is true, applies structured noise to future-facing features.
+// If aug is non-null, applies timescale and noise augmentation to features.
 static inline void ComputeRawFeaturesForFrame(
     const AnimDatabase* db,
     const MotionMatchingFeaturesConfig& cfg,
@@ -635,7 +868,7 @@ static inline void ComputeRawFeaturesForFrame(
     float* outFeatures,
     std::vector<std::string>* outNames,
     std::vector<FeatureType>* outTypes,
-    bool doAugmentation)
+    const MotionTrainingAugmentations* aug)
 {
     using std::string;
     using std::span;
@@ -682,13 +915,9 @@ static inline void ComputeRawFeaturesForFrame(
     const Vector3 magicToRight = Vector3Subtract(rightPos, magicPos);
     const Vector3 localRightPos = Vector3RotateByRot6d(magicToRight, invMagicYawRot);
 
-    // sample augmentation values once per frame
-    const float timescale = doAugmentation
-        ? 1.0f + RandomGaussian() * 0.1f
-        : 1.0f;
-    const float aimAugAngle = doAugmentation
-        ? RandomGaussian() * (10.0f * DEG2RAD)
-        : 0.0f;
+    // augmentation parameters come from the caller (nullptr = no augmentation)
+    const float timescale = (aug != nullptr) ? aug->timescale : 1.0f;
+    const float aimAugAngle = (aug != nullptr) ? aug->aimAngleOffset : 0.0f;
     const Rot6d aimAugRot = Rot6dFromYaw(aimAugAngle);
 
     // compute a future/past frame offset, clamped to clip bounds
@@ -906,7 +1135,7 @@ static inline void ComputeRawFeaturesForFrame(
             Vector3 aimDirLocal = Vector3RotateByRot6d(aimDirWorld, invMagicYawRot);
 
             // augmentation: rotate aim direction by a random angle
-            if (doAugmentation)
+            if (aug != nullptr)
             {
                 aimDirLocal = Vector3RotateByRot6d(aimDirLocal, aimAugRot);
             }
@@ -1083,7 +1312,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     using std::string;
     using std::span;
 
-    LOG_PROFILE_START(AnimDatabaseRebuild);
+    LOG_PROFILE_SCOPE(AnimDatabaseRebuild);
 
     AnimDatabaseFree(db);
 
@@ -2139,7 +2368,7 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
             db, cfg, f, featRow,
             isFirstFrame ? &db->featureNames : nullptr,
             isFirstFrame ? &db->featureTypes : nullptr,
-            false);
+            nullptr);
     }
 
 
@@ -2417,7 +2646,6 @@ static void AnimDatabaseRebuild(AnimDatabase* db, const CharacterData* character
     // set db->valid true now that we completed full build
     db->valid = true;
 
-    LOG_PROFILE_END(AnimDatabaseRebuild);
 
 }
 

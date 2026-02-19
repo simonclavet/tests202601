@@ -1,0 +1,49 @@
+{
+    "robot_root_name": "Hips",
+    "human_root_name": "Hips",
+    "ground_height": 0.0,
+    "human_height_assumption": 0.85,
+    "use_ik_match_table1": true,
+    "use_ik_match_table2": true,
+    "human_scale_table": {
+        "Hips": 1.0,
+        "Spine": 1.0,
+        "Spine1": 1.0,
+        "Spine2": 1.0,
+        "Spine3": 1.0,
+        "Neck": 1.0,
+        "Head": 1.0,
+        "LeftShoulder": 1.0,
+        "LeftArm": 1.0,
+        "LeftForeArm": 1.0,
+        "LeftHand": 1.0,
+        "RightShoulder": 1.0,
+        "RightArm": 1.0,
+        "RightForeArm": 1.0,
+        "RightHand": 1.0,
+        "LeftUpLeg": 1.0,
+        "LeftLeg": 1.0,
+        "LeftFoot": 1.0,
+        "LeftToeBase": 1.0,
+        "RightUpLeg": 1.0,
+        "RightLeg": 1.0,
+        "RightFoot": 1.0,
+        "RightToeBase": 1.0
+    },
+    "ik_match_table1": {
+        "Hips": ["Hips", 0, 10, [0,0,0], [1,0,0,0]],
+        "Spine3": ["Spine3", 0, 10, [0,0,0], [1,0,0,0]],
+        "LeftHand": ["LeftHand", 0, 10, [0,0,0], [1,0,0,0]],
+        "RightHand": ["RightHand", 0, 10, [0,0,0], [1,0,0,0]],
+        "LeftFoot": ["LeftFoot", 0, 10, [0,0,0], [1,0,0,0]],
+        "RightFoot": ["RightFoot", 0, 10, [0,0,0], [1,0,0,0]]
+    },
+    "ik_match_table2": {
+        "Hips": ["Hips", 100, 10, [0,0,0], [1,0,0,0]],
+        "Spine3": ["Spine3", 10, 10, [0,0,0], [1,0,0,0]],
+        "LeftHand": ["LeftHand", 10, 10, [0,0,0], [1,0,0,0]],
+        "RightHand": ["RightHand", 10, 10, [0,0,0], [1,0,0,0]],
+        "LeftFoot": ["LeftFoot", 50, 10, [0,0,0], [1,0,0,0]],
+        "RightFoot": ["RightFoot", 50, 10, [0,0,0], [1,0,0,0]]
+    }
+}

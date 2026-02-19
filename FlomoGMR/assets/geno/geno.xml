@@ -1,0 +1,394 @@
+<mujoco model="geno">
+  <compiler angle="radian" meshdir="meshes" autolimits="true"/>
+  <option timestep="0.005" iterations="50" tolerance="1e-10" solver="Newton" jacobian="dense" cone="elliptic"/>
+  <size njmax="500" nconmax="100"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-140" elevation="-20"/>
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="1 1 1" rgb2="1 1 1" width="800" height="800"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="1 1 1" rgb2="1 1 1" markrgb="0 0 0" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0"/>
+  </asset>
+  <worldbody>
+    <light diffuse=".5 .5 .5" pos="0 0 3" dir="0 0 -1"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <body name="Hips" pos="0.00013648943099999999 0.0213670418 0.855290222">
+      <freejoint name="Hips"/>
+      <site name="Hips" size="0.01" rgba="1 0 0 1"/>
+      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+      <body name="Spine" pos="2.30099286e-07 0.020800323500000002 0.0881424618">
+        <joint name="Spine" type="ball"/>
+        <site name="Spine" size="0.01" rgba="1 0 0 1"/>
+        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+        <body name="Spine1" pos="8.7261958e-09 2.72457055e-08 0.0884414387">
+          <joint name="Spine1" type="ball"/>
+          <site name="Spine1" size="0.01" rgba="1 0 0 1"/>
+          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+          <body name="Spine2" pos="-2.55740429e-08 -4.31642138e-08 0.11682271999999999">
+            <joint name="Spine2" type="ball"/>
+            <site name="Spine2" size="0.01" rgba="1 0 0 1"/>
+            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+            <body name="Spine3" pos="6.59586306e-09 3.93247592e-08 0.117466984">
+              <joint name="Spine3" type="ball"/>
+              <site name="Spine3" size="0.01" rgba="1 0 0 1"/>
+              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+              <body name="Neck" pos="8.48960008e-08 8.42700974e-07 0.176582756">
+                <joint name="Neck" type="ball"/>
+                <site name="Neck" size="0.01" rgba="1 0 0 1"/>
+                <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                <body name="Neck1" pos="3.79443094e-09 -3.26421036e-08 0.0510151863">
+                  <joint name="Neck1" type="ball"/>
+                  <site name="Neck1" size="0.01" rgba="1 0 0 1"/>
+                  <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                  <body name="Head" pos="-9.479538680000001e-08 -8.865558809999999e-08 0.0510151625">
+                    <joint name="Head" type="ball"/>
+                    <site name="Head" size="0.01" rgba="1 0 0 1"/>
+                    <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    <body name="HeadEnd" pos="-4.13024277e-18 -5.50596564e-16 0.116550846">
+                      <joint name="HeadEnd" type="ball"/>
+                      <site name="HeadEnd" size="0.01" rgba="1 0 0 1"/>
+                      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+              <body name="RightShoulder" pos="-0.0262538743 4.81263169e-08 0.111752224">
+                <joint name="RightShoulder" type="ball"/>
+                <site name="RightShoulder" size="0.01" rgba="1 0 0 1"/>
+                <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                <body name="RightArm" pos="-1.50603675e-08 -1.24267818e-07 0.104347115">
+                  <joint name="RightArm" type="ball"/>
+                  <site name="RightArm" size="0.01" rgba="1 0 0 1"/>
+                  <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                  <body name="RightForeArm" pos="0.00069977134 0.005369550010000001 0.258717893">
+                    <joint name="RightForeArm" type="ball"/>
+                    <site name="RightForeArm" size="0.01" rgba="1 0 0 1"/>
+                    <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    <body name="RightHand" pos="0.0029897696400000002 0.00033806178899999995 0.248929021">
+                      <joint name="RightHand" type="ball"/>
+                      <site name="RightHand" size="0.01" rgba="1 0 0 1"/>
+                      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                      <body name="RightHandThumb1" pos="-0.028673086200000003 -0.029442994599999998 0.0395956302">
+                        <joint name="RightHandThumb1" type="ball"/>
+                        <site name="RightHandThumb1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="RightHandThumb2" pos="5.44471726e-08 6.88177021e-09 0.0335039091">
+                          <joint name="RightHandThumb2" type="ball"/>
+                          <site name="RightHandThumb2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="RightHandThumb3" pos="-5.1811981199999995e-08 -3.88906735e-08 0.0375651813">
+                            <joint name="RightHandThumb3" type="ball"/>
+                            <site name="RightHandThumb3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="RightHandThumb4" pos="-4.830709819999999e-09 1.1163668099999998e-08 0.031473465">
+                              <joint name="RightHandThumb4" type="ball"/>
+                              <site name="RightHandThumb4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="RightHandIndex1" pos="-0.000867566392 -0.0234528232 0.10030899">
+                        <joint name="RightHandIndex1" type="ball"/>
+                        <site name="RightHandIndex1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="RightHandIndex2" pos="-3.76662116e-08 -3.4132215800000003e-08 0.0406108809">
+                          <joint name="RightHandIndex2" type="ball"/>
+                          <site name="RightHandIndex2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="RightHandIndex3" pos="2.12695065e-08 2.9199021699999998e-08 0.032488718">
+                            <joint name="RightHandIndex3" type="ball"/>
+                            <site name="RightHandIndex3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="RightHandIndex4" pos="1.19115619e-09 -2.31537559e-08 0.026397078">
+                              <joint name="RightHandIndex4" type="ball"/>
+                              <site name="RightHandIndex4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="RightHandMiddle1" pos="0.00104109198 -6.77696662e-05 0.0950295544">
+                        <joint name="RightHandMiddle1" type="ball"/>
+                        <site name="RightHandMiddle1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="RightHandMiddle2" pos="-4.00518747e-09 -5.93760964e-08 0.0456873274">
+                          <joint name="RightHandMiddle2" type="ball"/>
+                          <site name="RightHandMiddle2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="RightHandMiddle3" pos="7.54751455e-08 3.2926228599999997e-08 0.036549809">
+                            <joint name="RightHandMiddle3" type="ball"/>
+                            <site name="RightHandMiddle3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="RightHandMiddle4" pos="-2.4724227099999998e-08 -5.7228443499999995e-08 0.027412297699999998">
+                              <joint name="RightHandMiddle4" type="ball"/>
+                              <site name="RightHandMiddle4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="RightHandRing1" pos="0.000867536962 0.022674486599999998 0.08921710969999999">
+                        <joint name="RightHandRing1" type="ball"/>
+                        <site name="RightHandRing1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="RightHandRing2" pos="-8.494164849999999e-08 -8.33849263e-10 0.0406109715">
+                          <joint name="RightHandRing2" type="ball"/>
+                          <site name="RightHandRing2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="RightHandRing3" pos="-2.69741424e-09 -8.05873964e-08 0.036549761300000004">
+                            <joint name="RightHandRing3" type="ball"/>
+                            <site name="RightHandRing3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="RightHandRing4" pos="-1.75682811e-09 6.02012545e-09 0.0274124503">
+                              <joint name="RightHandRing4" type="ball"/>
+                              <site name="RightHandRing4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="RightHandPinky1" pos="-0.0017349013699999999 0.044672045699999996 0.0797699213">
+                        <joint name="RightHandPinky1" type="ball"/>
+                        <site name="RightHandPinky1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="RightHandPinky2" pos="-5.09637176e-08 1.14142521e-07 0.0335040545">
+                          <joint name="RightHandPinky2" type="ball"/>
+                          <site name="RightHandPinky2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="RightHandPinky3" pos="-2.4106434500000002e-08 -3.31119791e-09 0.0284276104">
+                            <joint name="RightHandPinky3" type="ball"/>
+                            <site name="RightHandPinky3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="RightHandPinky4" pos="-4.84227395e-08 -4.19883692e-08 0.0263970661">
+                              <joint name="RightHandPinky4" type="ball"/>
+                              <site name="RightHandPinky4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="RightForeArmEnd" pos="-2.56183113e-16 6.35784429e-19 -1.74232385e-18">
+                        <joint name="RightForeArmEnd" type="ball"/>
+                        <site name="RightForeArmEnd" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                      </body>
+                    </body>
+                    <body name="RightArmEnd" pos="-6.998603949999999e-16 1.81852944e-18 1.22731819e-16">
+                      <joint name="RightArmEnd" type="ball"/>
+                      <site name="RightArmEnd" size="0.01" rgba="1 0 0 1"/>
+                      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+              <body name="LeftShoulder" pos="0.026253914800000003 5.8317759800000006e-08 0.111752157">
+                <joint name="LeftShoulder" type="ball"/>
+                <site name="LeftShoulder" size="0.01" rgba="1 0 0 1"/>
+                <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                <body name="LeftArm" pos="5.6675547500000004e-08 4.22273472e-08 0.108136358">
+                  <joint name="LeftArm" type="ball"/>
+                  <site name="LeftArm" size="0.01" rgba="1 0 0 1"/>
+                  <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                  <body name="LeftForeArm" pos="0.00495176165 0.00449427606 0.255930268">
+                    <joint name="LeftForeArm" type="ball"/>
+                    <site name="LeftForeArm" size="0.01" rgba="1 0 0 1"/>
+                    <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    <body name="LeftHand" pos="0.0117407218 0.005204860770000001 0.259241226">
+                      <joint name="LeftHand" type="ball"/>
+                      <site name="LeftHand" size="0.01" rgba="1 0 0 1"/>
+                      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                      <body name="LeftHandThumb1" pos="0.0286732364 -0.029442858699999998 0.0395956516">
+                        <joint name="LeftHandThumb1" type="ball"/>
+                        <site name="LeftHandThumb1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="LeftHandThumb2" pos="4.51622475e-08 6.45308119e-08 0.0335040307">
+                          <joint name="LeftHandThumb2" type="ball"/>
+                          <site name="LeftHandThumb2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="LeftHandThumb3" pos="-4.4710781699999994e-08 -2.93693687e-08 0.037565124">
+                            <joint name="LeftHandThumb3" type="ball"/>
+                            <site name="LeftHandThumb3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="LeftHandThumb4" pos="5.8781243699999995e-08 -6.19059526e-09 0.0309999704">
+                              <joint name="LeftHandThumb4" type="ball"/>
+                              <site name="LeftHandThumb4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="LeftHandIndex1" pos="0.000867575407 -0.023452754 0.100309181">
+                        <joint name="LeftHandIndex1" type="ball"/>
+                        <site name="LeftHandIndex1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="LeftHandIndex2" pos="2.42767352e-08 3.08199487e-08 0.0406109953">
+                          <joint name="LeftHandIndex2" type="ball"/>
+                          <site name="LeftHandIndex2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="LeftHandIndex3" pos="8.04225515e-08 8.45241096e-09 0.03248873">
+                            <joint name="LeftHandIndex3" type="ball"/>
+                            <site name="LeftHandIndex3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="LeftHandIndex4" pos="1.72217163e-08 2.5227572e-08 0.0263970876">
+                              <joint name="LeftHandIndex4" type="ball"/>
+                              <site name="LeftHandIndex4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="LeftHandMiddle1" pos="-0.00104109183 -6.76779216e-05 0.09502980230000001">
+                        <joint name="LeftHandMiddle1" type="ball"/>
+                        <site name="LeftHandMiddle1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="LeftHandMiddle2" pos="9.37434926e-08 9.79924987e-08 0.045687375100000004">
+                          <joint name="LeftHandMiddle2" type="ball"/>
+                          <site name="LeftHandMiddle2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="LeftHandMiddle3" pos="4.04745486e-09 6.22627218e-08 0.0365497494">
+                            <joint name="LeftHandMiddle3" type="ball"/>
+                            <site name="LeftHandMiddle3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="LeftHandMiddle4" pos="6.56328438e-08 -2.1488132200000003e-08 0.027412438400000003">
+                              <joint name="LeftHandMiddle4" type="ball"/>
+                              <site name="LeftHandMiddle4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="LeftHandRing1" pos="-0.000867514238 0.0226744246 0.0892171001">
+                        <joint name="LeftHandRing1" type="ball"/>
+                        <site name="LeftHandRing1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="LeftHandRing2" pos="2.8426056599999997e-08 -1.66922936e-08 0.040610981">
+                          <joint name="LeftHandRing2" type="ball"/>
+                          <site name="LeftHandRing2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="LeftHandRing3" pos="2.69776163e-08 4.2109282e-09 0.0365499043">
+                            <joint name="LeftHandRing3" type="ball"/>
+                            <site name="LeftHandRing3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="LeftHandRing4" pos="-3.79034851e-08 -8.99070159e-08 0.027412307299999997">
+                              <joint name="LeftHandRing4" type="ball"/>
+                              <site name="LeftHandRing4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="LeftHandPinky1" pos="0.0017350249 0.04467214109999999 0.0797701931">
+                        <joint name="LeftHandPinky1" type="ball"/>
+                        <site name="LeftHandPinky1" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                        <body name="LeftHandPinky2" pos="7.27843511e-08 9.3553765e-09 0.0335040712">
+                          <joint name="LeftHandPinky2" type="ball"/>
+                          <site name="LeftHandPinky2" size="0.01" rgba="1 0 0 1"/>
+                          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                          <body name="LeftHandPinky3" pos="-5.85262889e-08 -4.58743125e-08 0.0284276485">
+                            <joint name="LeftHandPinky3" type="ball"/>
+                            <site name="LeftHandPinky3" size="0.01" rgba="1 0 0 1"/>
+                            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            <body name="LeftHandPinky4" pos="-7.78088633e-08 4.94400273e-08 0.0263970661">
+                              <joint name="LeftHandPinky4" type="ball"/>
+                              <site name="LeftHandPinky4" size="0.01" rgba="1 0 0 1"/>
+                              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                      <body name="LeftForeArmEnd" pos="0.0 -0.0 0.0">
+                        <joint name="LeftForeArmEnd" type="ball"/>
+                        <site name="LeftForeArmEnd" size="0.01" rgba="1 0 0 1"/>
+                        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                      </body>
+                    </body>
+                    <body name="LeftArmEnd" pos="4.00792269e-16 9.155368789999999e-18 -3.03205474e-17">
+                      <joint name="LeftArmEnd" type="ball"/>
+                      <site name="LeftArmEnd" size="0.01" rgba="1 0 0 1"/>
+                      <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="RightUpLeg" pos="-0.112899361 -4.37811241e-08 -5.41907593e-08">
+        <joint name="RightUpLeg" type="ball"/>
+        <site name="RightUpLeg" size="0.01" rgba="1 0 0 1"/>
+        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+        <body name="RightLeg" pos="4.06874415e-08 2.16508837e-06 -0.382003288">
+          <joint name="RightLeg" type="ball"/>
+          <site name="RightLeg" size="0.01" rgba="1 0 0 1"/>
+          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+          <body name="RightFoot" pos="2.34040795e-08 1.7754560999999998e-08 -0.399008484">
+            <joint name="RightFoot" type="ball"/>
+            <site name="RightFoot" size="0.01" rgba="1 0 0 1"/>
+            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+            <body name="RightToeBase" pos="8.322946090000001e-08 -0.152616587 -2.00084855e-08">
+              <joint name="RightToeBase" type="ball"/>
+              <site name="RightToeBase" size="0.01" rgba="1 0 0 1"/>
+              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+              <body name="RightToeBaseEnd" pos="1.1352030400000002e-16 -0.0737070894 -2.6645352600000003e-17">
+                <joint name="RightToeBaseEnd" type="ball"/>
+                <site name="RightToeBaseEnd" size="0.01" rgba="1 0 0 1"/>
+                <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+              </body>
+            </body>
+            <body name="RightLegEnd" pos="3.7732815600000004e-18 -1.54514225e-17 -3.17678035e-17">
+              <joint name="RightLegEnd" type="ball"/>
+              <site name="RightLegEnd" size="0.01" rgba="1 0 0 1"/>
+              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+            </body>
+          </body>
+          <body name="RightUpLegEnd" pos="0.0 -0.0 0.0">
+            <joint name="RightUpLegEnd" type="ball"/>
+            <site name="RightUpLegEnd" size="0.01" rgba="1 0 0 1"/>
+            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+          </body>
+        </body>
+      </body>
+      <body name="LeftUpLeg" pos="0.113156643 -3.5843104300000004e-08 5.637718e-08">
+        <joint name="LeftUpLeg" type="ball"/>
+        <site name="LeftUpLeg" size="0.01" rgba="1 0 0 1"/>
+        <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+        <body name="LeftLeg" pos="3.96562187e-06 -3.90832592e-05 -0.382004128">
+          <joint name="LeftLeg" type="ball"/>
+          <site name="LeftLeg" size="0.01" rgba="1 0 0 1"/>
+          <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+          <body name="LeftFoot" pos="6.99668022e-09 -1.10017036e-07 -0.399008179">
+            <joint name="LeftFoot" type="ball"/>
+            <site name="LeftFoot" size="0.01" rgba="1 0 0 1"/>
+            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+            <body name="LeftToeBase" pos="1.27913745e-08 -0.152616472 -6.146619399999999e-08">
+              <joint name="LeftToeBase" type="ball"/>
+              <site name="LeftToeBase" size="0.01" rgba="1 0 0 1"/>
+              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+              <body name="LeftToeBaseEnd" pos="-2.9873673e-16 -0.0753999615 9.85322934e-17">
+                <joint name="LeftToeBaseEnd" type="ball"/>
+                <site name="LeftToeBaseEnd" size="0.01" rgba="1 0 0 1"/>
+                <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+              </body>
+            </body>
+            <body name="LeftLegEnd" pos="-2.2540700399999998e-18 -1.59377203e-17 7.51349475e-18">
+              <joint name="LeftLegEnd" type="ball"/>
+              <site name="LeftLegEnd" size="0.01" rgba="1 0 0 1"/>
+              <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+            </body>
+          </body>
+          <body name="LeftUpLegEnd" pos="0.0 -0.0 0.0">
+            <joint name="LeftUpLegEnd" type="ball"/>
+            <site name="LeftUpLegEnd" size="0.01" rgba="1 0 0 1"/>
+            <geom type="sphere" size="0.015" rgba="0.5 0.5 0.5 1"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

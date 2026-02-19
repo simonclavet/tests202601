@@ -163,6 +163,129 @@ static void TransformDataSampleFrameCubic(
     }
 }
 
+// Accumulate local rotations from root down to (but not including) joint j
+static Quaternion TransformDataParentGlobalRotation(const TransformData* data, int jointIndex)
+{
+    int chain[64];
+    int chainLen = 0;
+    int j = data->parents[jointIndex];
+    while (j >= 0 && chainLen < 64)
+    {
+        chain[chainLen++] = j;
+        j = data->parents[j];
+    }
+    Quaternion rot = QuaternionIdentity();
+    for (int k = chainLen - 1; k >= 0; k--)
+    {
+        rot = QuaternionMultiply(rot, data->localRotations[chain[k]]);
+    }
+    return rot;
+}
+
+// sum of channelCounts of joints [0, jointIndex) — gives the offset
+// into a frame's channel data where jointIndex's channels begin
+static int BVHJointChannelOffset(const BVHData* bvh, int jointIndex)
+{
+    int offset = 0;
+    for (int i = 0; i < jointIndex; i++)
+    {
+        offset += bvh->joints[i].channelCount;
+    }
+    return offset;
+}
+
+// decompose quaternion into Euler angles (degrees) matching a BVH joint's
+// rotation channel order. writes one float per rotation channel found.
+// the channels array and channelCount come from BVHJointData.
+static void QuaternionToChannelOrder(
+    Quaternion q,
+    const char* channels,
+    int channelCount,
+    float* outDegrees)
+{
+    // build rotation matrix from quaternion
+    const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+
+    // column-major: m[col][row]
+    const float m00 = 1.0f - 2.0f * (yy + zz);
+    const float m01 = 2.0f * (xy + wz);
+    const float m02 = 2.0f * (xz - wy);
+    const float m10 = 2.0f * (xy - wz);
+    const float m11 = 1.0f - 2.0f * (xx + zz);
+    const float m12 = 2.0f * (yz + wx);
+    const float m20 = 2.0f * (xz + wy);
+    const float m21 = 2.0f * (yz - wx);
+    const float m22 = 1.0f - 2.0f * (xx + yy);
+
+    // figure out rotation axis order from channels
+    int axes[3];
+    int rotCount = 0;
+    for (int c = 0; c < channelCount && rotCount < 3; c++)
+    {
+        if (channels[c] == CHANNEL_X_ROTATION) axes[rotCount++] = 0;
+        else if (channels[c] == CHANNEL_Y_ROTATION) axes[rotCount++] = 1;
+        else if (channels[c] == CHANNEL_Z_ROTATION) axes[rotCount++] = 2;
+    }
+    if (rotCount != 3) return;
+
+    // R = R(axes[0]) * R(axes[1]) * R(axes[2])
+    // store full matrix as m[row][col] for indexing
+    const float mat[3][3] = {
+        { m00, m10, m20 },
+        { m01, m11, m21 },
+        { m02, m12, m22 }
+    };
+
+    const int a0 = axes[0], a1 = axes[1], a2 = axes[2];
+
+    // for intrinsic rotation R = Ra0 * Ra1 * Ra2:
+    // middle angle from mat[a0][a2], first and third from atan2
+    float angle0, angle1, angle2;
+
+    if (a0 != a2)
+    {
+        // Tait-Bryan angles (all axes different)
+        // sign depends on whether the axes form an even or odd permutation
+        const int sign = ((a1 - a0 + 3) % 3 == 1) ? 1 : -1;
+
+        angle1 = asinf(Clamp((float)sign * mat[a0][a2], -1.0f, 1.0f));
+        const float cosA1 = cosf(angle1);
+
+        if (fabsf(cosA1) > 1e-6f)
+        {
+            angle0 = atan2f(-sign * mat[a1][a2], mat[a2][a2]);
+            angle2 = atan2f(-sign * mat[a0][a1], mat[a0][a0]);
+        }
+        else
+        {
+            // gimbal lock
+            angle0 = atan2f(sign * mat[a2][a1], mat[a1][a1]);
+            angle2 = 0.0f;
+        }
+    }
+    else
+    {
+        // Euler angles (first == last axis, e.g. XYX) — rare in BVH
+        angle0 = 0.0f;
+        angle1 = 0.0f;
+        angle2 = 0.0f;
+    }
+
+    int rotIdx = 0;
+    for (int c = 0; c < channelCount; c++)
+    {
+        if (channels[c] >= CHANNEL_X_ROTATION)
+        {
+            if (rotIdx == 0) outDegrees[rotIdx] = angle0 * RAD2DEG;
+            else if (rotIdx == 1) outDegrees[rotIdx] = angle1 * RAD2DEG;
+            else if (rotIdx == 2) outDegrees[rotIdx] = angle2 * RAD2DEG;
+            rotIdx++;
+        }
+    }
+}
+
 // Compute forward kinematics on the transform buffer
 static void TransformDataForwardKinematics(TransformData* data)
 {

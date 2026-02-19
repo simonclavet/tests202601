@@ -183,6 +183,9 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
 
     config.exposure = ResolveFloatConfig(buffer, "exposure", config.exposure, argc, argv);
 
+    config.showControlledCharacter = ResolveBoolConfig(buffer, "showControlledCharacter", config.showControlledCharacter, argc, argv);
+    config.showSequenceCharacters = ResolveBoolConfig(buffer, "showSequenceCharacters", config.showSequenceCharacters, argc, argv);
+
     config.drawOrigin = ResolveBoolConfig(buffer, "drawOrigin", config.drawOrigin, argc, argv);
     config.drawGrid = ResolveBoolConfig(buffer, "drawGrid", config.drawGrid, argc, argv);
     config.drawChecker = ResolveBoolConfig(buffer, "drawChecker", config.drawChecker, argc, argv);
@@ -279,6 +282,9 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"ambientLightStrength\": %.6f,\n", config.ambientLightStrength);
 
     fprintf(file, "    \"exposure\": %.6f,\n", config.exposure);
+
+    fprintf(file, "    \"showControlledCharacter\": %s,\n", config.showControlledCharacter ? "true" : "false");
+    fprintf(file, "    \"showSequenceCharacters\": %s,\n", config.showSequenceCharacters ? "true" : "false");
 
     fprintf(file, "    \"drawOrigin\": %s,\n", config.drawOrigin ? "true" : "false");
     fprintf(file, "    \"drawGrid\": %s,\n", config.drawGrid ? "true" : "false");

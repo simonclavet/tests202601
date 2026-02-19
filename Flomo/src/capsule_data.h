@@ -252,6 +252,7 @@ static void CapsuleDataAppendFromTransformData(
             xforms->globalRotations[p],
             QuaternionBetween(Vector3{ 1.0f, 0.0f, 0.0f }, Vector3Normalize(xforms->localPositions[i])));
 
+        assert(data->capsuleCount < (int)data->capsulePositions.size());
         data->capsulePositions[data->capsuleCount] = capsulePosition;
         data->capsuleRotations[data->capsuleCount] = capsuleRotation;
         data->capsuleHalfLengths[data->capsuleCount] = capsuleHalfLength;

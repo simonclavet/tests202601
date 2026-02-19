@@ -13,7 +13,7 @@
 #include "utils.h"
 
 // Un-comment to enable profiling
-//#define ENABLE_PROFILE
+#define ENABLE_PROFILE
 #include "profiler.h"
 
 
@@ -214,7 +214,6 @@ static void ShaderUniformsInit(ShaderUniforms* uniforms, Shader shader)
 // Animation playback state and settings
 struct ScrubberSettings {
     // Playback controls
-    bool playing;
     bool looping;
     bool inplace;       // Lock root position during playback
     float playTime;
@@ -236,7 +235,6 @@ struct ScrubberSettings {
 
 static inline void ScrubberSettingsInit(ScrubberSettings* settings, int argc, char** argv)
 {
-    settings->playing = ArgBool(argc, argv, "playing", true);
     settings->looping = ArgBool(argc, argv, "looping", true);
     settings->inplace = ArgBool(argc, argv, "inplace", false);
     settings->playTime = ArgFloat(argc, argv, "playTime", 0.0f);
@@ -293,6 +291,15 @@ static inline void ScrubberSettingsClamp(ScrubberSettings* settings, CharacterDa
     settings->timeMin = settings->frameMin * characterData->bvhData[characterData->active].frameTime;
 
     settings->playTime = Clamp(settings->playTime, settings->timeMin, settings->timeMax);
+}
+
+static inline void StopTrainingThread(TrainingThreadControl* ctrl)
+{
+    if (ctrl->thread.joinable())
+    {
+        ctrl->stopRequested.store(true);
+        ctrl->thread.join();
+    }
 }
 
 // Helper: Setup state after characters are loaded
@@ -807,6 +814,10 @@ struct ApplicationState {
     vector<BVHGenoMapping> genoMappings;
     BVHGenoMapping ccGenoMapping = {};
 
+    // Test augmentation (for visualizing augmentations on sequence characters)
+    MotionTrainingAugmentations testAugmentations;
+    bool augmentationsCreated = false;
+
     // Debug timescale system
     // numpad-: halve debugTimescale
     // numpad+: double debugTimescale (max 1.0), also unpause
@@ -815,8 +826,10 @@ struct ApplicationState {
     bool debugPaused = false;
     double worldTime = 0.0;  // accumulated time with timescale applied
 
-    // Neural Network state
-    NetworkState networkState;
+    // Neural Network state (split for threading: training on GPU, runtime on CPU)
+    NetworkState trainingNetworks;
+    NetworkState runtimeNetworks;
+    TrainingThreadControl trainingCtrl;
 
     // Flag for pending database rebuild (set when config changes, cleared when rebuilt)
     bool animDatabaseRebuildPending = false;
@@ -1181,14 +1194,13 @@ static inline void ImGuiRenderSettings(AppConfig* config,
     ImGui::End();
 }
 
-static inline void ImGuiCharacterData(
-    CharacterData* characterData,
-    CameraSystem* camera,
-    ControlledCharacter* controlledCharacter,
-    char* errMsg,
-    int argc,
-    char** argv)
+static inline void ImGuiCharacterData(ApplicationState* app)
 {
+    AppConfig* config = &app->config;
+    CharacterData* characterData = &app->characterData;
+    CameraSystem* camera = &app->camera;
+    ControlledCharacter* controlledCharacter = &app->controlledCharacter;
+
     float offsetHeight = 280.0f;
     ImGui::SetNextWindowPos(ImVec2(20, offsetHeight), ImGuiCond_FirstUseEver);
 
@@ -1197,19 +1209,37 @@ static inline void ImGuiCharacterData(
 
     ImGui::SetNextWindowSize(ImVec2(190, (CHARACTERS_GUI_SLOTS - 1) * 30 + 150), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Characters")) {
-        //#if !defined(PLATFORM_WEB)
-        //        if (ImGui::Button("Open")) {
-        //            fileDialogState->windowActive = true;
-        //        }
-        //        ImGui::SameLine();
-        //#endif
+        ImGui::Checkbox("Show Controlled", &config->showControlledCharacter);
+        ImGui::SameLine();
+        ImGui::Checkbox("Show Sequences", &config->showSequenceCharacters);
+
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::InputFloat("Timescale", &app->debugTimescale, 0.0f, 0.0f, "%.4f");
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("num+/num-, soft pause by holding *"); }
+
+        // auto-switch camera when hiding the tracked character type
+        if (!config->showControlledCharacter && camera->trackControlledCharacter)
+        {
+            if (config->showSequenceCharacters && characterData->count > 0)
+            {
+                camera->trackControlledCharacter = false;
+            }
+        }
+        if (!config->showSequenceCharacters && !camera->trackControlledCharacter)
+        {
+            if (config->showControlledCharacter && controlledCharacter->active)
+            {
+                camera->trackControlledCharacter = true;
+            }
+        }
+
         if (ImGui::Button("Clear")) {
             characterData->clearRequested = true;  // Handled in main update with full state access
-            errMsg[0] = '\0';
+            app->errMsg[0] = '\0';
         }
 
         // Show controlled character first if active (as camera target option)
-        if (controlledCharacter->active)
+        if (config->showControlledCharacter && controlledCharacter->active)
         {
             const bool isSelected = camera->trackControlledCharacter;
             if (ImGui::RadioButton("Controlled", isSelected))
@@ -1229,6 +1259,7 @@ static inline void ImGuiCharacterData(
             ImGui::GetWindowDrawList()->AddRect(min, max, IM_COL32(128, 128, 128, 255));
         }
 
+        if (config->showSequenceCharacters)
         for (int i = 0; i < characterData->count; i++) {
             string bvhNameShort;
             if (characterData->names[i].length() < 100) {
@@ -1264,7 +1295,7 @@ static inline void ImGuiCharacterData(
             ImGui::GetWindowDrawList()->AddRect(min, max, IM_COL32(128, 128, 128, 255));
         }
 
-        if (characterData->count > 0) {
+        if (config->showSequenceCharacters && characterData->count > 0) {
             bool scaleM = characterData->scales[characterData->active] == 1.0f;
             ImGui::Checkbox("m", &scaleM);
             if (scaleM) characterData->scales[characterData->active] = 1.0f;
@@ -1303,15 +1334,13 @@ static inline void ImGuiCharacterData(
     ImGui::End();
 }
 
-static inline void ImGuiScrubberSettings(
-    ScrubberSettings* settings,
-    CharacterData* characterData,
-    int screenWidth,
-    int screenHeight)
+static inline void ImGuiScrubberSettings(ApplicationState* app)
 {
+    ScrubberSettings* settings = &app->scrubberSettings;
+    CharacterData* characterData = &app->characterData;
     if (characterData->count == 0) { return; }
-    const float sw = (float)screenWidth;
-    const float sh = (float)screenHeight;
+    const float sw = (float)app->screenWidth;
+    const float sh = (float)app->screenHeight;
     const float frameTime = characterData->bvhData[characterData->active].frameTime;
 
     const float padding = 20.0f;
@@ -1331,8 +1360,9 @@ static inline void ImGuiScrubberSettings(
         ImGui::SameLine();
         ImGui::Checkbox("Loop", &settings->looping);
         ImGui::SameLine();
-        ImGui::Checkbox("Play", &settings->playing);
-        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Numpad+: unpause\nNumpad*: pause (hold to advance slow)\nNumpad-/+: adjust speed"); }
+        bool playing = !app->debugPaused;
+        if (ImGui::Checkbox("Play", &playing)) { app->debugPaused = !playing; }
+        if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Spacebar\nNumpad+: unpause\nNumpad*: pause (hold to advance slow)\nNumpad-/+: adjust speed"); }
 
         int frame = ClampInt((int)(settings->playTime / frameTime + 0.5f), settings->frameMin, settings->frameMax);
 
@@ -1368,6 +1398,98 @@ static inline void ImGuiScrubberSettings(
             }
             else {
                 settings->playTime = Clamp(frameFloat * frameTime, settings->timeMin, settings->timeMax);
+            }
+        }
+    }
+    ImGui::End();
+}
+
+static void CreateAugmentations(ApplicationState* app)
+{
+    const int originalCount = app->characterData.count;
+    if (originalCount == 0) return;
+
+    // each original produces 4 augmented copies: 2 aim + 2 timescale
+    const int augmentedMultiplier = 5;
+    CharacterDataReserve(&app->characterData, originalCount * augmentedMultiplier);
+
+    for (int i = 0; i < originalCount; i++)
+    {
+        const int spine3Idx = FindSpine3IndexFromBVH(app->characterData.bvhData[i]);
+        if (spine3Idx < 0)
+        {
+            TraceLog(LOG_WARNING, "CreateAugmentations: spine3 not found in '%s', skipping",
+                app->characterData.names[i].c_str());
+            continue;
+        }
+
+        const std::string baseName = app->characterData.names[i];
+
+        {
+            const BVHData& src = app->characterData.bvhData[i];
+            BVHData neg = CreateAimOffsetBVH(src, spine3Idx, -45.0f * DEG2RAD);
+            CharacterDataAddBVH(&app->characterData, neg, baseName + " (aim-45)");
+        }
+
+        {
+            const BVHData& src = app->characterData.bvhData[i];
+            BVHData pos = CreateAimOffsetBVH(src, spine3Idx, +45.0f * DEG2RAD);
+            CharacterDataAddBVH(&app->characterData, pos, baseName + " (aim+45)");
+        }
+    }
+
+    // timescale augmentations
+    for (int i = 0; i < originalCount; i++)
+    {
+        const std::string baseName = app->characterData.names[i];
+
+        {
+            const BVHData& src = app->characterData.bvhData[i];
+            BVHData slow = CreateTimescaleBVH(src, 0.9f);
+            CharacterDataAddBVH(&app->characterData, slow, baseName + " (ts0.9)");
+        }
+
+        {
+            const BVHData& src = app->characterData.bvhData[i];
+            BVHData fast = CreateTimescaleBVH(src, 1.1f);
+            CharacterDataAddBVH(&app->characterData, fast, baseName + " (ts1.1)");
+        }
+    }
+
+    TraceLog(LOG_INFO, "Created augmentations: %d -> %d characters",
+        originalCount, app->characterData.count);
+    app->augmentationsCreated = true;
+
+    // resize capsule buffer immediately so rendering doesn't overflow before rebuild
+    CapsuleDataUpdateForCharacters(&app->capsuleData, &app->characterData);
+
+    // rebuild database right away with the augmented characters
+    StopTrainingThread(&app->trainingCtrl);
+    app->animDatabase.featuresConfig = app->config.mmConfigEditor;
+    AnimDatabaseRebuild(&app->animDatabase, &app->characterData);
+    NetworkResetAll(&app->trainingNetworks);
+    NetworkResetAll(&app->runtimeNetworks);
+    app->animDatabaseRebuildPending = false;
+}
+
+static inline void ImGuiTestAugmentations(ApplicationState* app)
+{
+    ImGui::SetNextWindowPos(ImVec2(20, 700), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(200, 80), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Test Augmentations"))
+    {
+        float aimDeg = app->testAugmentations.aimAngleOffset * RAD2DEG;
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::SliderFloat("Aim Offset", &aimDeg, -45.0f, 45.0f, "%.1f"))
+        {
+            app->testAugmentations.aimAngleOffset = aimDeg * DEG2RAD;
+        }
+
+        if (!app->augmentationsCreated)
+        {
+            if (ImGui::Button("Create Augmentations"))
+            {
+                CreateAugmentations(app);
             }
         }
     }
@@ -1605,9 +1727,11 @@ static inline void ImGuiAnimSettings(ApplicationState* app)
             ImGui::Separator();
             if (ImGui::Button("Rebuild Database"))
             {
+                StopTrainingThread(&app->trainingCtrl);
                 db.featuresConfig = editedMMConfig;  // Copy all config including lookahead time and blend root modes
                 AnimDatabaseRebuild(&db, &app->characterData);
-                NetworkResetAll(&app->networkState);
+                NetworkResetAll(&app->trainingNetworks);
+                NetworkResetAll(&app->runtimeNetworks);
                 app->animDatabaseRebuildPending = false;
                 TraceLog(LOG_INFO, "Motion matching config updated");
             }
@@ -1624,31 +1748,10 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
     AppConfig* config = &app->config;
     if (!cc->active) return;
 
-    const bool hasLatentSegmentPredictor = static_cast<bool>(app->networkState.segmentLatentAveragePredictor);
-    const bool hasFlow = static_cast<bool>(app->networkState.latentFlowModel);
-    const bool hasFullFlow = static_cast<bool>(app->networkState.fullFlowModel);
-    const bool hasSinglePosePredictor = static_cast<bool>(app->networkState.singlePosePredictor);
-    const bool hasUncondAdvance = static_cast<bool>(app->networkState.uncondAdvancePredictor);
-    const bool hasMonday = static_cast<bool>(app->networkState.mondayPredictor);
-    const bool hasFridayFlow = static_cast<bool>(app->networkState.fridayFlowModel);
-    const bool hasGlimpse = static_cast<bool>(app->networkState.glimpseFlow)
-        && static_cast<bool>(app->networkState.glimpseDecompressor);
+    const bool hasGlimpse = static_cast<bool>(app->runtimeNetworks.glimpseFlow)
+        && static_cast<bool>(app->runtimeNetworks.glimpseDecompressor);
 
     // if current mode needs networks and there are none, fall back to motion matching
-    if (config->animationMode == AnimationMode::AverageLatentPredictor && !hasLatentSegmentPredictor)
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::FlowSampled && !hasFlow)
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::FullFlowSampled && !hasFullFlow)
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::FridayFlow && !hasFridayFlow)
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
-        config->animationMode = AnimationMode::MotionMatching;
-    if (config->animationMode == AnimationMode::MondayPredictor && !hasMonday)
-        config->animationMode = AnimationMode::MotionMatching;
     if (config->animationMode == AnimationMode::GlimpseMode && !hasGlimpse)
         config->animationMode = AnimationMode::MotionMatching;
 
@@ -1663,20 +1766,6 @@ static inline void ImGuiPlayerControl(ApplicationState* app)
             for (int i = 0; i < static_cast<int>(AnimationMode::COUNT); ++i)
             {
                 const AnimationMode mode = static_cast<AnimationMode>(i);
-                if (mode == AnimationMode::AverageLatentPredictor && !hasLatentSegmentPredictor)
-                    continue;
-                if (mode == AnimationMode::FlowSampled && !hasFlow)
-                    continue;
-                if (mode == AnimationMode::FullFlowSampled && !hasFullFlow)
-                    continue;
-                if (mode == AnimationMode::FridayFlow && !hasFridayFlow)
-                    continue;
-                if (mode == AnimationMode::SinglePosePredictor && !hasSinglePosePredictor)
-                    continue;
-                if (mode == AnimationMode::UnconditionedAdvance && (!hasUncondAdvance || !hasSinglePosePredictor))
-                    continue;
-                if (mode == AnimationMode::MondayPredictor && !hasMonday)
-                    continue;
                 if (mode == AnimationMode::GlimpseMode && !hasGlimpse)
                     continue;
                 const bool isSelected = (currentMode == i);
@@ -1734,7 +1823,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                 SaveConfigToFolder(
                     app->config,
                     app->characterData,
-                    app->networkState,
+                    app->runtimeNetworks,
                     app->animDatabase,
                     folderPath);
             }
@@ -1755,7 +1844,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
             if (SaveConfigToNewFolder(
                 app->config,
                 app->characterData,
-                app->networkState,
+                app->runtimeNetworks,
                 app->animDatabase,
                 folderName))
             {
@@ -1814,6 +1903,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                 {
                     const std::string& folderName =
                         app->savedConfigFolders[i];
+                    StopTrainingThread(&app->trainingCtrl);
                     AppConfig newConfig;
                     if (LoadConfigFromFolder(
                         folderName,
@@ -1823,7 +1913,7 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
                         app->scrubberSettings,
                         app->animDatabase,
                         app->controlledCharacter,
-                        app->networkState,
+                        app->runtimeNetworks,
                         app->argc,
                         app->argv,
                         app->errMsg,
@@ -1848,45 +1938,40 @@ static inline void ImGuiSavedConfigs(ApplicationState* app)
 
 static inline void ImGuiNeuralNetworks(ApplicationState* app)
 {
+    TrainingThreadControl& ctrl = app->trainingCtrl;
+
     ImGui::SetNextWindowPos(
         ImVec2(800, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(
         ImVec2(300, 500), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Neural Networks"))
     {
-        const bool training =
-            app->networkState.isTraining;
+        const bool training = ctrl.isRunning.load();
         const bool hasNetworks =
-            app->networkState.featuresAutoEncoder
-            || app->networkState.poseAutoEncoder
-            || app->networkState.segmentAutoEncoder
-            || app->networkState.segmentLatentAveragePredictor
-            || app->networkState.singlePosePredictor
-            || app->networkState.latentFlowModel
-            || app->networkState.fullFlowModel
-            || app->networkState.fridayFlowModel
-            || app->networkState.uncondAdvancePredictor
-            || app->networkState.mondayPredictor
-            || app->networkState.glimpseFlow
-            || app->networkState.glimpseDecompressor;
+            static_cast<bool>(app->runtimeNetworks.glimpseFlow)
+            || static_cast<bool>(app->runtimeNetworks.glimpseDecompressor);
 
         if (!training)
         {
             if (ImGui::Button("Start Training"))
             {
                 if (app->animDatabase.valid
-                    && app->animDatabase
-                        .poseGenSegmentFlatDim > 0)
+                    && app->animDatabase.poseGenSegmentFlatDim > 0)
                 {
                     NetworkInitAllForTraining(
-                        &app->networkState,
+                        &app->trainingNetworks,
                         &app->animDatabase);
+                    ctrl.stopRequested.store(false);
+                    ctrl.thread = std::thread(
+                        TrainingThreadMain,
+                        &app->trainingNetworks,
+                        &app->animDatabase,
+                        &ctrl);
                 }
                 else
                 {
                     TraceLog(LOG_WARNING,
-                        "Cannot start: AnimDatabase"
-                        " not valid");
+                        "Cannot start: AnimDatabase not valid");
                 }
             }
 
@@ -1895,7 +1980,14 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
                 ImGui::SameLine();
                 if (ImGui::Button("Continue Training"))
                 {
-                    app->networkState.isTraining = true;
+                    // resume: trainingNetworks already has models from last session
+                    app->trainingNetworks.isTraining = true;
+                    ctrl.stopRequested.store(false);
+                    ctrl.thread = std::thread(
+                        TrainingThreadMain,
+                        &app->trainingNetworks,
+                        &app->animDatabase,
+                        &ctrl);
                 }
             }
         }
@@ -1903,206 +1995,74 @@ static inline void ImGuiNeuralNetworks(ApplicationState* app)
         {
             if (ImGui::Button("Stop Training"))
             {
-                app->networkState.isTraining = false;
+                ctrl.stopRequested.store(true);
+                if (ctrl.thread.joinable()) { ctrl.thread.join(); }
             }
         }
 
         // checkboxes (independent of training)
-        if (app->networkState.featuresAutoEncoder)
-        {
-            ImGui::Checkbox("Use Denoiser", &app->config.useMMFeatureDenoiser);
-        }
-        if (app->networkState.segmentAutoEncoder)
-        {
-            ImGui::Checkbox("Test Segment AE", &app->config.testSegmentAutoEncoder);
-        }
         if (app->animDatabase.pcaSegmentK > 0)
         {
             ImGui::Checkbox("Test PCA Reconstruction", &app->config.testPcaReconstruction);
         }
-        if (app->networkState.poseAutoEncoder)
-        {
-            ImGui::Checkbox("Test Pose AE", &app->config.testPoseAutoEncoder);
-        }
 
+        // read live stats from atomics (lock-free)
+        const int flowIter = ctrl.glimpseFlowIterations.load();
+        const float flowLoss = ctrl.glimpseFlowLossSmoothed.load();
+        const int decompIter = ctrl.glimpseDecompressorIterations.load();
+        const float decompLoss = ctrl.glimpseDecompressorLossSmoothed.load();
+        const double elapsed = ctrl.trainingElapsedSeconds.load();
 
-        if (training || hasNetworks)
+        if (training || hasNetworks || flowIter > 0 || decompIter > 0)
         {
             ImGui::Separator();
 
-            ImGui::Text("Device: %s",
-                app->networkState.device.is_cuda()
-                    ? "GPU" : "CPU");
-
-            const int totalMin =
-                (int)(app->networkState
-                    .trainingElapsedSeconds / 60.0);
-            const int totalSec =
-                (int)(app->networkState
-                    .trainingElapsedSeconds) % 60;
-            ImGui::Text("Training: %dm %02ds",
-                totalMin, totalSec);
-
-            const bool headstart =
-                app->networkState
-                    .trainingElapsedSeconds
-                    < HEADSTART_SECONDS
-                && !app->networkState
-                    .segmentLatentAveragePredictor;
-            if (headstart)
-            {
-                const int remaining = (int)(
-                    HEADSTART_SECONDS
-                    - app->networkState
-                        .trainingElapsedSeconds);
-                ImGui::Text(
-                    "Headstart: %ds remaining",
-                    remaining);
-            }
+            const int totalMin = (int)(elapsed / 60.0);
+            const int totalSec = (int)(elapsed) % 60;
+            ImGui::Text("Training: %dm %02ds", totalMin, totalSec);
 
             ImGui::Separator();
 
-            const NetworkState& ns = app->networkState;
+            // loss history lives in runtimeNetworks (updated from staging)
+            const NetworkState& ns = app->runtimeNetworks;
             const ImVec2 plotSize(0, 50);
 
-            // log-scale loss plot helper:
-            // converts raw loss to log10, applies
-            // skip slider, and plots
             static float lossPlotSkipPct = 0.0f;
-            auto plotLossLog = [&](
-                const char* label,
-                const std::vector<float>& history)
-            {
-                const int total = (int)history.size();
-                const int skip =
-                    (int)(lossPlotSkipPct * 0.01f
-                        * total);
-                const int count = total - skip;
-                if (count <= 0) return;
-                const float* data = history.data() + skip;
-                ImGui::PlotLines(label,
-                    data, count,
-                    0, nullptr,
-                    FLT_MAX, FLT_MAX, plotSize);
-            };
-
             ImGui::SliderFloat("Skip##lossPlot",
-                &lossPlotSkipPct, 0.0f, 99.0f,
-                "%.0f%%");
+                &lossPlotSkipPct, 0.0f, 99.0f, "%.0f%%");
 
-            if (ns.featureAEIterations > 0)
+            if (flowIter > 0)
             {
-                ImGui::Text("Feature AE  Loss: %.6f  Iter: %d",
-                    ns.featureAELossSmoothed, ns.featureAEIterations);
-                if (!ns.featureAELossHistory.empty())
-                    plotLossLog("##featureAE", ns.featureAELossHistory);
-            }
-
-            if (ns.poseAEIterations > 0)
-            {
-                ImGui::Text("Pose AE  Loss: %.6f  Iter: %d",
-                    ns.poseAELossSmoothed, ns.poseAEIterations);
-                if (!ns.poseAELossHistory.empty())
-                    plotLossLog("##poseAE", ns.poseAELossHistory);
-            }
-
-            if (ns.segmentAEIterations > 0)
-            {
-                ImGui::Text("Segment AE  Loss: %.6f  Iter: %d",
-                    ns.segmentAELossSmoothed, ns.segmentAEIterations);
-                if (!ns.segmentAELossHistory.empty())
-                    plotLossLog("##segmentAE", ns.segmentAELossHistory);
-            }
-
-            if (ns.latentSegmentPredictorIterations > 0)
-            {
-                ImGui::Text("Seg Pred    Loss: %.6f  Iter: %d",
-                    ns.latentSegmentPredictorLossSmoothed,
-                    ns.latentSegmentPredictorIterations);
-                if (!ns.latentSegmentPredictorLossHistory.empty())
-                    plotLossLog("##segPredictor", ns.latentSegmentPredictorLossHistory);
-            }
-
-            if (ns.flowIterations > 0)
-            {
-                ImGui::Text("Flow Match  Loss: %.6f  Iter: %d",
-                    ns.flowLossSmoothed, ns.flowIterations);
-                if (!ns.flowLossHistory.empty())
-                    plotLossLog("##flow", ns.flowLossHistory);
-            }
-
-            if (ns.segmentE2eIterations > 0)
-            {
-                ImGui::Text("Segment E2E  Loss: %.6f  Iter: %d",
-                    ns.segmentE2eLossSmoothed, ns.segmentE2eIterations);
-                if (!ns.segmentE2eLossHistory.empty())
-                    plotLossLog("##segmentE2e", ns.segmentE2eLossHistory);
-            }
-
-            if (ns.fullFlowIterations > 0)
-            {
-                ImGui::Text("FullFlow    Loss: %.6f  Iter: %d",
-                    ns.fullFlowLossSmoothed, ns.fullFlowIterations);
-                if (!ns.fullFlowLossHistory.empty())
-                    plotLossLog("##fullFlow", ns.fullFlowLossHistory);
-            }
-
-            if (ns.fridayFlowIterations > 0)
-            {
-                ImGui::Text("FridayFlow  Loss: %.6f  Iter: %d",
-                    ns.fridayFlowLossSmoothed, ns.fridayFlowIterations);
-                if (!ns.fridayFlowLossHistory.empty())
-                    plotLossLog("##fridayFlow", ns.fridayFlowLossHistory);
-            }
-
-            if (ns.singlePosePredictorIterations > 0)
-            {
-                ImGui::Text("SinglePose  Loss: %.6f  Iter: %d",
-                    ns.singlePosePredictorLossSmoothed,
-                    ns.singlePosePredictorIterations);
-                if (!ns.singlePosePredictorLossHistory.empty())
-                    plotLossLog("##singlePose", ns.singlePosePredictorLossHistory);
-            }
-
-            if (ns.singlePoseE2eIterations > 0)
-            {
-                ImGui::Text("SinglePose E2E  Loss: %.6f  Iter: %d",
-                    ns.singlePoseE2eLossSmoothed, ns.singlePoseE2eIterations);
-                if (!ns.singlePoseE2eLossHistory.empty())
-                    plotLossLog("##singlePoseE2e", ns.singlePoseE2eLossHistory);
-            }
-
-            if (ns.uncondAdvanceIterations > 0)
-            {
-                ImGui::Text("UncondAdvance  Loss: %.6f  Iter: %d",
-                    ns.uncondAdvanceLossSmoothed, ns.uncondAdvanceIterations);
-                if (!ns.uncondAdvanceLossHistory.empty())
-                    plotLossLog("##uncondAdvance", ns.uncondAdvanceLossHistory);
-            }
-
-            if (ns.mondayIterations > 0)
-            {
-                ImGui::Text("Monday  Loss: %.6f  Iter: %d",
-                    ns.mondayLossSmoothed, ns.mondayIterations);
-                if (!ns.mondayLossHistory.empty())
-                    plotLossLog("##monday", ns.mondayLossHistory);
-            }
-
-            if (ns.glimpseFlowIterations > 0)
-            {
-                ImGui::Text("GlimpseFlow  Loss: %.6f  Iter: %d",
-                    ns.glimpseFlowLossSmoothed, ns.glimpseFlowIterations);
+                ImGui::Text("GlimpseFlow  Loss: %.6f  Iter: %d", flowLoss, flowIter);
                 if (!ns.glimpseFlowLossHistory.empty())
-                    plotLossLog("##glimpseFlow", ns.glimpseFlowLossHistory);
+                {
+                    const int total = (int)ns.glimpseFlowLossHistory.size();
+                    const int skip = (int)(lossPlotSkipPct * 0.01f * total);
+                    const int count = total - skip;
+                    if (count > 0)
+                    {
+                        ImGui::PlotLines("##glimpseFlow",
+                            ns.glimpseFlowLossHistory.data() + skip, count,
+                            0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                    }
+                }
             }
 
-            if (ns.glimpseDecompressorIterations > 0)
+            if (decompIter > 0)
             {
-                ImGui::Text("GlimpseDecomp  Loss: %.6f  Iter: %d",
-                    ns.glimpseDecompressorLossSmoothed,
-                    ns.glimpseDecompressorIterations);
+                ImGui::Text("GlimpseDecomp  Loss: %.6f  Iter: %d", decompLoss, decompIter);
                 if (!ns.glimpseDecompressorLossHistory.empty())
-                    plotLossLog("##glimpseDecomp", ns.glimpseDecompressorLossHistory);
+                {
+                    const int total = (int)ns.glimpseDecompressorLossHistory.size();
+                    const int skip = (int)(lossPlotSkipPct * 0.01f * total);
+                    const int count = total - skip;
+                    if (count > 0)
+                    {
+                        ImGui::PlotLines("##glimpseDecomp",
+                            ns.glimpseDecompressorLossHistory.data() + skip, count,
+                            0, nullptr, FLT_MAX, FLT_MAX, plotSize);
+                    }
+                }
             }
         }
     }
@@ -2252,6 +2212,8 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         if (app->characterData.count > prevBvhCount)
         {
+            StopTrainingThread(&app->trainingCtrl);
+
             // Setup state after loading characters
             OnCharactersLoaded(
                 app->characterData,
@@ -2260,7 +2222,7 @@ static void ApplicationUpdate(void* voidApplicationState)
                 app->animDatabase,
                 app->controlledCharacter,
                 app->config,
-                app->networkState,
+                app->runtimeNetworks,
                 app->argc,
                 app->argv);
 
@@ -2288,6 +2250,8 @@ static void ApplicationUpdate(void* voidApplicationState)
             //ControlledCharacterFree(&app->controlledCharacter);
             app->controlledCharacter.active = false;
         }
+
+        app->augmentationsCreated = false;
 
         // Reset geno mappings
         app->genoMappings.clear();
@@ -2367,6 +2331,10 @@ static void ApplicationUpdate(void* voidApplicationState)
             app->debugPaused = true;
             TraceLog(LOG_INFO, "Paused (hold / to rewind at half speed)");
         }
+        if (IsKeyPressed(KEY_SPACE))
+        {
+            app->debugPaused = !app->debugPaused;
+        }
 
         // Compute effective dt
         if (app->debugPaused)
@@ -2397,7 +2365,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Tick time forward
 
-    if (app->scrubberSettings.playing)
+    if (!app->debugPaused)
     {
         app->scrubberSettings.playTime += effectiveDt;
 
@@ -2411,6 +2379,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     // Sample Animation Data
 
+    if (app->config.showSequenceCharacters)
     for (int i = 0; i < app->characterData.count; i++)
     {
         if (app->scrubberSettings.sampleMode == 0)
@@ -2468,28 +2437,42 @@ static void ApplicationUpdate(void* voidApplicationState)
                 app->characterData.xformData[i].localRotations[0]);
         }
 
+        // apply test aim offset distributed across spine1, spine2, spine3 (rotation around world Y)
+        const int spine3 = app->animDatabase.spine3Index;
+        if (spine3 >= 0 && spine3 < app->characterData.xformData[i].jointCount
+            && app->testAugmentations.aimAngleOffset != 0.0f)
+        {
+            TransformData& xd = app->characterData.xformData[i];
+            const int spine2 = xd.parents[spine3];
+            const int spine1 = (spine2 >= 0) ? xd.parents[spine2] : -1;
+
+            const float totalAngle = app->testAugmentations.aimAngleOffset;
+            const int spineCount = 1 + (spine2 >= 0 ? 1 : 0) + (spine1 >= 0 ? 1 : 0);
+            const float perJointAngle = totalAngle / (float)spineCount;
+
+            const int spineJoints[] = { spine1, spine2, spine3 };
+            for (int s = 0; s < 3; s++)
+            {
+                const int sj = spineJoints[s];
+                if (sj < 0) continue;
+
+                const Quaternion parentGlobal = TransformDataParentGlobalRotation(&xd, sj);
+                const Quaternion parentGlobalInv = QuaternionInvert(parentGlobal);
+                const Quaternion worldYawRot = QuaternionFromAxisAngle(
+                    Vector3{ 0.0f, 1.0f, 0.0f }, perJointAngle);
+
+                xd.localRotations[sj] = QuaternionMultiply(
+                    parentGlobalInv,
+                    QuaternionMultiply(worldYawRot,
+                        QuaternionMultiply(parentGlobal, xd.localRotations[sj])));
+            }
+        }
+
         TransformDataForwardKinematics(&app->characterData.xformData[i]);
     }
 
     // Update Controlled Character (root motion playback)
 
-    if (app->controlledCharacter.active && effectiveDt > 0.0f)
-    {
-        // sync settings from config
-        app->controlledCharacter.animMode = app->config.animationMode;
-        app->controlledCharacter.cursorBlendMode = app->config.cursorBlendMode;
-        app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
-
-        ControlledCharacterUpdate(
-            &app->controlledCharacter,
-            &app->characterData,
-            &app->animDatabase,
-            effectiveDt,
-            app->worldTime,
-            app->config,
-            &app->networkState);
-
-    }
 
     // Update Camera
     const Vector2 mouseDelta = GetMouseDelta();
@@ -2632,7 +2615,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Update Player Control Input (WASD relative to camera)
-    if (app->controlledCharacter.active && 
+    if (app->config.showControlledCharacter && app->controlledCharacter.active &&
         !imguiWantsKeyboard &&
         app->camera.mode != FlomoCameraMode::UnrealEditor)
     {
@@ -2716,10 +2699,29 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
     }
 
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && effectiveDt > 0.0f)
+    {
+        // sync settings from config
+        app->controlledCharacter.animMode = app->config.animationMode;
+        app->controlledCharacter.cursorBlendMode = app->config.cursorBlendMode;
+        app->controlledCharacter.blendPosReturnTime = app->config.blendPosReturnTime;
+
+        ControlledCharacterUpdate(
+            &app->controlledCharacter,
+            &app->characterData,
+            &app->animDatabase,
+            effectiveDt,
+            app->worldTime,
+            app->config,
+            &app->runtimeNetworks);
+
+    }
+
 
     // Create Capsules
 
     CapsuleDataReset(&app->capsuleData);
+    if (app->config.showSequenceCharacters)
     for (int i = 0; i < app->characterData.count; i++)
     {
         CapsuleDataAppendFromTransformData(
@@ -2732,9 +2734,10 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Add controlled character's capsules
-    // (kept even in geno mode for AO/shadows on the ground)
-    if (app->controlledCharacter.active)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active) 
     {
+        assert(app->controlledCharacter.xformData.jointCount > 0);
+        assert(!app->controlledCharacter.xformData.globalPositions.empty());
         CapsuleDataAppendFromTransformData(
             &app->capsuleData,
             &app->controlledCharacter.xformData,
@@ -3047,6 +3050,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
 
         // Draw all sequence characters
+        if (app->config.showSequenceCharacters)
         for (int c = 0; c < app->characterData.count; c++)
         {
             // Update Geno animation from current BVH pose
@@ -3067,13 +3071,13 @@ static void ApplicationUpdate(void* voidApplicationState)
         // Draw controlled character with geno mesh
         const ControlledCharacter& cc =
             app->controlledCharacter;
-        if (cc.active && cc.skeleton)
+        if (app->config.showControlledCharacter && cc.active && cc.skeleton.jointCount > 0)
         {
             if (!app->ccGenoMapping.valid)
             {
                 app->ccGenoMapping =
                     CreateBVHGenoMapping(
-                        cc.skeleton, &app->genoModel);
+                        &cc.skeleton, &app->genoModel);
             }
 
             UpdateGenoAnimationFromBVH(
@@ -3124,6 +3128,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     if (app->config.drawSkeleton)
     {
+        if (app->config.showSequenceCharacters)
         for (int i = 0; i < app->characterData.count; i++)
         {
             DrawSkeleton(
@@ -3134,7 +3139,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
 
         // Draw controlled character skeleton (uses character's color)
-        if (app->controlledCharacter.active && app->controlledCharacter.xformData.jointCount > 0)
+        if (app->config.showControlledCharacter && app->controlledCharacter.active && app->controlledCharacter.xformData.jointCount > 0)
         {
             DrawSkeleton(
                 &app->controlledCharacter.xformData,
@@ -3145,7 +3150,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     }
     // Draw lookahead pose skeleton (semi-transparent magenta)
-    if (app->config.drawLookaheadPose && app->controlledCharacter.active)
+    if (app->config.drawLookaheadPose && app->config.showControlledCharacter && app->controlledCharacter.active)
     {
         DrawSkeleton(
             &app->controlledCharacter.xformLookahead,
@@ -3154,20 +3159,8 @@ static void ApplicationUpdate(void* voidApplicationState)
             ColorAlpha(MAGENTA, 0.3f));
     }
 
-    // Draw glimpse flow predicted future pose (semi-transparent cyan)
-    if (app->config.drawLookaheadPose && app->controlledCharacter.active
-        && app->controlledCharacter.glimpsePoseValid
-        && app->controlledCharacter.animMode == AnimationMode::GlimpseMode)
-    {
-        DrawSkeleton(
-            &app->controlledCharacter.xformGlimpsePose,
-            app->config.drawEndSites,
-            ColorAlpha(SKYBLUE, 0.5f),
-            ColorAlpha(SKYBLUE, 0.3f));
-    }
-
     // Draw basic blend skeleton (semi-transparent green)
-    if (app->config.drawBasicBlend && app->controlledCharacter.active)
+    if (app->config.drawBasicBlend && app->config.showControlledCharacter && app->controlledCharacter.active)
     {
         DrawSkeleton(
             &app->controlledCharacter.xformBasicBlend,
@@ -3181,6 +3174,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     {
         const float velScale = 0.1f;  // scale factor for velocity visualization
 
+        if (app->config.showSequenceCharacters)
         for (int c = 0; c < app->characterData.count; ++c)
         {
             if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
@@ -3221,6 +3215,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     {
         const float accScale = 0.01f;  // scale factor for acceleration visualization (smaller since acc is larger)
 
+        if (app->config.showSequenceCharacters)
         for (int c = 0; c < app->characterData.count; ++c)
         {
             if (c >= (int)app->animDatabase.clipStartFrame.size()) continue;
@@ -3257,7 +3252,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw magic velocity (when drawing velocities)
-    if (app->config.drawVelocities && app->animDatabase.valid)
+    if (app->config.drawVelocities && app->animDatabase.valid && app->config.showSequenceCharacters)
     {
         const float velScale = 0.5f;
 
@@ -3293,7 +3288,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw magic acceleration (when drawing accelerations)
-    if (app->config.drawAccelerations && app->animDatabase.valid)
+    if (app->config.drawAccelerations && app->animDatabase.valid && app->config.showSequenceCharacters)
     {
         const float accScale = 0.1f;
 
@@ -3329,7 +3324,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     };
 
     // Draw root motion velocities from each cursor
-    if (app->controlledCharacter.active && app->config.drawRootVelocities)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawRootVelocities)
     {
         const ControlledCharacter& cc = app->controlledCharacter;
         const float velScale = 0.5f;  // scale for velocity visualization
@@ -3369,7 +3364,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw toe velocities (actual vs blended)
-    if (app->controlledCharacter.active && app->config.drawToeVelocities && app->animDatabase.valid)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawToeVelocities && app->animDatabase.valid)
     {
         const ControlledCharacter& cc = app->controlledCharacter;
         const AnimDatabase& db = app->animDatabase;
@@ -3395,7 +3390,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Magic anchor (from controlled character's world transform)
-    if (app->controlledCharacter.active && app->config.drawMagicAnchor && app->animDatabase.valid)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawMagicAnchor && app->animDatabase.valid)
     {
         const ControlledCharacter& cc = app->controlledCharacter;
         const AnimDatabase& db = app->animDatabase;
@@ -3422,7 +3417,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Magic anchor for animated character (scrubber-controlled)
-    if (app->config.drawMagicAnchor && app->animDatabase.valid && app->characterData.count > 0)
+    if (app->config.drawMagicAnchor && app->config.showSequenceCharacters && app->animDatabase.valid && app->characterData.count > 0)
     {
         const TransformData& xform = app->characterData.xformData[app->characterData.active];
         const AnimDatabase& db = app->animDatabase;
@@ -3462,7 +3457,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Foot IK debug (virtual toe positions, FK foot positions before IK, full FK skeleton before IK)
-    if (app->controlledCharacter.active &&
+    if (app->config.showControlledCharacter && app->controlledCharacter.active &&
         app->config.drawFootIK &&
         app->config.enableFootIK &&
         app->animDatabase.valid)
@@ -3590,7 +3585,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Blend Cursor Skeletons (for debug visualization)
-    if (app->controlledCharacter.active && app->config.drawBlendCursors)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawBlendCursors)
     {
         for (int ci = 0; ci < ControlledCharacter::MAX_BLEND_CURSORS; ++ci)
         {
@@ -3625,20 +3620,21 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     if (app->config.drawTransforms)
     {
+        if (app->config.showSequenceCharacters)
         for (int i = 0; i < app->characterData.count; i++)
         {
             DrawTransforms(&app->characterData.xformData[i]);
         }
 
         // Draw controlled character transforms
-        if (app->controlledCharacter.active)
+        if (app->config.showControlledCharacter && app->controlledCharacter.active)
         {
             DrawTransforms(&app->controlledCharacter.xformData);
         }
     }
 
     // Draw Player Input Arrow
-    if (app->controlledCharacter.active && app->config.drawPlayerInput)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawPlayerInput)
     {
         const PlayerControlInput& input = app->controlledCharacter.playerInput;
         const float velMag = Vector3Length(input.desiredVelocity);
@@ -3705,7 +3701,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Draw Past Position History
-    if (app->controlledCharacter.active && app->config.drawPastHistory)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawPastHistory)
     {
         const ControlledCharacter& cc = app->controlledCharacter;
 
@@ -3816,9 +3812,7 @@ static void ApplicationUpdate(void* voidApplicationState)
         ImGuiCamera(&app->camera, &app->characterData, &app->controlledCharacter, &app->config, app->argc, app->argv);
 
         // Characters
-        ImGuiCharacterData(&app->characterData,
-            &app->camera, &app->controlledCharacter,
-            app->errMsg, app->argc, app->argv);
+        ImGuiCharacterData(app);
 
         // Color Picker
         if (app->characterData.colorPickerActive) {
@@ -3836,7 +3830,13 @@ static void ApplicationUpdate(void* voidApplicationState)
         }
 
         // Scrubber
-        ImGuiScrubberSettings(&app->scrubberSettings, &app->characterData, app->screenWidth, app->screenHeight);
+        if (app->config.showSequenceCharacters)
+        {
+            ImGuiScrubberSettings(app);
+        }
+
+        // Test augmentations
+        ImGuiTestAugmentations(app);
 
         // Animation settings
         ImGuiAnimSettings(app);
@@ -3981,7 +3981,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     }
 
     // Blend Stack Debug Window
-    if (app->controlledCharacter.active && app->config.drawBlendCursors)
+    if (app->config.showControlledCharacter && app->controlledCharacter.active && app->config.drawBlendCursors)
     {
         // Cursor colors matching the 3D visualization
         const ImVec4 cursorImColors[ControlledCharacter::MAX_BLEND_CURSORS] = {
@@ -4012,7 +4012,6 @@ static void ApplicationUpdate(void* voidApplicationState)
             {
                 ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "PLAYING");
             }
-            ImGui::Text("Timescale: %.4f", app->debugTimescale);
             ImGui::Text("Switch Timer: %.2f", app->controlledCharacter.switchTimer);
             ImGui::Separator();
 
@@ -4092,46 +4091,30 @@ static void ApplicationUpdate(void* voidApplicationState)
 
 
 
-
-    PROFILE_END(Gui);
-
     // End ImGui frame and render
     rlImGuiEnd();
 
     // Done
 
-    // Update Neural Networks (all three, time-budgeted)
-    NetworkTrainAll(
-        &app->networkState, &app->animDatabase, 0.1);
-
-    // Auto-save every 5 minutes during training.
-    // Always overwrites the same "autosave" folder so we
-    // don't pile up folders over a long weekend run.
-    if (app->networkState.isTraining
-        && app->networkState.timeSinceLastAutoSave
-            >= AUTOSAVE_INTERVAL_SECONDS)
+    // pick up staged weights from training thread (non-blocking)
+    if (app->trainingCtrl.stagingMutex.try_lock())
     {
-        app->networkState.timeSinceLastAutoSave = 0.0;
-
-        const std::string autoSavePath = "saved/autosave";
-        if (!fs::exists("saved"))
+        if (app->trainingCtrl.stagingReady)
         {
-            fs::create_directories("saved");
+            app->runtimeNetworks.glimpseFlow = std::move(app->trainingCtrl.stagedGlimpseFlow);
+            app->runtimeNetworks.glimpseDecompressor = std::move(app->trainingCtrl.stagedGlimpseDecompressor);
+            app->runtimeNetworks.glimpseTargetStd = std::move(app->trainingCtrl.stagedGlimpseTargetStd);
+            app->runtimeNetworks.device = torch::kCPU;
+            app->trainingCtrl.stagingReady = false;
         }
-        if (!fs::exists(autoSavePath))
+        if (app->trainingCtrl.lossHistoryDirty)
         {
-            fs::create_directory(autoSavePath);
+            app->runtimeNetworks.lossHistoryTime = app->trainingCtrl.stagedLossHistoryTime;
+            app->runtimeNetworks.glimpseFlowLossHistory = app->trainingCtrl.stagedGlimpseFlowLossHistory;
+            app->runtimeNetworks.glimpseDecompressorLossHistory = app->trainingCtrl.stagedGlimpseDecompressorLossHistory;
+            app->trainingCtrl.lossHistoryDirty = false;
         }
-
-        SaveConfigToFolder(
-            app->config,
-            app->characterData,
-            app->networkState,
-            app->animDatabase,
-            autoSavePath);
-        app->savedConfigsNeedRefresh = true;
-        TraceLog(LOG_INFO, "Auto-saved to: %s",
-            autoSavePath.c_str());
+        app->trainingCtrl.stagingMutex.unlock();
     }
 
     EndDrawing();
@@ -4397,7 +4380,7 @@ int main(int argc, char** argv)
             app.animDatabase,
             app.controlledCharacter,
             app.config,
-            app.networkState,
+            app.runtimeNetworks,
             app.argc,
             app.argv);
 
@@ -4459,6 +4442,8 @@ int main(int argc, char** argv)
 
 
     SaveAppConfig(app.config);
+
+    StopTrainingThread(&app.trainingCtrl);
 
     CloseWindow();
 

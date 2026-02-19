@@ -1,8 +1,13 @@
 #pragma once
 
+#include <thread>
+#include <atomic>
+#include <mutex>
+
 //#include "raylib.h"
 
-constexpr int PCA_SEGMENT_K = 128;
+constexpr int PCA_SEGMENT_K = 200;
+constexpr int PCA_FEATURE_K = 20;
 
 // how many future poses the glimpse flow predicts, and at what times
 constexpr int GLIMPSE_POSE_COUNT = 2;
@@ -10,21 +15,14 @@ constexpr float GLIMPSE_POSE_TIMES[GLIMPSE_POSE_COUNT] = { 0.1f, 0.3f };
 
 // glimpse toe PCA: 2 times x 2 toes x (pos_xz + vel_xz) = 16 raw dims, compressed to 8
 constexpr int GLIMPSE_TOE_RAW_DIM = GLIMPSE_POSE_COUNT * 2 * 4;  // 16
-constexpr int GLIMPSE_TOE_PCA_K = 8;
+constexpr int GLIMPSE_TOE_PCA_K = 10;
 
 // Animation playback mode for controlled character
 enum class AnimationMode : int
 {
     RandomSwitch = 0,              // randomly switch between animations
     MotionMatching,                // use motion matching to find best animation
-    AverageLatentPredictor,            // features -> predictor -> decoded pose segment
-    FlowSampled,                       // flow matching: diverse pose sampling
-    FullFlowSampled,                   // full-space flow matching (no AEs)
-    FridayFlow,                        // frame-by-frame flow in pose latent space
-    SinglePosePredictor,               // deterministic: features -> pose latent -> decoded pose
-    UnconditionedAdvance,              // hybrid: conditioned search + unconditioned latent advance
-    MondayPredictor,                   // conditioned delta: (features, pose latent) → pose latent delta
-    GlimpseMode,                       // flow-sampled future pose -> deterministic segment decompression
+    GlimpseMode,                   // flow-sampled future pose -> deterministic segment decompression
     COUNT
 };
 
@@ -34,13 +32,6 @@ static inline const char* AnimationModeName(AnimationMode mode)
     {
     case AnimationMode::RandomSwitch: return "Random Switch";
     case AnimationMode::MotionMatching: return "Motion Matching";
-    case AnimationMode::AverageLatentPredictor: return "Average Latent Predictor";
-    case AnimationMode::FlowSampled: return "Flow Sampled";
-    case AnimationMode::FullFlowSampled: return "Full Flow Sampled";
-    case AnimationMode::FridayFlow: return "Friday Flow";
-    case AnimationMode::SinglePosePredictor: return "Single Pose Predictor";
-    case AnimationMode::UnconditionedAdvance: return "Unconditioned Advance";
-    case AnimationMode::MondayPredictor: return "Monday Predictor";
     case AnimationMode::GlimpseMode: return "Glimpse Mode";
     default: return "Unknown";
     }
@@ -230,6 +221,10 @@ struct AppConfig {
 
     float exposure = 0.9f;
 
+    // Character visibility
+    bool showControlledCharacter = true;
+    bool showSequenceCharacters = true;
+
     // Toggles
     bool drawOrigin = true;
     bool drawGrid = false;
@@ -278,9 +273,6 @@ struct AppConfig {
     bool drawPlayerInput = false;
 
     // Neural Network settings
-    bool useMMFeatureDenoiser = false;
-    bool testSegmentAutoEncoder = false;
-    bool testPoseAutoEncoder = false;
     bool testPcaReconstruction = false;
 
     // Motion Matching Configuration, version that is editable: copied to AnimDatabase on build
@@ -597,6 +589,11 @@ struct AnimDatabase
     std::vector<float> pcaGlimpseToeMean;              // [GLIMPSE_TOE_RAW_DIM]
     std::vector<float> pcaGlimpseToeBasis;             // [K * GLIMPSE_TOE_RAW_DIM] row-major
 
+    // PCA on normalized MM features (for compact glimpse conditioning)
+    int pcaFeatureK = -1;                              // number of PCA components kept
+    std::vector<float> pcaFeatureMean;                 // [featureDim]
+    std::vector<float> pcaFeatureBasis;                // [K * featureDim] row-major
+
     // k-means clusters on normalizedFeatures for stratified training sampling
     // clusterFrames[c] holds the global frame indices belonging to cluster c
     int clusterCount = 0;
@@ -667,6 +664,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->pcaGlimpseToeK = -1;
     db->pcaGlimpseToeMean.clear();
     db->pcaGlimpseToeBasis.clear();
+    db->pcaFeatureK = -1;
+    db->pcaFeatureMean.clear();
+    db->pcaFeatureBasis.clear();
     db->clusterCount = 0;
     db->clusterFrames.clear();
 }
@@ -837,18 +837,14 @@ struct ControlledCharacter {
     // Blended lookahead pose for debugging
     TransformData xformLookahead;
 
-    // Glimpse flow predicted future pose for debugging
-    TransformData xformGlimpsePose;
-    bool glimpsePoseValid = false;
-
     // Visual properties
     Color color;
     float opacity;
     float radius;
     float scale;
 
-    // Reference to skeleton (first loaded BVH)
-    const BVHData* skeleton;
+    // Copy of skeleton (so we don't hold a pointer into a resizable vector)
+    BVHData skeleton;
     bool active;
 
     // Joint names combo string for UI (semicolon-separated)
@@ -916,66 +912,7 @@ struct ControlledCharacter {
     std::vector<HistoryPoint> positionHistory;
     double lastHistorySampleTime = 0.0f;
 
-    // FridayFlow: frame-by-frame latent state
-    std::vector<float> fridayFlowLatent;
-    bool fridayFlowInitialized = false;
-
-    // UnconditionedAdvance: pose latent state
-    std::vector<float> uncondAdvanceLatent;
-    bool uncondAdvanceInitialized = false;
-
-    // MondayPredictor: pose latent state
-    std::vector<float> mondayLatent;
-    bool mondayInitialized = false;
 };
-
-//----------------------------------------------------------------------------------
-// Flow Model with Residual Connections
-//----------------------------------------------------------------------------------
-
-struct FlowModelImpl : torch::nn::Module
-{
-    torch::nn::Linear inputProj{ nullptr };
-    torch::nn::Linear res1a{ nullptr }, res1b{ nullptr };
-    torch::nn::Linear res2a{ nullptr }, res2b{ nullptr };
-    torch::nn::Linear res3a{ nullptr }, res3b{ nullptr };
-    torch::nn::Linear outputProj{ nullptr };
-
-    FlowModelImpl(int inputDim, int hiddenDim, int outputDim);
-    torch::Tensor forward(const torch::Tensor& x);
-};
-TORCH_MODULE(FlowModel);
-
-//----------------------------------------------------------------------------------
-// Full-space Flow Model (condition re-injected at each layer)
-//----------------------------------------------------------------------------------
-
-struct FullFlowModelImpl : torch::nn::Module
-{
-    torch::nn::Linear layer1{nullptr};
-    torch::nn::Linear layer2{nullptr};
-    torch::nn::Linear outputLayer{nullptr};
-    int condTimeDim = 0;
-
-    FullFlowModelImpl(int featureDim, int flatDim);
-    torch::Tensor forward(const torch::Tensor& xt,
-                          const torch::Tensor& condTime);
-};
-TORCH_MODULE(FullFlowModel);
-
-// frame-by-frame flow matching in pose latent space
-struct FridayFlowModelImpl : torch::nn::Module
-{
-    torch::nn::Linear layer1{nullptr};
-    torch::nn::Linear layer2{nullptr};
-    torch::nn::Linear outputLayer{nullptr};
-    int condTimeDim = 0;
-
-    FridayFlowModelImpl(int featureDim, int poseLatentDim);
-    torch::Tensor forward(const torch::Tensor& xt,
-                          const torch::Tensor& condTime);
-};
-TORCH_MODULE(FridayFlowModel);
 
 // Glimpse flow: noise -> pose PCA coefficients, conditioned on MM features + time
 // deeper than FullFlowModel: 256 -> 512 -> 256 with condition re-injected at each layer
@@ -1017,109 +954,6 @@ struct NetworkState {
     bool isTraining = false;
     torch::Device device = torch::kCPU;
 
-    // feature autoencoder
-    torch::nn::Sequential featuresAutoEncoder = nullptr;
-    std::shared_ptr<torch::optim::Adam> featureAEOptimizer =
-        nullptr;
-    float featureAELoss = 0.0f;
-    float featureAELossSmoothed = 0.0f;
-    int featureAEIterations = 0;
-    std::vector<float> featureAELossHistory;
-
-    // pose autoencoder (single frame)
-    torch::nn::Sequential poseAutoEncoder = nullptr;
-    std::shared_ptr<torch::optim::Adam> poseAEOptimizer = nullptr;
-    float poseAELoss = 0.0f;
-    float poseAELossSmoothed = 0.0f;
-    int poseAEIterations = 0;
-    std::vector<float> poseAELossHistory;
-
-    // segment autoencoder
-    torch::nn::Sequential segmentAutoEncoder = nullptr;
-    std::shared_ptr<torch::optim::Adam> segmentOptimizer =
-        nullptr;
-    float segmentAELoss = 0.0f;
-    float segmentAELossSmoothed = 0.0f;
-    int segmentAEIterations = 0;
-    std::vector<float> segmentAELossHistory;
-
-    // segment latent average predictor
-    torch::nn::Sequential segmentLatentAveragePredictor =
-        nullptr;
-    std::shared_ptr<torch::optim::Adam> latentSegmentPredictorOptimizer =
-        nullptr;
-    float latentSegmentPredictorLoss = 0.0f;
-    float latentSegmentPredictorLossSmoothed = 0.0f;
-    int latentSegmentPredictorIterations = 0;
-    std::vector<float> latentSegmentPredictorLossHistory;
-
-    // single pose latent predictor (features -> pose latent, deterministic)
-    torch::nn::Sequential singlePosePredictor = nullptr;
-    std::shared_ptr<torch::optim::Adam> singlePosePredictorOptimizer = nullptr;
-    float singlePosePredictorLoss = 0.0f;
-    float singlePosePredictorLossSmoothed = 0.0f;
-    int singlePosePredictorIterations = 0;
-    std::vector<float> singlePosePredictorLossHistory;
-
-    // latent flow matching
-    FlowModel latentFlowModel = nullptr;
-//    torch::nn::Sequential latentFlowModel = nullptr;
-    std::shared_ptr<torch::optim::Adam> flowOptimizer =
-        nullptr;
-    float flowLoss = 0.0f;
-    float flowLossSmoothed = 0.0f;
-    int flowIterations = 0;
-    std::vector<float> flowLossHistory;
-
-    // full-space flow matching (bypasses autoencoders)
-    FullFlowModel fullFlowModel = nullptr;
-    std::shared_ptr<torch::optim::Adam> fullFlowOptimizer = nullptr;
-    float fullFlowLoss = 0.0f;
-    float fullFlowLossSmoothed = 0.0f;
-    int fullFlowIterations = 0;
-    std::vector<float> fullFlowLossHistory;
-
-    // friday flow: frame-by-frame flow in pose latent space
-    FridayFlowModel fridayFlowModel = nullptr;
-    std::shared_ptr<torch::optim::Adam> fridayFlowOptimizer =
-        nullptr;
-    float fridayFlowLoss = 0.0f;
-    float fridayFlowLossSmoothed = 0.0f;
-    int fridayFlowIterations = 0;
-    std::vector<float> fridayFlowLossHistory;
-    std::vector<float> poseLatentStd;  // per-dim std of pose latent codes [POSE_AE_LATENT_DIM]
-
-    // segment end-to-end training (features → encode → predict → decode → segment)
-    float segmentE2eLoss = 0.0f;
-    float segmentE2eLossSmoothed = 0.0f;
-    int segmentE2eIterations = 0;
-    std::vector<float> segmentE2eLossHistory;
-
-    // single pose end-to-end training (features → featureAE encode → predict → poseAE decode → pose)
-    float singlePoseE2eLoss = 0.0f;
-    float singlePoseE2eLossSmoothed = 0.0f;
-    int singlePoseE2eIterations = 0;
-    std::vector<float> singlePoseE2eLossHistory;
-
-    // unconditioned pose advance: pose latent → next pose latent
-    torch::nn::Sequential uncondAdvancePredictor = nullptr;
-    std::shared_ptr<torch::optim::Adam> uncondAdvanceOptimizer = nullptr;
-    float uncondAdvanceLoss = 0.0f;
-    float uncondAdvanceLossSmoothed = 0.0f;
-    int uncondAdvanceIterations = 0;
-    std::vector<float> uncondAdvanceLossHistory;
-
-    // monday predictor: (features, pose latent) → pose latent delta
-    torch::nn::Sequential mondayPredictor = nullptr;
-    std::shared_ptr<torch::optim::Adam> mondayOptimizer = nullptr;
-    float mondayLoss = 0.0f;
-    float mondayLossSmoothed = 0.0f;
-    int mondayIterations = 0;
-    std::vector<float> mondayLossHistory;
-    std::vector<float> mondayDeltaMean;   // per-dim mean of latent deltas [POSE_AE_LATENT_DIM]
-    std::vector<float> mondayDeltaStd;    // per-dim std of latent deltas [POSE_AE_LATENT_DIM]
-    double mondayDeltaStatsTimer = 0.0;   // time since last stats recomputation
-
     // glimpse flow: noise -> pose PCA coefficients at 0.3s, conditioned on MM features
     GlimpseFlowModel glimpseFlow = nullptr;
     std::shared_ptr<torch::optim::Adam> glimpseFlowOptimizer = nullptr;
@@ -1147,4 +981,44 @@ struct NetworkState {
     // unified training timing
     double trainingElapsedSeconds = 0.0;
     double timeSinceLastAutoSave = 0.0;
+
+    // model architecture dimensions (stored at init, needed for cloning)
+    int glimpseFlowCondDim = 0;
+    int glimpseFlowGlimpseDim = 0;
+    int glimpseDecompCondDim = 0;
+    int glimpseDecompGlimpseDim = 0;
+    int glimpseDecompSegK = 0;
+};
+
+//----------------------------------------------------------------------------------
+// Training thread control
+//----------------------------------------------------------------------------------
+
+struct TrainingThreadControl
+{
+    std::thread thread;
+
+    // main → training thread signals
+    std::atomic<bool> stopRequested = false;
+
+    // training → main thread status (atomics for lock-free reads)
+    std::atomic<bool> isRunning = false;
+    std::atomic<float> glimpseFlowLossSmoothed = 0.0f;
+    std::atomic<int> glimpseFlowIterations = 0;
+    std::atomic<float> glimpseDecompressorLossSmoothed = 0.0f;
+    std::atomic<int> glimpseDecompressorIterations = 0;
+    std::atomic<double> trainingElapsedSeconds = 0.0;
+
+    // staged weights: training thread writes under mutex, main thread consumes
+    std::mutex stagingMutex;
+    bool stagingReady = false;
+    GlimpseFlowModel stagedGlimpseFlow = nullptr;
+    GlimpseDecompressorModel stagedGlimpseDecompressor = nullptr;
+    std::vector<float> stagedGlimpseTargetStd;
+
+    // staged loss history (copied under same mutex)
+    std::vector<float> stagedLossHistoryTime;
+    std::vector<float> stagedGlimpseFlowLossHistory;
+    std::vector<float> stagedGlimpseDecompressorLossHistory;
+    bool lossHistoryDirty = false;
 };

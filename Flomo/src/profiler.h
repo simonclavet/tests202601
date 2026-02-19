@@ -3,6 +3,8 @@
 //----------------------------------------------------------------------------------
 // Profiling
 //----------------------------------------------------------------------------------
+#define PROFILE_CONCAT_INNER(a, b) a##b
+#define PROFILE_CONCAT(a, b) PROFILE_CONCAT_INNER(a, b)
 
 
 // Profiling only available on Windows
@@ -26,7 +28,7 @@ enum
 };
 
 // A single record for a profiled code location with a cyclic buffer of start and end times.
-typedef struct
+struct ProfileRecord
 {
     const char* name;
     uint32_t idx;
@@ -37,16 +39,16 @@ typedef struct
         LARGE_INTEGER end;
     } samples[PROFILE_RECORD_SAMPLE_MAX];
 
-} ProfileRecord;
+};
 
 // Structure containing space for all profiled code locations
-typedef struct
+struct ProfileRecordData
 {
     uint32_t num;
     LARGE_INTEGER freq;
     ProfileRecord* records[PROFILE_RECORD_MAX];
 
-} ProfileRecordData;
+};
 
 // Global variable storing all the profile record data
 static ProfileRecordData globalProfileRecords;
@@ -147,18 +149,42 @@ static inline void ProfileTickersUpdate()
 #define PROFILE_TICKERS_INIT() ProfileTickersInit();
 #define PROFILE_TICKERS_UPDATE() ProfileTickersUpdate()
 
-#else
+class ProfileScoped {
+public:
+    explicit ProfileScoped(ProfileRecord* record) : m_record(record) {}
+    ~ProfileScoped() { ProfileRecordEnd(m_record); }
+private:
+    ProfileRecord* m_record;
+};
+
+
+// Create a unique static ProfileRecord variable for the given name and line
+#define PROFILE_RECORD_VAR(name, line) PROFILE_CONCAT(__PROFILE_RECORD_, PROFILE_CONCAT(name, line))
+
+// Create a unique local variable name for the scoped object
+#define PROFILE_SCOPED_VAR(name, line) PROFILE_CONCAT(__profile_scoped_, PROFILE_CONCAT(name, line))
+
+// Scoped profile macro: begins profiling immediately and ends at scope exit
+#define PROFILE_SCOPE(name)                                                     \
+    static ProfileRecord PROFILE_RECORD_VAR(name, __LINE__);                    \
+    ProfileRecordBegin(&PROFILE_RECORD_VAR(name, __LINE__), #name);             \
+    ProfileScoped PROFILE_SCOPED_VAR(name, __LINE__)(&PROFILE_RECORD_VAR(name, __LINE__))
+
+
+#else // ENABLE_PROFILE
 #define PROFILE_INIT()
 #define PROFILE_BEGIN(NAME)
 #define PROFILE_END(NAME)
 
 #define PROFILE_TICKERS_INIT()
 #define PROFILE_TICKERS_UPDATE()
-#endif
+
+#define PROFILE_SCOPE(name)
+#endif // ENABLE_PROFILE
 
 
 //--------------------------------------
-// One-off console timing (for loading/building operations): NOT IN THE TICK!
+// One-off console timing (for loading/building operations): NOT IN THE TICK!. This is always on.
 //--------------------------------------
 
 //#ifdef ENABLE_PROFILE // do it all the time because they should not be done in the tick
@@ -172,7 +198,23 @@ static inline void ProfileTickersUpdate()
                 __logProfile_##name##_end - __logProfile_##name##_start); \
             TraceLog(LOG_INFO, #name ": %lld ms", (long long)__logProfile_##name##_duration.count()); \
         } while(0)
-//#else
-//#define LOG_PROFILE_START(name)
-//#define LOG_PROFILE_END(name)
-//#endif
+
+
+struct LogProfileScoped {
+    std::chrono::high_resolution_clock::time_point start;
+    const char* name;
+
+    LogProfileScoped(const char* name)
+        : start(std::chrono::high_resolution_clock::now()), name(name) {
+    }
+
+    ~LogProfileScoped() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        TraceLog(LOG_INFO, "%s: %lld ms", name, (long long)duration.count());
+    }
+};
+
+// Scoped profile logging macro. use like: LOG_PROFILE_SCOPE(LoadingAssets); 
+#define LOG_PROFILE_SCOPE(name) \
+    LogProfileScoped PROFILE_CONCAT(__log_profile_scope_, __LINE__)(#name)

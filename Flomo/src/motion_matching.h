@@ -597,26 +597,6 @@ static int MotionMatchingSearch(
         normalizedQuery[d] = normalized * weight;
     }
 
-    // Pass the features through the autoencoder if enabled and available
-    if (config.useMMFeatureDenoiser && networkState && networkState->featuresAutoEncoder)
-    {
-        torch::NoGradGuard no_grad;
-        networkState->featuresAutoEncoder->eval();
-
-        try {
-            // Move query to model device
-            torch::Tensor queryTensor = torch::from_blob(normalizedQuery.data(), { 1, db->featureDim }).clone().to(networkState->device);
-            torch::Tensor denoisedTensor = networkState->featuresAutoEncoder->forward(queryTensor);
-            
-            // Move back to CPU before copying data back to vector
-            torch::Tensor resultHost = denoisedTensor.to(torch::kCPU);
-            std::copy(resultHost.data_ptr<float>(), resultHost.data_ptr<float>() + db->featureDim, normalizedQuery.begin());
-        }
-        catch (const std::exception& e) {
-            TraceLog(LOG_ERROR, "AE Inference failed: %s", e.what());
-        }
-    }
-
     // Brute-force search through all frames (skip clip boundaries for stability)
     int bestFrame = -1;
     float bestCost = FLT_MAX;
