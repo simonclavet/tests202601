@@ -1,5 +1,4 @@
-#version 300 es
-precision highp float;
+#version 330
 
 uniform float lightClipNear;
 uniform float lightClipFar;

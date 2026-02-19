@@ -6,16 +6,68 @@
 
 //#include "raylib.h"
 
-constexpr int PCA_SEGMENT_K = 200;
+constexpr int PCA_SEGMENT_K = 150;
 constexpr int PCA_FEATURE_K = 20;
 
 // how many future poses the glimpse flow predicts, and at what times
 constexpr int GLIMPSE_POSE_COUNT = 2;
 constexpr float GLIMPSE_POSE_TIMES[GLIMPSE_POSE_COUNT] = { 0.1f, 0.3f };
 
-// glimpse toe PCA: 2 times x 2 toes x (pos_xz + vel_xz) = 16 raw dims, compressed to 8
-constexpr int GLIMPSE_TOE_RAW_DIM = GLIMPSE_POSE_COUNT * 2 * 4;  // 16
 constexpr int GLIMPSE_TOE_PCA_K = 10;
+
+// Structured representation of the glimpse flow's toe output.
+// For each future time step and each side (left/right), stores position and velocity in root space XZ.
+struct GlimpseFeatures
+{
+    struct ToeSample
+    {
+        float posX = 0.0f;
+        float posZ = 0.0f;
+        float velX = 0.0f;
+        float velZ = 0.0f;
+    };
+
+    // toes[timeStep][side]: predicted toe position/velocity in current root space
+    ToeSample toes[GLIMPSE_POSE_COUNT][SIDES_COUNT] = {};
+
+    static constexpr int GetDim() { return GLIMPSE_POSE_COUNT * SIDES_COUNT * 4; }  // 16
+
+    void SerializeTo(float* dest) const
+    {
+        int idx = 0;
+        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+        {
+            for (int side = 0; side < SIDES_COUNT; ++side)
+            {
+                const ToeSample& s = toes[t][side];
+                dest[idx++] = s.posX;
+                dest[idx++] = s.posZ;
+                dest[idx++] = s.velX;
+                dest[idx++] = s.velZ;
+            }
+        }
+        assert(idx == GetDim());
+    }
+
+    void DeserializeFrom(const float* src)
+    {
+        int idx = 0;
+        for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+        {
+            for (int side = 0; side < SIDES_COUNT; ++side)
+            {
+                ToeSample& s = toes[t][side];
+                s.posX = src[idx++];
+                s.posZ = src[idx++];
+                s.velX = src[idx++];
+                s.velZ = src[idx++];
+            }
+        }
+        assert(idx == GetDim());
+    }
+};
+
+constexpr int GLIMPSE_TOE_RAW_DIM = GlimpseFeatures::GetDim();  // 16
 
 // Animation playback mode for controlled character
 enum class AnimationMode : int
@@ -594,6 +646,11 @@ struct AnimDatabase
     std::vector<float> pcaFeatureMean;                 // [featureDim]
     std::vector<float> pcaFeatureBasis;                // [K * featureDim] row-major
 
+    // precomputed per-frame training data (computed once, used by training loops)
+    Array2D<float> precompSegmentPCA;    // [motionFrameCount x pcaSegmentK] segment PCA coefficients
+    Array2D<float> precompFeaturePCA;    // [motionFrameCount x pcaFeatureK] feature PCA coefficients
+    Array2D<float> precompRawToe;        // [motionFrameCount x GLIMPSE_TOE_RAW_DIM] raw toe data
+
     // k-means clusters on normalizedFeatures for stratified training sampling
     // clusterFrames[c] holds the global frame indices belonging to cluster c
     int clusterCount = 0;
@@ -667,6 +724,9 @@ static void AnimDatabaseFree(AnimDatabase* db)
     db->pcaFeatureK = -1;
     db->pcaFeatureMean.clear();
     db->pcaFeatureBasis.clear();
+    db->precompSegmentPCA.clear();
+    db->precompFeaturePCA.clear();
+    db->precompRawToe.clear();
     db->clusterCount = 0;
     db->clusterFrames.clear();
 }
@@ -904,6 +964,10 @@ struct ControlledCharacter {
     float virtualToeUnlockStartDistance[SIDES_COUNT] = { 0.0f, 0.0f };  // distance at unlock moment (for smooth shrink)   
 
     PlayerControlInput playerInput;
+
+    // Glimpse flow predicted toe data (updated each prediction)
+    GlimpseFeatures predictedGlimpse = {};
+    bool predictedGlimpseValid = false;
 
     // Motion matching query (runtime features computed from current state)
     std::vector<float> mmQuery;

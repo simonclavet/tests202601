@@ -1,25 +1,46 @@
 #version 330
 
-// Simple forward-rendering fragment shader for skinned meshes
+// Forward-rendering fragment shader for skinned meshes with shadow mapping
 
 in vec3 fragPosition;
 in vec2 fragTexCoord;
 in vec4 fragColor;
 in vec3 fragNormal;
+in vec4 fragPositionLightSpace;
 
 uniform vec4 colDiffuse;
+uniform vec3 sunDir;
+uniform sampler2D shadowMap;
+uniform float lightClipNear;
+uniform float lightClipFar;
 
 out vec4 finalColor;
 
+float LinearDepth(float depth, float near, float far)
+{
+    return (2.0 * near) / (far + near - depth * (far - near));
+}
+
 void main()
 {
-    // Simple directional lighting
-    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
     vec3 normal = normalize(fragNormal);
 
-    float diff = max(dot(normal, lightDir), 0.0);
+    // Shadow map lookup
+    vec3 posLS = fragPositionLightSpace.xyz / fragPositionLightSpace.w;
+    posLS = posLS * 0.5 + 0.5;
+
+    float clip = float(
+        posLS.x > 0.0 && posLS.x < 1.0 &&
+        posLS.y > 0.0 && posLS.y < 1.0);
+
+    float fd = LinearDepth(posLS.z, lightClipNear, lightClipFar);
+    float sd = texture(shadowMap, posLS.xy).r;
+    float shadow = 1.0 - clip * float(fd - 0.0001 > sd);
+
+    // Directional lighting using actual sun direction
+    float diff = max(dot(normal, -sunDir), 0.0);
     float ambient = 0.3;
-    float lighting = ambient + diff * 0.7;
+    float lighting = ambient + diff * 0.7 * shadow;
 
     vec3 color = fragColor.rgb * colDiffuse.rgb * lighting;
 

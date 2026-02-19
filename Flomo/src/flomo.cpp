@@ -31,6 +31,7 @@
 #include "character_data.h"
 #include "anim_database.h"
 #include "leg_ik.h"
+#include "retargeter.h"
 #include "controlled_character.h"
 #include "networks.h"
 
@@ -814,6 +815,26 @@ struct ApplicationState {
     vector<BVHGenoMapping> genoMappings;
     BVHGenoMapping ccGenoMapping = {};
 
+    // Mesh shadow map
+    RenderTexture2D meshShadowMap = {};
+    Shader skinnedShadowShader = {};
+    int skinnedShadowLightClipNear = -1;
+    int skinnedShadowLightClipFar = -1;
+
+    // Shadow map uniform locations on genoBasicShader
+    int genoLightViewProj = -1;
+    int genoSunDir = -1;
+    int genoShadowMap = -1;
+    int genoLightClipNear = -1;
+    int genoLightClipFar = -1;
+
+    // Shadow map uniform locations on capsule shader
+    int capsuleUseMeshShadowMap = -1;
+    int capsuleMeshShadowMapTex = -1;
+    int capsuleLightViewProj = -1;
+    int capsuleLightClipNear = -1;
+    int capsuleLightClipFar = -1;
+
     // Test augmentation (for visualizing augmentations on sequence characters)
     MotionTrainingAugmentations testAugmentations;
     bool augmentationsCreated = false;
@@ -842,6 +863,13 @@ struct ApplicationState {
     // FBX converter UI
     bool converterWindowOpen = false;
     std::vector<ConversionResult> conversionResults;
+
+    // Retargeter UI
+    bool retargetWindowOpen = false;
+    bool retargetTargetLoaded = false;
+    BVHData retargetTargetBvh = {};
+    char retargetTargetName[256] = {};
+    std::vector<ConversionResult> retargetResults;
 };
 
 
@@ -2077,8 +2105,11 @@ static inline void ImGuiUtilities(ApplicationState* app)
         ImVec2(200, 60), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Utilities"))
     {
-        if (ImGui::Button("Open Converter"))
+        if (ImGui::Button("FBX to BVH"))
             app->converterWindowOpen = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Retarget"))
+            app->retargetWindowOpen = true;
     }
     ImGui::End();
 }
@@ -2135,6 +2166,74 @@ static inline void ImGuiConverter(ApplicationState* app)
     ImGui::End();
 }
 
+static inline void ImGuiRetargeter(ApplicationState* app)
+{
+    if (!app->retargetWindowOpen) return;
+
+    ImGui::SetNextWindowPos(ImVec2(420, 220), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 340), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Retarget BVH", &app->retargetWindowOpen))
+    {
+        if (!app->retargetTargetLoaded)
+        {
+            ImGui::TextWrapped(
+                "Drop a target skeleton .bvh file first"
+                " (e.g. Geno_bind.bvh).");
+        }
+        else
+        {
+            ImGui::Text("Target: %s (%d joints)",
+                app->retargetTargetName,
+                app->retargetTargetBvh.jointCount);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear"))
+            {
+                BVHDataFree(&app->retargetTargetBvh);
+                app->retargetTargetLoaded = false;
+                app->retargetTargetName[0] = '\0';
+            }
+            ImGui::TextWrapped(
+                "Drop .bvh or .fbx source files to retarget"
+                " them onto this skeleton.");
+        }
+        ImGui::Separator();
+
+        if (!app->retargetResults.empty())
+        {
+            if (ImGui::Button("Clear Results"))
+                app->retargetResults.clear();
+
+            ImGui::BeginChild("##retarget_results",
+                ImVec2(0, 0), true);
+            for (int i = 0;
+                i < (int)app->retargetResults.size();
+                i++)
+            {
+                const ConversionResult& r =
+                    app->retargetResults[i];
+                if (r.success)
+                {
+                    ImGui::TextColored(
+                        ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
+                        "[OK] %s", r.filename);
+                    ImGui::TextDisabled(
+                        "  -> %s", r.outputPath);
+                }
+                else
+                {
+                    ImGui::TextColored(
+                        ImVec4(0.9f, 0.2f, 0.2f, 1.0f),
+                        "[FAIL] %s", r.filename);
+                    ImGui::TextDisabled(
+                        "  %s", r.errorMsg);
+                }
+            }
+            ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+}
+
 //----------------------------------------------------------------------------------
 // Application
 //----------------------------------------------------------------------------------
@@ -2158,7 +2257,7 @@ static void ApplicationUpdate(void* voidApplicationState)
     {
         FilePathList droppedFiles = LoadDroppedFiles();
 
-        int prevBvhCount = app->characterData.count;
+        const int prevBvhCount = app->characterData.count;
 
         for (int i = 0; i < droppedFiles.count; i++)
         {
@@ -2198,6 +2297,77 @@ static void ApplicationUpdate(void* voidApplicationState)
                 }
                 BVHDataFree(&bvh);
                 app->conversionResults.push_back(result);
+            }
+            // when retarget window is open, route bvh/fbx drops
+            else if (app->retargetWindowOpen
+                && (IsFileExtension(path, ".bvh")
+                    || IsFileExtension(path, ".fbx")))
+            {
+                if (!app->retargetTargetLoaded)
+                {
+                    // first drop = target skeleton
+                    BVHDataInit(&app->retargetTargetBvh);
+                    char loadErr[256];
+                    bool ok = IsFileExtension(path, ".fbx")
+                        ? FBXDataLoad(&app->retargetTargetBvh, path, loadErr, sizeof(loadErr))
+                        : BVHDataLoad(&app->retargetTargetBvh, path, loadErr, sizeof(loadErr));
+
+                    if (ok)
+                    {
+                        app->retargetTargetLoaded = true;
+                        snprintf(app->retargetTargetName, sizeof(app->retargetTargetName),
+                            "%s", GetFileName(path));
+                    }
+                    else
+                    {
+                        ConversionResult r = {};
+                        snprintf(r.filename, sizeof(r.filename), "%s", GetFileName(path));
+                        snprintf(r.errorMsg, sizeof(r.errorMsg), "Load target: %s", loadErr);
+                        r.success = false;
+                        app->retargetResults.push_back(r);
+                    }
+                }
+                else
+                {
+                    // subsequent drops = retarget source files
+                    ConversionResult result = {};
+                    snprintf(result.filename, sizeof(result.filename), "%s", GetFileName(path));
+                    snprintf(result.outputPath, sizeof(result.outputPath), "%s.retarget.bvh", path);
+
+                    BVHData srcBvh;
+                    BVHDataInit(&srcBvh);
+                    char loadErr[256];
+                    bool loaded = IsFileExtension(path, ".fbx")
+                        ? FBXDataLoad(&srcBvh, path, loadErr, sizeof(loadErr))
+                        : BVHDataLoad(&srcBvh, path, loadErr, sizeof(loadErr));
+
+                    if (!loaded)
+                    {
+                        snprintf(result.errorMsg, sizeof(result.errorMsg), "Load: %s", loadErr);
+                        result.success = false;
+                    }
+                    else
+                    {
+                        BVHData outBvh;
+                        if (!RetargetBVH(&outBvh, &srcBvh, &app->retargetTargetBvh,
+                            result.errorMsg, sizeof(result.errorMsg)))
+                        {
+                            result.success = false;
+                        }
+                        else if (!BVHDataSave(&outBvh, result.outputPath,
+                            result.errorMsg, sizeof(result.errorMsg)))
+                        {
+                            result.success = false;
+                        }
+                        else
+                        {
+                            result.success = true;
+                        }
+                        BVHDataFree(&outBvh);
+                    }
+                    BVHDataFree(&srcBvh);
+                    app->retargetResults.push_back(result);
+                }
             }
             else if (CharacterDataLoadFromFile(
                 &app->characterData, path,
@@ -2785,11 +2955,74 @@ static void ApplicationUpdate(void* voidApplicationState)
 
     ClearBackground(app->config.backgroundColor);
 
+    // Compute sun direction (needed by both shadow pass and main pass)
+    const Vector3 sunLightPosition = Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, 1.0f }, QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, app->config.sunAzimuth));
+    const Vector3 sunLightAxis = Vector3Normalize(Vector3CrossProduct(sunLightPosition, Vector3{ 0.0f, 1.0f, 0.0f }));
+    const Vector3 sunLightDir = Vector3Negate(Vector3RotateByQuaternion(sunLightPosition, QuaternionFromAxisAngle(sunLightAxis, app->config.sunAltitude)));
+
+    // Mesh shadow map pass
+    Matrix lightViewProj = MatrixIdentity();
+    const float shadowLightClipNear = 0.1f;
+    const float shadowLightClipFar = 20.0f;
+
+    if (app->genoRenderMode && app->genoModelLoaded && app->config.drawShadows
+        && app->characterData.count > 0 && app->skinnedShadowShader.id > 0)
+    {
+        // Ensure geno mappings are ready
+        while ((int)app->genoMappings.size() < app->characterData.count)
+        {
+            const int idx = (int)app->genoMappings.size();
+            BVHGenoMapping mapping = CreateBVHGenoMapping(
+                &app->characterData.bvhData[idx], &app->genoModel);
+            app->genoMappings.push_back(mapping);
+        }
+
+        const ShadowLight shadowLight = ShadowLightCreate(
+            sunLightDir, app->camera.cam3d.target, 10.0f, shadowLightClipNear, shadowLightClipFar);
+
+        BeginShadowMap(app->meshShadowMap, shadowLight);
+        lightViewProj = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+
+        SetShaderValue(app->skinnedShadowShader, app->skinnedShadowLightClipNear,
+            &shadowLightClipNear, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(app->skinnedShadowShader, app->skinnedShadowLightClipFar,
+            &shadowLightClipFar, SHADER_UNIFORM_FLOAT);
+
+        const Shader prevShader = app->genoModel.materials[0].shader;
+        app->genoModel.materials[0].shader = app->skinnedShadowShader;
+
+        // Sequence characters into shadow map
+        if (app->config.showSequenceCharacters)
+        {
+            for (int c = 0; c < app->characterData.count; c++)
+            {
+                UpdateGenoAnimationFromBVH(
+                    &app->genoAnimation, &app->characterData.xformData[c],
+                    &app->genoMappings[c], 1.0f);
+                UpdateModelAnimationBones(app->genoModel, app->genoAnimation, 0);
+                DrawModel(app->genoModel, Vector3Zero(), 1.0f, WHITE);
+            }
+        }
+
+        // Controlled character into shadow map
+        const ControlledCharacter& cc = app->controlledCharacter;
+        if (app->config.showControlledCharacter && cc.active && cc.skeleton.jointCount > 0)
+        {
+            if (!app->ccGenoMapping.valid)
+            {
+                app->ccGenoMapping = CreateBVHGenoMapping(&cc.skeleton, &app->genoModel);
+            }
+            UpdateGenoAnimationFromBVH(
+                &app->genoAnimation, &cc.xformData, &app->ccGenoMapping, 1.0f);
+            UpdateModelAnimationBones(app->genoModel, app->genoAnimation, 0);
+            DrawModel(app->genoModel, Vector3Zero(), 1.0f, WHITE);
+        }
+
+        app->genoModel.materials[0].shader = prevShader;
+        EndShadowMap();
+    }
+
     BeginMode3D(app->camera.cam3d);
-
-    //DrawSphere(Vector3{ 0, 2, 0 }, 0.5f, RED);  // Simple red sphere
-    //DrawCube(Vector3{ 2, 1, 0 }, 1, 1, 1, BLUE); // Simple blue cube
-
 
     // Set shader uniforms that don't change based on the object being drawn
 
@@ -2798,10 +3031,6 @@ static void ApplicationUpdate(void* voidApplicationState)
     const float objectSpecularity = 0.5f;
     const float objectGlossiness = 10.0f;
     const float objectOpacity = 1.0f;
-
-    const Vector3 sunLightPosition = Vector3RotateByQuaternion(Vector3{ 0.0f, 0.0f, 1.0f }, QuaternionFromAxisAngle(Vector3{ 0.0f, 1.0f, 0.0f }, app->config.sunAzimuth));
-    const Vector3 sunLightAxis = Vector3Normalize(Vector3CrossProduct(sunLightPosition, Vector3{ 0.0f, 1.0f, 0.0f }));
-    const Vector3 sunLightDir = Vector3Negate(Vector3RotateByQuaternion(sunLightPosition, QuaternionFromAxisAngle(sunLightAxis, app->config.sunAltitude)));
 
     SetShaderValue(app->shader, app->uniforms.cameraPosition, &app->camera.cam3d.position, SHADER_UNIFORM_VEC3);
     SetShaderValue(app->shader, app->uniforms.exposure, &app->config.exposure, SHADER_UNIFORM_FLOAT);
@@ -2819,6 +3048,27 @@ static void ApplicationUpdate(void* voidApplicationState)
     SetShaderValue(app->shader, app->uniforms.shadowLookupResolution, &app->capsuleData.shadowLookupResolution, SHADER_UNIFORM_VEC2);
     SetShaderValueTexture(app->shader, app->uniforms.aoLookupTable, app->capsuleData.aoLookupTable);
     SetShaderValueTexture(app->shader, app->uniforms.shadowLookupTable, app->capsuleData.shadowLookupTable);
+
+    // Mesh shadow map uniforms on capsule/ground shader
+    const int useMeshShadow = (app->genoRenderMode && app->genoModelLoaded && app->config.drawShadows) ? 1 : 0;
+    SetShaderValue(app->shader, app->capsuleUseMeshShadowMap, &useMeshShadow, SHADER_UNIFORM_INT);
+    if (useMeshShadow)
+    {
+        SetShaderValueMatrix(app->shader, app->capsuleLightViewProj, lightViewProj);
+        SetShaderValue(app->shader, app->capsuleLightClipNear, &shadowLightClipNear, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(app->shader, app->capsuleLightClipFar, &shadowLightClipFar, SHADER_UNIFORM_FLOAT);
+        SetShaderValueShadowMap(app->shader, app->capsuleMeshShadowMapTex, app->meshShadowMap);
+    }
+
+    // Mesh shadow map uniforms on geno mesh shader
+    if (app->genoBasicShader.id > 0)
+    {
+        SetShaderValueMatrix(app->genoBasicShader, app->genoLightViewProj, lightViewProj);
+        SetShaderValue(app->genoBasicShader, app->genoSunDir, &sunLightDir, SHADER_UNIFORM_VEC3);
+        SetShaderValue(app->genoBasicShader, app->genoLightClipNear, &shadowLightClipNear, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(app->genoBasicShader, app->genoLightClipFar, &shadowLightClipFar, SHADER_UNIFORM_FLOAT);
+        SetShaderValueShadowMap(app->genoBasicShader, app->genoShadowMap, app->meshShadowMap);
+    }
 
     // Draw Ground
 
@@ -3414,6 +3664,45 @@ static void ApplicationUpdate(void* voidApplicationState)
             const Vector3 spine3Pos = cc.xformData.globalPositions[db.spine3Index];
             DrawLine3D(magicPos, spine3Pos, Color{ 255, 100, 255, 128 });
         }
+
+        // Draw predicted toe positions and velocities from the glimpse flow
+        if (cc.predictedGlimpseValid)
+        {
+            const GlimpseFeatures& g = cc.predictedGlimpse;
+            const float velScale = 0.2f;
+
+            for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+            {
+                const float timeAlpha = (float)(t + 1) / (float)(GLIMPSE_POSE_COUNT + 1);
+                for (int side = 0; side < SIDES_COUNT; ++side)
+                {
+                    const GlimpseFeatures::ToeSample& s = g.toes[t][side];
+
+                    // transform from root space to world space
+                    const Vector3 localPos = { s.posX, 0.02f, s.posZ };
+                    const Vector3 worldPos = Vector3Add(
+                        cc.worldPosition,
+                        Vector3RotateByQuaternion(localPos, cc.worldRotation));
+
+                    const Vector3 localVel = { s.velX * velScale, 0.0f, s.velZ * velScale };
+                    const Vector3 worldVel = Vector3RotateByQuaternion(localVel, cc.worldRotation);
+                    const Vector3 velEnd = Vector3Add(worldPos, worldVel);
+
+                    // color: brighter for farther future, different per side
+                    const unsigned char bright = (unsigned char)(150 + (int)(105.0f * timeAlpha));
+                    const Color posColor = (side == 0)
+                        ? Color{ bright, 100, 0, 255 }    // left toe: orange
+                        : Color{ 0, 100, bright, 255 };   // right toe: blue
+                    const Color velColor = (side == 0)
+                        ? Color{ bright, 150, 50, 255 }
+                        : Color{ 50, 150, bright, 255 };
+
+                    DrawSphere(worldPos, 0.025f, posColor);
+                    DrawLine3D(worldPos, velEnd, velColor);
+                    DrawSphere(velEnd, 0.012f, velColor);
+                }
+            }
+        }
     }
 
     // Draw Magic anchor for animated character (scrubber-controlled)
@@ -3849,6 +4138,7 @@ static void ApplicationUpdate(void* voidApplicationState)
 
         ImGuiUtilities(app);
         ImGuiConverter(app);
+        ImGuiRetargeter(app);
 
         // File Dialog
         //ImGuiWindowFileDialog(&app->fileDialogState);
@@ -4175,6 +4465,49 @@ int main(int argc, char** argv)
         return ConvertFBXtoBVH(argv[2]);
     }
 
+    if (argc >= 4 && strcmp(argv[1], "-retarget") == 0)
+    {
+        const char* srcPath = argv[2];
+        const char* tgtPath = argv[3];
+
+        BVHData srcBvh, tgtBvh, outBvh;
+        BVHDataInit(&srcBvh);
+        BVHDataInit(&tgtBvh);
+        BVHDataInit(&outBvh);
+
+        char loadErr[512] = {};
+        if (!BVHDataLoad(&srcBvh, srcPath, loadErr, sizeof(loadErr)))
+        {
+            printf("Error loading source BVH '%s': %s\n", srcPath, loadErr);
+            return 1;
+        }
+        if (!BVHDataLoad(&tgtBvh, tgtPath, loadErr, sizeof(loadErr)))
+        {
+            printf("Error loading target BVH '%s': %s\n", tgtPath, loadErr);
+            return 1;
+        }
+
+        char retargetErr[512] = {};
+        if (!RetargetBVH(&outBvh, &srcBvh, &tgtBvh, retargetErr, sizeof(retargetErr)))
+        {
+            printf("Retarget failed: %s\n", retargetErr);
+            return 1;
+        }
+
+        // output path: source.retarget.bvh
+        char outPath[1024];
+        snprintf(outPath, sizeof(outPath), "%s.retarget.bvh", srcPath);
+        char saveErr[256] = {};
+        if (!BVHDataSave(&outBvh, outPath, saveErr, sizeof(saveErr)))
+        {
+            printf("Error saving output BVH '%s': %s\n", outPath, saveErr);
+            return 1;
+        }
+
+        printf("Output: %s\n", outPath);
+        return 0;
+    }
+
     // Set current working directory to source root for file access
     // This helps find shader files and other resources
 #if defined(SOURCE_ROOT_PATH)
@@ -4292,11 +4625,36 @@ int main(int argc, char** argv)
         {
             app.genoModel.materials[0].shader = app.genoBasicShader;
             TraceLog(LOG_INFO, "GENO: Loaded skinned shader successfully");
+
+            // Shadow map uniform locations on the main mesh shader
+            app.genoLightViewProj = GetShaderLocation(app.genoBasicShader, "lightViewProj");
+            app.genoSunDir = GetShaderLocation(app.genoBasicShader, "sunDir");
+            app.genoShadowMap = GetShaderLocation(app.genoBasicShader, "shadowMap");
+            app.genoLightClipNear = GetShaderLocation(app.genoBasicShader, "lightClipNear");
+            app.genoLightClipFar = GetShaderLocation(app.genoBasicShader, "lightClipFar");
         }
         else
         {
             TraceLog(LOG_WARNING, "GENO: Failed to load skinned shader, animation may not work");
         }
+
+        // Load shadow depth shader for the shadow pass
+        app.skinnedShadowShader = LoadShader("shaders/skinnedShadow.vs", "shaders/shadow.fs");
+        if (app.skinnedShadowShader.id > 0)
+        {
+            app.skinnedShadowLightClipNear = GetShaderLocation(app.skinnedShadowShader, "lightClipNear");
+            app.skinnedShadowLightClipFar = GetShaderLocation(app.skinnedShadowShader, "lightClipFar");
+        }
+
+        // Create shadow map render texture
+        app.meshShadowMap = LoadShadowMap(1024, 1024);
+
+        // Shadow map uniform locations on the capsule/ground shader
+        app.capsuleUseMeshShadowMap = GetShaderLocation(app.shader, "useMeshShadowMap");
+        app.capsuleMeshShadowMapTex = GetShaderLocation(app.shader, "meshShadowMapTex");
+        app.capsuleLightViewProj = GetShaderLocation(app.shader, "lightViewProj");
+        app.capsuleLightClipNear = GetShaderLocation(app.shader, "lightClipNear");
+        app.capsuleLightClipFar = GetShaderLocation(app.shader, "lightClipFar");
 
         TraceLog(LOG_INFO, "GENO: Model loaded successfully, %d bones", app.genoModel.boneCount);
     }
@@ -4415,6 +4773,11 @@ int main(int argc, char** argv)
         {
             UnloadShader(app.genoBasicShader);
         }
+        if (app.skinnedShadowShader.id > 0)
+        {
+            UnloadShader(app.skinnedShadowShader);
+        }
+        UnloadShadowMap(app.meshShadowMap);
     }
 
     UnloadModel(app.capsuleModel);

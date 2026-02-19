@@ -29,7 +29,7 @@ static inline MotionTrainingAugmentations SampleTrainingAugmentations()
 {
     MotionTrainingAugmentations aug;
     aug.timescale = 1.0f + RandomGaussian() * 0.1f;
-    aug.aimAngleOffset = RandomGaussian() * (10.0f * DEG2RAD);
+    //aug.aimAngleOffset = RandomGaussian() * (10.0f * DEG2RAD);
     return aug;
 }
 
@@ -160,16 +160,16 @@ static inline void PcaReconstructGlimpseToe(
     }
 }
 
-// build 16 raw toe dims for a given frame: 2 future times x 2 toes x (pos_xz + vel_xz)
+// build glimpse toe features for a given frame: 2 future times x 2 toes x (pos_xz + vel_xz)
 // positions are world toe positions transformed to current root space
 // velocities are rotated from future root space to current root space
-static inline void BuildRawGlimpseToe(
-    const AnimDatabase* db, int frame, const int* futureFrames, float* raw16)
+static inline GlimpseFeatures BuildGlimpseFeatures(
+    const AnimDatabase* db, int frame, const int* futureFrames)
 {
+    GlimpseFeatures g = {};
     const float curYaw = db->magicYaw[frame];
     const float cosC = cosf(-curYaw);
     const float sinC = sinf(-curYaw);
-    int idx = 0;
     for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
     {
         const int futureF = frame + futureFrames[t];
@@ -178,21 +178,30 @@ static inline void BuildRawGlimpseToe(
         const float sinD = sinf(deltaYaw);
         for (int side : sides)
         {
+            GlimpseFeatures::ToeSample& s = g.toes[t][side];
             // position: world toe -> current root space (XZ only)
             const Vector3 toeWorld =
                 db->jointPositionsAnimSpace.row_view(futureF)[db->toeIndices[side]];
             const float dx = toeWorld.x - db->magicPosition[frame].x;
             const float dz = toeWorld.z - db->magicPosition[frame].z;
-            raw16[idx++] = dx * cosC - dz * sinC;
-            raw16[idx++] = dx * sinC + dz * cosC;
+            s.posX = dx * cosC - dz * sinC;
+            s.posZ = dx * sinC + dz * cosC;
             // velocity: future root space -> current root space (XZ only)
             const Vector3 vel =
                 db->jointVelocitiesRootSpace.row_view(futureF)[db->toeIndices[side]];
-            raw16[idx++] = vel.x * cosD - vel.z * sinD;
-            raw16[idx++] = vel.x * sinD + vel.z * cosD;
+            s.velX = vel.x * cosD - vel.z * sinD;
+            s.velZ = vel.x * sinD + vel.z * cosD;
         }
     }
-    assert(idx == GLIMPSE_TOE_RAW_DIM);
+    return g;
+}
+
+// flat version for PCA pipelines: builds GlimpseFeatures then serializes to float array
+static inline void BuildRawGlimpseToe(
+    const AnimDatabase* db, int frame, const int* futureFrames, float* raw16)
+{
+    const GlimpseFeatures g = BuildGlimpseFeatures(db, frame, futureFrames);
+    g.SerializeTo(raw16);
 }
 
 // build 16 raw toe dims with augmentation: future offsets become fractional,
@@ -268,43 +277,27 @@ static inline bool IsPoseGenVelocityDim(int d, int jointCount)
     return false;
 }
 
-// build an augmented normalized segment for decompressor training.
-// for each output frame i, interpolates raw poseGenFeatures at
-// source frame (frame + i * aug.timescale), scales velocity dims, normalizes.
+// build a normalized segment for decompressor training.
+// reads poseGenFeatures at integer frames [frame, frame+segFrameCount), clamped to clip bounds.
 // outNormFlat must have room for segFrameCount * pgDim floats.
-static inline void BuildAugmentedNormalizedSegment(
+static inline void BuildNormalizedSegment(
     const AnimDatabase* db,
     int frame,
-    const MotionTrainingAugmentations& aug,
-    int clipStart,
     int clipEnd,
     float* outNormFlat)
 {
     const int segFrames = db->poseGenSegmentFrameCount;
     const int pgDim = db->poseGenFeaturesComputeDim;
-    const int jc = db->jointCount;
 
     for (int i = 0; i < segFrames; ++i)
     {
-        // playback frame i maps to i * timescale original frames ahead
-        const float srcFrac = (float)frame + (float)i * aug.timescale;
-        const float srcClamped = std::clamp(srcFrac, (float)clipStart, (float)(clipEnd - 1) - 0.001f);
-        const int f0 = (int)srcClamped;
-        const int f1 = std::min(f0 + 1, clipEnd - 1);
-        const float alpha = srcClamped - (float)f0;
-
-        std::span<const float> row0 = db->poseGenFeatures.row_view(f0);
-        std::span<const float> row1 = db->poseGenFeatures.row_view(f1);
+        const int f = std::min(frame + i, clipEnd - 1);
+        std::span<const float> row = db->poseGenFeatures.row_view(f);
 
         for (int d = 0; d < pgDim; ++d)
         {
-            float rawInterp = row0[d] + alpha * (row1[d] - row0[d]);
-            if (IsPoseGenVelocityDim(d, jc))
-            {
-                rawInterp *= aug.timescale;
-            }
             outNormFlat[i * pgDim + d] =
-                (rawInterp - db->poseGenFeaturesMean[d])
+                (row[d] - db->poseGenFeaturesMean[d])
                 / db->poseGenFeaturesStd[d]
                 * db->poseGenFeaturesWeight[d];
         }
@@ -560,9 +553,9 @@ static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
         if (room >= 0) numValidStarts += room + 1;
     }
 
-    // sample 2x that using cluster-weighted sampling so rare motions are well represented
-    const int numSamples = numValidStarts * 2;
-    TraceLog(LOG_INFO, "PCA: sampling %d segments cluster-weighted (flatDim=%d, K=%d)", numSamples, flatDim, K);
+    // cap samples — more than 30K doesn't improve PCA quality for ~1500 dims
+    const int numSamples = std::min(MaxInt(numValidStarts * 2, 20000), 30000);
+    TraceLog(LOG_INFO, "PCA segment: sampling %d segments (flatDim=%d, K=%d)...", numSamples, flatDim, K);
 
     torch::Tensor dataMat = torch::empty({numSamples, flatDim});
     float* dPtr = dataMat.data_ptr<float>();
@@ -586,6 +579,7 @@ static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
     }
 
     // compute and subtract mean
+    TraceLog(LOG_INFO, "PCA segment: computing SVD on [%d x %d] matrix...", numSamples, flatDim);
     torch::Tensor meanTensor = dataMat.mean(0);  // [flatDim]
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
@@ -638,8 +632,8 @@ static void AnimDatabaseComputeGlimpseToePCA(
         if (room >= 0) numValidStarts += room + 1;
     }
 
-    const int numSamples = numValidStarts * 2;
-    TraceLog(LOG_INFO, "PCA glimpse toe: sampling %d frames (rawDim=%d, K=%d)",
+    const int numSamples = std::min(numValidStarts * 2, 30000);
+    TraceLog(LOG_INFO, "PCA glimpse toe: sampling %d frames (rawDim=%d, K=%d)...",
         numSamples, GLIMPSE_TOE_RAW_DIM, K);
 
     torch::Tensor dataMat = torch::empty({numSamples, GLIMPSE_TOE_RAW_DIM});
@@ -651,6 +645,7 @@ static void AnimDatabaseComputeGlimpseToePCA(
     }
 
     // compute and subtract mean
+    TraceLog(LOG_INFO, "PCA glimpse toe: computing SVD on [%d x %d] matrix...", numSamples, GLIMPSE_TOE_RAW_DIM);
     torch::Tensor meanTensor = dataMat.mean(0);  // [GLIMPSE_TOE_RAW_DIM]
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
@@ -692,9 +687,8 @@ static void AnimDatabaseComputeFeaturePCA(AnimDatabase* db)
         numValidStarts += db->clipEndFrame[c] - db->clipStartFrame[c];
     }
 
-    const int numSamples = numValidStarts * 2;
-    TraceLog(LOG_INFO, "PCA feature: sampling %d frames (featureDim=%d, K=%d)",
-        numSamples, dim, K);
+    const int numSamples = std::min(numValidStarts * 2, 30000);
+    TraceLog(LOG_INFO, "PCA feature: sampling %d frames (featureDim=%d, K=%d)...", numSamples, dim, K);
 
     torch::Tensor dataMat = torch::empty({numSamples, dim});
     float* dPtr = dataMat.data_ptr<float>();
@@ -705,6 +699,7 @@ static void AnimDatabaseComputeFeaturePCA(AnimDatabase* db)
         memcpy(dPtr + i * dim, row.data(), dim * sizeof(float));
     }
 
+    TraceLog(LOG_INFO, "PCA feature: computing SVD on [%d x %d] matrix...", numSamples, dim);
     torch::Tensor meanTensor = dataMat.mean(0);
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
@@ -725,6 +720,82 @@ static void AnimDatabaseComputeFeaturePCA(AnimDatabase* db)
     memcpy(db->pcaFeatureBasis.data(), basisTensor.data_ptr<float>(), K * dim * sizeof(float));
 
     TraceLog(LOG_INFO, "PCA feature: stored basis [%d x %d]", K, dim);
+}
+
+// precompute per-frame training data so training loops are pure lookups.
+// call after all PCAs are computed and before training starts.
+static void AnimDatabasePrecomputeTrainingData(AnimDatabase* db)
+{
+    if (!db->precompSegmentPCA.empty()) return;  // already done
+
+    const int N = db->motionFrameCount;
+    const int segK = db->pcaSegmentK;
+    const int featK = db->pcaFeatureK;
+    const int flatDim = db->poseGenSegmentFlatDim;
+    const float animDt = db->animFrameTime[0];
+
+    if (segK <= 0 || featK <= 0 || N <= 0) return;
+
+    TraceLog(LOG_INFO, "Precomputing training data for %d frames...", N);
+
+    // segment PCA coefficients per frame (this is the slow one: N x flatDim->segK projection)
+    TraceLog(LOG_INFO, "  segment PCA (%d x %d)...", N, segK);
+    db->precompSegmentPCA.resize(N, segK);
+    {
+        std::vector<float> segNormBuf(flatDim);
+        for (int f = 0; f < N; ++f)
+        {
+            if (f % 25000 == 0 && f > 0)
+            {
+                TraceLog(LOG_INFO, "    %d / %d (%.0f%%)", f, N, 100.0f * f / N);
+            }
+            const int clipIdx = FindClipForMotionFrame(db, f);
+            const int clipEnd = db->clipEndFrame[clipIdx];
+            BuildNormalizedSegment(db, f, clipEnd, segNormBuf.data());
+            PcaProjectSegment(db, segNormBuf.data(), db->precompSegmentPCA.row_view(f).data());
+        }
+    }
+
+    // feature PCA coefficients per frame
+    TraceLog(LOG_INFO, "  feature PCA (%d x %d)...", N, featK);
+    db->precompFeaturePCA.resize(N, featK);
+    for (int f = 0; f < N; ++f)
+    {
+        std::span<const float> normFeat = db->normalizedFeatures.row_view(f);
+        PcaProjectFeature(db, normFeat.data(), db->precompFeaturePCA.row_view(f).data());
+    }
+
+    // raw toe data per frame
+    TraceLog(LOG_INFO, "  raw toe data (%d x %d)...", N, GLIMPSE_TOE_RAW_DIM);
+    int futureFrames[GLIMPSE_POSE_COUNT];
+    for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+    {
+        futureFrames[t] = (int)roundf(GLIMPSE_POSE_TIMES[t] / animDt);
+    }
+    int maxFutureFrame = 0;
+    for (int t = 0; t < GLIMPSE_POSE_COUNT; ++t)
+    {
+        if (futureFrames[t] > maxFutureFrame) maxFutureFrame = futureFrames[t];
+    }
+
+    db->precompRawToe.resize(N, GLIMPSE_TOE_RAW_DIM);
+    db->precompRawToe.fill(0.0f);
+    for (int f = 0; f < N; ++f)
+    {
+        const int clipIdx = FindClipForMotionFrame(db, f);
+        const int clipEnd = db->clipEndFrame[clipIdx];
+        if (f + maxFutureFrame < clipEnd)
+        {
+            BuildRawGlimpseToe(db, f, futureFrames, db->precompRawToe.row_view(f).data());
+        }
+    }
+
+    const float segMB = (float)(N * segK * sizeof(float)) / (1024.0f * 1024.0f);
+    const float featMB = (float)(N * featK * sizeof(float)) / (1024.0f * 1024.0f);
+    const float toeMB = (float)(N * GLIMPSE_TOE_RAW_DIM * sizeof(float)) / (1024.0f * 1024.0f);
+    TraceLog(LOG_INFO,
+        "Precomputed training data: segPCA[%dx%d]=%.1fMB featPCA[%dx%d]=%.1fMB rawToe[%dx%d]=%.1fMB",
+        N, segK, segMB, N, featK, featMB, N, GLIMPSE_TOE_RAW_DIM, toeMB);
 }
 
 // save clusters + PCA to a binary file so they don't need to be recomputed

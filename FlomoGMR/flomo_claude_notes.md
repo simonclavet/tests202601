@@ -65,7 +65,7 @@ R_twist  = align_vectors(d_target, d_geno)
 ```
 q_corrected = inv(R_twist_parent) * q_source_local * R_twist_self
 ```
-
+	
 The `inv(R_twist_parent)` compensates for the parent's twist so it doesn't accumulate. After correction: `world_rot_J_geno = world_rot_J_src * R_twist_J`, which gives the correct bone direction in world space.
 
 ### Computed twist values

@@ -42,6 +42,12 @@ uniform float ambientStrength;
 uniform float groundStrength;
 uniform float exposure;
 
+uniform int useMeshShadowMap;
+uniform sampler2D meshShadowMapTex;
+uniform mat4 lightViewProj;
+uniform float lightClipNear;
+uniform float lightClipFar;
+
 out vec4 finalColor;
 
 #define AO_RATIO_MAX 4.0
@@ -57,6 +63,11 @@ vec3 ToGamma(vec3 col)
 vec3 FromGamma(vec3 col)
 {
     return vec3(pow(col.x, 1.0/2.2), pow(col.y, 1.0/2.2), pow(col.z, 1.0/2.2));
+}
+
+float LinearDepth(float depth, float near, float far)
+{
+    return (2.0 * near) / (far + near - depth * (far - near));
 }
 
 float Saturate(float x)
@@ -234,7 +245,26 @@ void main()
             shadowCapsuleRadii[i],
             sunDir));
     }
-    
+
+    // Mesh shadow map (normal bias shifts sample along surface normal to avoid
+    // missing shadows from geometry close to the surface, like feet on ground)
+    if (useMeshShadowMap == 1)
+    {
+        vec3 biasedPos = pos + 0.01 * nor;
+        vec4 posLS = lightViewProj * vec4(biasedPos, 1.0);
+        posLS.xyz /= posLS.w;
+        posLS.xyz = posLS.xyz * 0.5 + 0.5;
+
+        float clip = float(
+            posLS.x > 0.0 && posLS.x < 1.0 &&
+            posLS.y > 0.0 && posLS.y < 1.0);
+
+        float fd = LinearDepth(posLS.z, lightClipNear, lightClipFar);
+        float sd = texture(meshShadowMapTex, posLS.xy).r;
+        float meshShadow = 1.0 - clip * float(fd - 0.000005 > sd);
+        sunShadow = min(sunShadow, meshShadow);
+    }
+
     // Compute ambient shadow amount
 
     float ambShadow = 1.0;

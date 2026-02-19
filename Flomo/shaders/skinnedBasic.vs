@@ -13,11 +13,13 @@ in vec4 vertexBoneWeights;
 uniform mat4 boneMatrices[MAX_BONE_NUM];
 
 uniform mat4 mvp;
+uniform mat4 lightViewProj;
 
 out vec3 fragPosition;
 out vec2 fragTexCoord;
 out vec4 fragColor;
 out vec3 fragNormal;
+out vec4 fragPositionLightSpace;
 
 void main()
 {
@@ -42,6 +44,7 @@ void main()
     fragTexCoord = vertexTexCoord;
     fragColor = vertexColor;
     fragNormal = skinnedNormal;
+    fragPositionLightSpace = lightViewProj * vec4(fragPosition, 1.0);
 
     gl_Position = mvp * vec4(fragPosition, 1.0);
 }

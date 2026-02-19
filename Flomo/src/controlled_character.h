@@ -297,13 +297,17 @@ static void SpawnBlendCursorFromGlimpse(
     cursor->blendTime = blendTime;
     cursor->segmentFrameTime = db->animFrameTime[0];
 
-    std::vector<float> futurePoseRaw;
+    GlimpseFeatures glimpse = {};
     if (!NetworkPredictGlimpse(
-        networkState, db, query, cursor->segment, &futurePoseRaw))
+        networkState, db, query, cursor->segment, &glimpse))
     {
         cursor->active = false;
+        cc->predictedGlimpseValid = false;
         return;
     }
+
+    cc->predictedGlimpse = glimpse;
+    cc->predictedGlimpseValid = true;
 
     cursor->segmentAnimTime = 0.0f;
 }
