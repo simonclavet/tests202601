@@ -200,21 +200,22 @@ def extract_zip(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
-def setup_libtorch_build(target_dir, cuda_version, debug=False):
-    """Download and setup one LibTorch build (debug or release)."""
+def setup_libtorch_build(target_dir, dest_dir, cuda_version, debug=False):
+    """Download and extract one LibTorch build directly into dest_dir."""
 
     build_name = "DEBUG" if debug else "RELEASE"
 
-    # Try requested version first
     versions_to_try = [cuda_version]
-
-    # Add fallbacks if CUDA version fails
     if cuda_version == "cu130":
         versions_to_try.extend(["cu128", "cu126"])
     elif cuda_version == "cu128":
         versions_to_try.append("cu126")
 
     last_error = None
+
+    # extract into a scratch directory so we never collide with the real
+    # thirdparty/libtorch/ that holds release/ and debug/
+    extract_dir = os.path.join(target_dir, "_libtorch_extract")
 
     for version in versions_to_try:
         url = get_libtorch_url(version, debug)
@@ -226,27 +227,40 @@ def setup_libtorch_build(target_dir, cuda_version, debug=False):
 
             download_file(url, temp_zip)
 
-            # Extract
-            extract_zip(temp_zip, target_dir)
+            # clean scratch dir so previous failed attempts don't linger
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir)
+            os.makedirs(extract_dir)
+
+            extract_zip(temp_zip, extract_dir)
             os.remove(temp_zip)
 
-            # The zip extracts to libtorch/
-            extracted_path = os.path.join(target_dir, "libtorch")
+            # the zip puts everything under a libtorch/ folder
+            extracted_path = os.path.join(extract_dir, "libtorch")
 
             if not os.path.exists(extracted_path):
                 print("  ERROR: Extracted libtorch directory not found")
                 continue
 
+            # move into the final destination
+            if os.path.exists(dest_dir):
+                shutil.rmtree(dest_dir)
+            shutil.move(extracted_path, dest_dir)
+
+            # clean up scratch dir
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
             if version != cuda_version:
                 print(f"  Successfully downloaded {version} as fallback")
 
-            return extracted_path
+            return True
 
         except Exception as e:
             last_error = e
             print(f"  Failed to download {build_name} {version}: {e}")
             if os.path.exists(temp_zip):
                 os.remove(temp_zip)
+            shutil.rmtree(extract_dir, ignore_errors=True)
             continue
 
     print(f"\n  ERROR: All {build_name} download attempts failed. "
@@ -286,24 +300,12 @@ def setup_libtorch(thirdparty_dir):
     # Download RELEASE if needed
     if need_release:
         print("\nDownloading LibTorch RELEASE...")
-        extracted_release = setup_libtorch_build(
-            thirdparty_dir, libtorch_cuda, debug=False
-        )
-
-        if not extracted_release:
+        os.makedirs(libtorch_dir, exist_ok=True)
+        if not setup_libtorch_build(
+            thirdparty_dir, release_dir, libtorch_cuda, debug=False
+        ):
             print("\nFailed to setup LibTorch RELEASE")
             return False
-
-        # The zip extracts to thirdparty/libtorch which is also our parent dir,
-        # so rename it to a temp name first to avoid moving a dir into itself.
-        temp_extracted = extracted_release + "_temp"
-        if os.path.exists(temp_extracted):
-            shutil.rmtree(temp_extracted)
-        os.rename(extracted_release, temp_extracted)
-        os.makedirs(os.path.dirname(release_dir), exist_ok=True)
-        if os.path.exists(release_dir):
-            shutil.rmtree(release_dir)
-        shutil.move(temp_extracted, release_dir)
         print_color("[OK] LibTorch RELEASE installed", Color.GREEN)
     elif need_debug:
         print_color("[OK] LibTorch RELEASE already exists", Color.GREEN)
@@ -311,20 +313,10 @@ def setup_libtorch(thirdparty_dir):
     # Download DEBUG if needed
     if need_debug:
         print("\nDownloading LibTorch DEBUG...")
-        extracted_debug = setup_libtorch_build(
-            thirdparty_dir, libtorch_cuda, debug=True
-        )
-
-        if extracted_debug:
-            # Same temp rename trick for debug
-            temp_extracted = extracted_debug + "_temp"
-            if os.path.exists(temp_extracted):
-                shutil.rmtree(temp_extracted)
-            os.rename(extracted_debug, temp_extracted)
-            os.makedirs(os.path.dirname(debug_dir), exist_ok=True)
-            if os.path.exists(debug_dir):
-                shutil.rmtree(debug_dir)
-            shutil.move(temp_extracted, debug_dir)
+        os.makedirs(libtorch_dir, exist_ok=True)
+        if setup_libtorch_build(
+            thirdparty_dir, debug_dir, libtorch_cuda, debug=True
+        ):
             print_color("[OK] LibTorch DEBUG installed", Color.GREEN)
         else:
             print("\nWARNING: Failed to setup LibTorch DEBUG")
