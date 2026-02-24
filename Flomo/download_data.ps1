@@ -125,7 +125,31 @@ function Download-AnimData {
     Write-Host "[OK] $description installed ($fileCount files)" -ForegroundColor Green
 }
 
-# Dataset definitions
+# Geno model resources (from GenoView repo)
+Write-Host ""
+Write-Host "Checking Geno model resources..." -ForegroundColor Cyan
+
+$genoBaseUrl = "https://raw.githubusercontent.com/orangeduck/GenoView/main/resources"
+$genoFiles = @("Geno.bin", "Geno_bind.bvh", "Geno_stance.bvh")
+
+foreach ($file in $genoFiles) {
+    $destFile = Join-Path $dataDir $file
+    if (Test-Path $destFile) {
+        Write-Host "[OK] $file already exists" -ForegroundColor Green
+        continue
+    }
+
+    Write-Host "[DOWNLOADING] $file" -ForegroundColor Yellow
+    try {
+        Download-WithProgress "$genoBaseUrl/$file" $destFile $file
+        Write-Host "[OK] $file downloaded" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "[ERROR] Failed to download $file : $_" -ForegroundColor Red
+    }
+}
+
+# Animation dataset definitions
 $datasets = @(
     @{
         Name = "lafan"
