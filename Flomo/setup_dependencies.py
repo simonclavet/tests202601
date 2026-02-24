@@ -294,11 +294,16 @@ def setup_libtorch(thirdparty_dir):
             print("\nFailed to setup LibTorch RELEASE")
             return False
 
-        # Move to final location immediately (so progress is saved if interrupted)
+        # The zip extracts to thirdparty/libtorch which is also our parent dir,
+        # so rename it to a temp name first to avoid moving a dir into itself.
+        temp_extracted = extracted_release + "_temp"
+        if os.path.exists(temp_extracted):
+            shutil.rmtree(temp_extracted)
+        os.rename(extracted_release, temp_extracted)
         os.makedirs(os.path.dirname(release_dir), exist_ok=True)
         if os.path.exists(release_dir):
             shutil.rmtree(release_dir)
-        shutil.move(extracted_release, release_dir)
+        shutil.move(temp_extracted, release_dir)
         print_color("[OK] LibTorch RELEASE installed", Color.GREEN)
     elif need_debug:
         print_color("[OK] LibTorch RELEASE already exists", Color.GREEN)
@@ -311,11 +316,15 @@ def setup_libtorch(thirdparty_dir):
         )
 
         if extracted_debug:
-            # Move to final location immediately
+            # Same temp rename trick for debug
+            temp_extracted = extracted_debug + "_temp"
+            if os.path.exists(temp_extracted):
+                shutil.rmtree(temp_extracted)
+            os.rename(extracted_debug, temp_extracted)
             os.makedirs(os.path.dirname(debug_dir), exist_ok=True)
             if os.path.exists(debug_dir):
                 shutil.rmtree(debug_dir)
-            shutil.move(extracted_debug, debug_dir)
+            shutil.move(temp_extracted, debug_dir)
             print_color("[OK] LibTorch DEBUG installed", Color.GREEN)
         else:
             print("\nWARNING: Failed to setup LibTorch DEBUG")
