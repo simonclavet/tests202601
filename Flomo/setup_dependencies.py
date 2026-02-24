@@ -66,15 +66,17 @@ def parse_version(version_str):
         return (major, minor, patch)
     return None
 
-def clone_if_missing(folder, url, thirdparty_dir):
-    """Clone git repo if it doesn't exist."""
+def clone_if_missing(folder, url, thirdparty_dir, tag=None):
+    """Clone git repo if it doesn't exist. Optionally pin to a tag/branch."""
     path = os.path.join(thirdparty_dir, folder)
     if os.path.exists(path):
         print_color(f"[OK] {folder} already exists", Color.GREEN)
         return True
 
-    print_color(f"[DOWNLOADING] {folder} from {url}", Color.YELLOW)
-    cmd = f'git clone --depth 1 "{url}" "{path}"'
+    tag_str = f" (tag: {tag})" if tag else ""
+    print_color(f"[DOWNLOADING] {folder} from {url}{tag_str}", Color.YELLOW)
+    branch_arg = f"--branch {tag} " if tag else ""
+    cmd = f'git clone --depth 1 {branch_arg}"{url}" "{path}"'
     _, ret = run_command(cmd)
 
     if ret != 0:
@@ -450,14 +452,14 @@ def main():
     print_color("Checking git dependencies...", Color.CYAN)
 
     repos = [
-        ("raylib", "https://github.com/raysan5/raylib.git"),
-        ("raygui", "https://github.com/raysan5/raygui.git"),
-        ("imgui", "https://github.com/ocornut/imgui.git"),
-        ("rlImGui", "https://github.com/raylib-extras/rlImGui.git"),
+        ("raylib", "https://github.com/raysan5/raylib.git", "5.5"),
+        ("raygui", "https://github.com/raysan5/raygui.git", "4.0"),
+        ("imgui", "https://github.com/ocornut/imgui.git", "v1.92.6-docking"),
+        ("rlImGui", "https://github.com/raylib-extras/rlImGui.git", None),
     ]
 
-    for folder, url in repos:
-        if not clone_if_missing(folder, url, thirdparty_dir):
+    for folder, url, tag in repos:
+        if not clone_if_missing(folder, url, thirdparty_dir, tag):
             return 1
 
     # tiny-cuda-nn - fast neural networks for motion matching

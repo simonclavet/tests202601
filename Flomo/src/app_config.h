@@ -197,7 +197,7 @@ static inline AppConfig LoadAppConfig(int argc, char** argv)
     config.drawShadows = ResolveBoolConfig(buffer, "drawShadows", config.drawShadows, argc, argv);
     config.drawEndSites = ResolveBoolConfig(buffer, "drawEndSites", config.drawEndSites, argc, argv);
     config.drawFPS = ResolveBoolConfig(buffer, "drawFPS", config.drawFPS, argc, argv);
-    config.drawUI = ResolveBoolConfig(buffer, "drawUI", config.drawUI, argc, argv);
+
 
     config.drawFeatures = ResolveBoolConfig(buffer, "drawFeatures", config.drawFeatures, argc, argv);
     config.drawBlendCursors = ResolveBoolConfig(buffer, "drawBlendCursors", config.drawBlendCursors, argc, argv);
@@ -297,7 +297,7 @@ static inline void SaveAppConfig(const AppConfig& config)
     fprintf(file, "    \"drawShadows\": %s,\n", config.drawShadows ? "true" : "false");
     fprintf(file, "    \"drawEndSites\": %s,\n", config.drawEndSites ? "true" : "false");
     fprintf(file, "    \"drawFPS\": %s,\n", config.drawFPS ? "true" : "false");
-    fprintf(file, "    \"drawUI\": %s,\n", config.drawUI ? "true" : "false");
+
 
     fprintf(file, "    \"drawFeatures\": %s,\n", config.drawFeatures ? "true" : "false");
     fprintf(file, "    \"drawBlendCursors\": %s,\n", config.drawBlendCursors ? "true" : "false");

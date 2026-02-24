@@ -584,7 +584,7 @@ static void AnimDatabaseComputeSegmentPCA(AnimDatabase* db)
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
     // SVD: dataMat = U * S * Vt, we want top K rows of Vt as our basis
-    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+    auto [U, S, Vt] = at::linalg_svd(dataMat, false);
 
     // variance explained
     torch::Tensor totalVar = S.square().sum();
@@ -650,7 +650,7 @@ static void AnimDatabaseComputeGlimpseToePCA(
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
     // SVD
-    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+    auto [U, S, Vt] = at::linalg_svd(dataMat, false);
 
     torch::Tensor totalVar = S.square().sum();
     torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
@@ -703,7 +703,7 @@ static void AnimDatabaseComputeFeaturePCA(AnimDatabase* db)
     torch::Tensor meanTensor = dataMat.mean(0);
     dataMat = dataMat - meanTensor.unsqueeze(0);
 
-    auto [U, S, Vt] = torch::linalg::svd(dataMat, false, std::nullopt);
+    auto [U, S, Vt] = at::linalg_svd(dataMat, false);
 
     torch::Tensor totalVar = S.square().sum();
     torch::Tensor topKVar = S.slice(0, 0, K).square().sum();
