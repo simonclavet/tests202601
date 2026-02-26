@@ -1355,6 +1355,65 @@ static inline void ImGuiCharacterData(ApplicationState* app)
             if (scaleFeet) { scaleM = scaleCM = scaleInches = scaleAuto = false; }
             if (scaleAuto) { scaleM = scaleCM = scaleInches = scaleFeet = false; }
 
+            // up-axis toggle: Y-up (default) vs Z-up source data
+            ImGui::SameLine();
+            ImGui::Text("|");
+            ImGui::SameLine();
+
+            const int activeIdx = characterData->active;
+            const int currentUpAxis = characterData->upAxes[activeIdx];
+
+            bool isYUp = (currentUpAxis == 0);
+            ImGui::Checkbox("Y up", &isYUp);
+            if (isYUp && currentUpAxis != 0)
+            {
+                // undo Z-up conversion: rotate back with Rx(+90)
+                const Quaternion rot = QuaternionFromAxisAngle(
+                    { 1.0f, 0.0f, 0.0f }, PI / 2.0f);
+                BVHDataApplyCoordinateRotation(
+                    &characterData->bvhData[activeIdx], rot);
+                characterData->upAxes[activeIdx] = 0;
+
+                // re-detect auto-scale
+                TransformDataSampleFrame(
+                    &characterData->xformData[activeIdx],
+                    &characterData->bvhData[activeIdx], 0, 1.0f);
+                TransformDataForwardKinematics(
+                    &characterData->xformData[activeIdx]);
+                float h = 1e-8f;
+                for (int j = 0; j < characterData->xformData[activeIdx].jointCount; j++)
+                {
+                    h = Max(h, characterData->xformData[activeIdx].globalPositions[j].y);
+                }
+                characterData->autoScales[activeIdx] = 1.8f / h;
+            }
+            ImGui::SameLine();
+
+            bool isZUp = (currentUpAxis == 1);
+            ImGui::Checkbox("Z up", &isZUp);
+            if (isZUp && currentUpAxis != 1)
+            {
+                // apply Z-up to Y-up conversion: Rx(-90)
+                const Quaternion rot = QuaternionFromAxisAngle(
+                    { 1.0f, 0.0f, 0.0f }, -PI / 2.0f);
+                BVHDataApplyCoordinateRotation(
+                    &characterData->bvhData[activeIdx], rot);
+                characterData->upAxes[activeIdx] = 1;
+
+                // re-detect auto-scale
+                TransformDataSampleFrame(
+                    &characterData->xformData[activeIdx],
+                    &characterData->bvhData[activeIdx], 0, 1.0f);
+                TransformDataForwardKinematics(
+                    &characterData->xformData[activeIdx]);
+                float h = 1e-8f;
+                for (int j = 0; j < characterData->xformData[activeIdx].jointCount; j++)
+                {
+                    h = Max(h, characterData->xformData[activeIdx].globalPositions[j].y);
+                }
+                characterData->autoScales[activeIdx] = 1.8f / h;
+            }
+
             ImGui::SliderFloat("Radius", &characterData->radii[characterData->active], 0.01f, 0.1f, "%.2f");
             ImGui::SliderFloat("Opacity", &characterData->opacities[characterData->active], 0.0f, 1.0f, "%.2f");
         }

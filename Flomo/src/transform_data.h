@@ -302,10 +302,100 @@ static void TransformDataForwardKinematics(TransformData* data)
         else
         {
             data->globalPositions[i] = Vector3Add(
-                Vector3RotateByQuaternion(data->localPositions[i], data->globalRotations[p]), 
+                Vector3RotateByQuaternion(data->localPositions[i], data->globalRotations[p]),
                 data->globalPositions[p]);
 
             data->globalRotations[i] = QuaternionMultiply(data->globalRotations[p], data->localRotations[i]);
+        }
+    }
+}
+
+// Apply a coordinate system rotation to all BVH data in-place (offsets, positions, rotations).
+// For example, to convert Z-up to Y-up, pass QuaternionFromAxisAngle({1,0,0}, -PI/2).
+// Rotations are conjugated: q' = coordRot * q * coordRot^-1, then decomposed back to Euler.
+static void BVHDataApplyCoordinateRotation(BVHData* bvh, Quaternion coordRot)
+{
+    const Quaternion coordRotInv = QuaternionInvert(coordRot);
+
+    // rotate all joint offsets
+    for (int i = 0; i < bvh->jointCount; i++)
+    {
+        bvh->joints[i].offset = Vector3RotateByQuaternion(bvh->joints[i].offset, coordRot);
+    }
+
+    // transform motion data frame by frame
+    for (int frame = 0; frame < bvh->frameCount; frame++)
+    {
+        int channelOffset = 0;
+        for (int i = 0; i < bvh->jointCount; i++)
+        {
+            const BVHJointData& joint = bvh->joints[i];
+            const int frameBase = frame * bvh->channelCount + channelOffset;
+
+            // collect position channel values and their indices in motionData
+            float posVals[3] = { 0.0f, 0.0f, 0.0f };
+            int posIndices[3] = { -1, -1, -1 };
+
+            // build rotation quaternion from Euler channels (same logic as TransformDataSampleFrame)
+            Quaternion rot = QuaternionIdentity();
+            int rotCount = 0;
+
+            for (int c = 0; c < joint.channelCount; c++)
+            {
+                const float val = bvh->motionData[frameBase + c];
+                switch (joint.channels[c])
+                {
+                case CHANNEL_X_POSITION: posVals[0] = val; posIndices[0] = frameBase + c; break;
+                case CHANNEL_Y_POSITION: posVals[1] = val; posIndices[1] = frameBase + c; break;
+                case CHANNEL_Z_POSITION: posVals[2] = val; posIndices[2] = frameBase + c; break;
+                case CHANNEL_X_ROTATION:
+                    rot = QuaternionMultiply(
+                        rot, QuaternionFromAxisAngle({ 1, 0, 0 }, DEG2RAD * val));
+                    rotCount++;
+                    break;
+                case CHANNEL_Y_ROTATION:
+                    rot = QuaternionMultiply(
+                        rot, QuaternionFromAxisAngle({ 0, 1, 0 }, DEG2RAD * val));
+                    rotCount++;
+                    break;
+                case CHANNEL_Z_ROTATION:
+                    rot = QuaternionMultiply(
+                        rot, QuaternionFromAxisAngle({ 0, 0, 1 }, DEG2RAD * val));
+                    rotCount++;
+                    break;
+                }
+            }
+
+            // rotate position channels if present
+            if (posIndices[0] >= 0 && posIndices[1] >= 0 && posIndices[2] >= 0)
+            {
+                const Vector3 newPos = Vector3RotateByQuaternion(
+                    { posVals[0], posVals[1], posVals[2] }, coordRot);
+                bvh->motionData[posIndices[0]] = newPos.x;
+                bvh->motionData[posIndices[1]] = newPos.y;
+                bvh->motionData[posIndices[2]] = newPos.z;
+            }
+
+            // conjugate rotation: q' = coordRot * q * coordRot^-1, then decompose back
+            if (rotCount == 3)
+            {
+                const Quaternion newRot = QuaternionMultiply(
+                    coordRot, QuaternionMultiply(rot, coordRotInv));
+
+                float degrees[3];
+                QuaternionToChannelOrder(newRot, joint.channels, joint.channelCount, degrees);
+
+                int rotIdx = 0;
+                for (int c = 0; c < joint.channelCount; c++)
+                {
+                    if (joint.channels[c] >= CHANNEL_X_ROTATION)
+                    {
+                        bvh->motionData[frameBase + c] = degrees[rotIdx++];
+                    }
+                }
+            }
+
+            channelOffset += joint.channelCount;
         }
     }
 }

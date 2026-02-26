@@ -35,6 +35,9 @@ struct CharacterData
     // Automatic scaling for each character
     std::vector<float> autoScales;
 
+    // Source up-axis for each character (0 = Y-up default, 1 = Z-up converted to Y-up)
+    std::vector<int> upAxes;
+
     // Color of each character
     std::vector<Color> colors;
 
@@ -82,6 +85,7 @@ static inline void CharacterDataReserve(CharacterData* data, int capacity)
     data->filePaths.reserve(capacity);
     data->scales.reserve(capacity);
     data->autoScales.reserve(capacity);
+    data->upAxes.reserve(capacity);
     data->opacities.reserve(capacity);
     data->radii.reserve(capacity);
     data->colors.reserve(capacity);
@@ -176,6 +180,24 @@ static bool CharacterDataLoadFromFile(
     data->radii.push_back(data->defaultRadius);
     data->colors.push_back(CharacterDataGetColorForIndex(data, idx));
 
+    // auto-detect Z-up: compare total offset magnitude in Y vs Z across all joints
+    float sumAbsY = 0.0f;
+    float sumAbsZ = 0.0f;
+    for (int j = 0; j < data->bvhData[idx].jointCount; j++)
+    {
+        sumAbsY += fabsf(data->bvhData[idx].joints[j].offset.y);
+        sumAbsZ += fabsf(data->bvhData[idx].joints[j].offset.z);
+    }
+    const bool looksZUp = sumAbsZ > sumAbsY * 1.5f;
+
+    if (looksZUp)
+    {
+        printf("INFO: Detected Z-up skeleton, converting to Y-up\n");
+        const Quaternion zUpToYUp = QuaternionFromAxisAngle({ 1.0f, 0.0f, 0.0f }, -PI / 2.0f);
+        BVHDataApplyCoordinateRotation(&data->bvhData[idx], zUpToYUp);
+    }
+    data->upAxes.push_back(looksZUp ? 1 : 0);
+
     // Add transform data
     TransformData xform;
     TransformDataInit(&xform);
@@ -198,7 +220,7 @@ static bool CharacterDataLoadFromFile(
     TransformDataResize(&xform, &data->bvhData[idx]);
     data->xformTmp3.push_back(xform);
 
-    // Auto-Scaling and unit detection
+    // Auto-Scaling and unit detection (runs after coordinate conversion so Y is up)
     if (data->bvhData[idx].frameCount > 0)
     {
         TransformDataSampleFrame(&data->xformData[idx], &data->bvhData[idx], 0, 1.0f);
@@ -392,6 +414,7 @@ static void CharacterDataAddBVH(
 
     data->scales.push_back(1.0f);
     data->autoScales.push_back(1.0f);
+    data->upAxes.push_back(0);  // augmented data is already Y-up
     data->opacities.push_back(data->defaultOpacity);
     data->radii.push_back(data->defaultRadius);
     data->colors.push_back(CharacterDataGetColorForIndex(data, idx));
